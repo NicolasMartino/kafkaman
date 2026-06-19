@@ -1,0 +1,25 @@
+framework_version = "0.2.1"
+project_name = "kafkaman"
+project_description = "We imagined the following, in a service oriented architecture each service would communicate with another using kafka instead of rest because of its reliabilty and monitoring story. In order to clarify when a message is consumed/sent it would first be saved in a  postgres database then a scheduler would attempt to run the code in the app to consume the message or send it and handle retries. So we plan to make a library to handle kafka that would plug in our modern rust projects."
+blueprint = "library-sdk"
+packs = [
+    "library",
+    "code",
+]
+resolved_folders = [
+    "examples",
+    "infra",
+    "raw",
+    "scripts",
+    "src",
+    "tests",
+    "wiki/archive",
+    "wiki/checklists",
+    "wiki/compatibility",
+    "wiki/decisions",
+    "wiki/plans",
+    "wiki/proposals",
+    "wiki/references",
+    "wiki/roadmaps",
+    "wiki/specs",
+]

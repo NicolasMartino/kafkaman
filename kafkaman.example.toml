@@ -1,0 +1,38 @@
+# kafkaman.example.toml — committed template documenting every config key.
+#
+# This file is TRACKED in git and contains only dummy values. The real
+# `kafkaman.toml` is gitignored and rendered per environment by CI/CD, with
+# secrets injected from the vault / config manager at deploy time. The running
+# instance reads one already-resolved flat file — there are no [profile] sections.
+#
+# ILLUSTRATIVE / PRE-IMPLEMENTATION: the key set below sketches the intended
+# shape. It is not yet validated by code and will be finalized with the first
+# implementation slice (see wiki/plans/first-poc-outbox-publisher.plan.md).
+#
+# See wiki/decisions/configuration-and-environment-model.decision.md.
+
+# --- Connections (secrets — injected by CI/CD, never committed resolved) -------
+[database]
+# Postgres connection string. Injected from the vault per environment.
+url = "postgres://user:password@localhost:5432/app"
+# Postgres schema kafkaman owns (configurable for public-only shops).
+schema = "kafkaman"
+
+[kafka]
+# Comma-separated broker list. Injected from the vault per environment.
+brokers = "localhost:9092"
+
+# --- Runtime config (re-read at every boot; tunable via config + redeploy) -----
+# These are NOT changesets: changing a value and redeploying takes effect.
+
+[retention]
+# How long to keep terminal (published / processed) rows before purge.
+# Per-env: e.g. short in preprod, long in prod.
+window = "168h"
+
+[runtime]
+# Relay/scheduler claim batch size and pacing.
+claim_batch_size = 100
+# Mandatory rate limiting for bulk operations (purge enforcer, replay drain).
+purge_batch_size = 500
+purge_rate_per_sec = 1000

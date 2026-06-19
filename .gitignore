@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# kafkaman config — rendered per env by CI/CD with injected secrets; never commit
+# the resolved file. The example (dummy values, documents the keys) stays tracked.
+kafkaman.toml
+!kafkaman.example.toml
+
+# OS / editor
+.DS_Store
+*.swp
+
+# LLM Wiki per-machine runtime/install state (absolute paths, install hashes)
+.llm_wiki/runtime.toml
+
+# Local-only raw research copies — large or private source dumps kept on disk
+# for reference but intentionally not committed. The distilled summary,
+# manifest, and small web/crate sources stay tracked.
+raw/research/2026-06-20-kafkaman-objectives-rust-microservice-architecture/sources/01-cqrs-fullstack/

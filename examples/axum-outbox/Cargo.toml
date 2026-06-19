@@ -1,0 +1,21 @@
+[package]
+name = "axum-outbox"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum.workspace = true
+kafkaman = { path = "../../crates/kafkaman" }
+kafkaman-core = { path = "../../crates/kafkaman-core" }
+kafkaman-rdkafka = { path = "../../crates/kafkaman-rdkafka" }
+kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
+kafkaman-worker = { path = "../../crates/kafkaman-worker" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
