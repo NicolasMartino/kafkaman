@@ -50,7 +50,7 @@ exactly-once.
   URL with ephemeral-schema `migrate()`, enqueue helper, `relay_once()`, a
   capturing publisher by default, published-record assertions, and row-state
   assertions. Redpanda/full-loop support is opt-in.
-- **`examples/axum-outbox`:** runnable Axum + SQLx example with a local
+- **`apps/axum-outbox`:** runnable Axum + SQLx example with a local
   `changelog.rs`, two-phase `main` (`migrate()` then relay run), and an endpoint
   that writes business state plus `enqueue(&mut tx, ...)` in one transaction.
 
@@ -70,7 +70,7 @@ exactly-once.
 
 1. Create workspace + compiling crate stubs: `kafkaman-core`, `kafkaman-sqlx`,
    `kafkaman-rdkafka`, `kafkaman-worker`, `kafkaman-test`, optional facade, and
-   `examples/axum-outbox`.
+   `apps/axum-outbox`.
 2. Write the headline failing Harness test for durable send: enqueue in a SQL tx,
    commit, run `relay_once()`, assert one published/captured record and row
    `Published`.

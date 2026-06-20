@@ -5,17 +5,25 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Opt-in full-loop gate: publishes through RdkafkaPublisher to a real Redpanda
+# broker started as a testcontainer and asserts the consumed record.
+redpanda = ["kafkaman-test/redpanda", "dep:rdkafka"]
+
 [dependencies]
 kafkaman-core = { path = "../../crates/kafkaman-core" }
 kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
 kafkaman-test = { path = "../../crates/kafkaman-test" }
 kafkaman-worker = { path = "../../crates/kafkaman-worker" }
+rdkafka = { workspace = true, optional = true }
 serde.workspace = true
 sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+serde_json.workspace = true
 testcontainers = "0.27.3"

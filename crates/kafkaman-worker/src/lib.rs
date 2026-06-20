@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use kafkaman_core::{ClaimedOutboxRow, MarkOutcome, PublishAck, RelayConfig, RelayStats};
 use kafkaman_sqlx::{claim_batch, mark_publish_failed, mark_published, OutboxTable};
 use sqlx::PgPool;
-use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 pub use kafkaman_core;
@@ -18,8 +17,8 @@ pub enum Error {
     #[error(transparent)]
     Sqlx(#[from] kafkaman_sqlx::Error),
 
-    #[error("publish failed: {0}")]
-    Publish(BoxError),
+    #[error("invalid relay config: {0}")]
+    InvalidConfig(String),
 }
 
 #[async_trait]
@@ -33,6 +32,8 @@ pub async fn relay_once<P: Publisher>(
     table: &OutboxTable,
     cfg: &RelayConfig,
 ) -> Result<RelayStats> {
+    cfg.validate().map_err(Error::InvalidConfig)?;
+
     let mut tx = pool.begin().await.map_err(kafkaman_sqlx::Error::from)?;
     let claimed = claim_batch(
         &mut tx,
@@ -53,22 +54,23 @@ pub async fn relay_once<P: Publisher>(
         match publisher.publish(&row).await {
             Ok(_) => match mark_published(pool, table, row.message_id(), row.claim_id).await? {
                 MarkOutcome::Updated => stats.published += 1,
-                MarkOutcome::StaleClaim | MarkOutcome::Missing => stats.stale += 1,
+                MarkOutcome::StaleClaim => stats.stale += 1,
+                MarkOutcome::Missing => stats.missing += 1,
             },
             Err(err) => {
-                let retry_at = OffsetDateTime::now_utc() + cfg.retry_after;
                 match mark_publish_failed(
                     pool,
                     table,
                     row.message_id(),
                     row.claim_id,
                     &err.to_string(),
-                    retry_at,
+                    cfg.retry_after,
                 )
                 .await?
                 {
                     MarkOutcome::Updated => stats.failed += 1,
-                    MarkOutcome::StaleClaim | MarkOutcome::Missing => stats.stale += 1,
+                    MarkOutcome::StaleClaim => stats.stale += 1,
+                    MarkOutcome::Missing => stats.missing += 1,
                 }
             }
         }
@@ -85,7 +87,24 @@ pub async fn run<P: Publisher>(
     shutdown: CancellationToken,
 ) -> Result<()> {
     loop {
-        relay_once(&pool, &publisher, &table, &cfg).await?;
+        // A relay cycle failure (typically a transient claim/mark database
+        // error) must not kill the worker. Log it and retry on the next tick;
+        // only a shutdown signal ends the loop.
+        match relay_once(&pool, &publisher, &table, &cfg).await {
+            Ok(stats) if stats.claimed > 0 => tracing::debug!(
+                claimed = stats.claimed,
+                published = stats.published,
+                failed = stats.failed,
+                stale = stats.stale,
+                missing = stats.missing,
+                "relay cycle complete"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::error!(
+                error = %err,
+                "relay cycle failed; retrying after poll interval"
+            ),
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(cfg.poll_interval) => {}

@@ -12,6 +12,9 @@
   - wiki/decisions/configuration-and-environment-model.decision.md
   - wiki/decisions/runtime-composition-and-topology.decision.md
   - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
+  - wiki/decisions/v1-roadmap-execution-policy.decision.md
   - wiki/decisions/library-test-strategy.decision.md
   - wiki/decisions/consumer-test-tooling.decision.md
 - Related:
@@ -20,15 +23,16 @@
 ## Where We Are
 
 The design surface is substantially decided: scope, schema/change-management,
-config/env, runtime/topology, send, consumption, and testing (×2) — **seven
-decisions** (3 Accepted, 4 Draft) plus the objectives proposal and the first-PoC
-plan. No production code yet. Objectives open questions OQ1–OQ4 are resolved; OQ5
-(host-context boundary) is agreed in discussion (opaque headers) but not yet
-ratified, slated for envelope finalization.
+config/env, runtime/topology, send, consumption, and testing (x2) — seven
+foundation decisions plus accepted follow-up decisions for message identity,
+retry/DLQ, and roadmap execution. M1 code exists; later milestones remain
+unimplemented. Objectives open questions OQ1-OQ4 are resolved, and OQ5
+(host-context boundary) is ratified as opaque headers with a reserved
+`kafkaman-*` namespace.
 
-The one design area still **undecided** is the **retry / backoff / DLQ** taxonomy,
-which every Draft decision deliberately defers — it gets its own decision at the
-front of M4.
+The previously open **retry / backoff / DLQ** taxonomy is now accepted as a
+separate decision. M4 implements that policy after M3 provides the receive
+seams; the decision itself no longer blocks planning.
 
 ## Milestones
 
@@ -46,6 +50,10 @@ Status: Completed.
   safety, publish-failure requeue, and the ack-before-mark duplicate window.
 
 ### M2 — Change-engine maturity + config/env
+
+Status: Completed 2026-06-21. Proof: `wiki/specs/m2-change-engine-config.spec.md`;
+integration gates cover config fail-fast, checksums/audit, legacy NULL-checksum
+upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
 - **Goal:** the real schema/operations engine and the configuration loader.
 - **Delivers:** the `changelog!` macro, checksums + `applied_by` audit, advisory-
   locked concurrency, operational `Replay` + the guardrails, the `kafkaman.toml`
@@ -66,13 +74,16 @@ Status: Completed.
   it, per dogfooding-first.
 - **Realizes:** message-consumption-and-handler-model, consumer-test-tooling,
   library-test-strategy.
+- **Execution Plan:** [m3-durable-receive.plan.md](../plans/m3-durable-receive.plan.md)
 - **Exit:** effective-once under random redelivery; a slow/failing handler never
   stalls the partition; handler stacks are `oneshot`-testable.
 
 ### M4 — Reliability (retry / backoff / DLQ)
 - **Goal:** turn "it’s durable" into "it recovers."
-- **Opens with a decision:** the retry/backoff/DLQ taxonomy (retryable vs terminal
-  errors, backoff schedule, max attempts, poison classification, terminal → DLQ).
+- **Implements:** the accepted retry/backoff/DLQ taxonomy: retryable vs terminal
+  errors, per-message config with common defaults in `kafkaman.toml`, backoff
+  schedule, max attempts, poison classification, and terminal to table-backed
+  DLQ.
 - **Delivers:** the retry processor using `attempts` / `next_attempt_at` / `errors`,
   a DLQ surface, poison-message handling — built on the seams M3 reserved.
 - **Exit:** retryable failures back off and recover; terminal/poison land in the
@@ -119,8 +130,8 @@ every later milestone does the same with the seam it adds.
 
 - **M2 before M3** so the consume side is built on the real change engine and
   config loader, not the PoC's hardcoded minimal `migrate()`.
-- **M4 needs its own decision first** — it is the only remaining undecided design
-  area; do not start building retry/DLQ until that decision lands.
+- **M4 has its policy decision**, but implementation still waits for M3 receive
+  seams and the per-message config substrate from M2.
 - **Do not blanket-Accept the four Draft decisions at M1 entry.** They describe
   M3/M4 code the PoC has not validated. Treat consumption, both testing decisions,
   and the *receive* half of runtime-composition as **Accepted design direction
@@ -128,6 +139,10 @@ every later milestone does the same with the seam it adds.
   only once its milestone validates it. Only the **send-side** of the
   runtime-composition decision (the half M1 actually exercises) is eligible to be
   ratified at M1 exit.
+- **Parallel worktrees are allowed only with dependency-aware lanes.** M1
+  closeout, M2 substrate, M3 API/test sketches, retry/DLQ docs, and status/docs
+  cleanup may proceed in separate worktrees, but M3 implementation waits for M2
+  and M4 implementation waits for M3 seams.
 
 ## What Closes This Roadmap
 

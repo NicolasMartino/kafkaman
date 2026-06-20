@@ -1,12 +1,13 @@
 [workspace]
 members = [
+    "crates/kafkaman-config",
     "crates/kafkaman-core",
     "crates/kafkaman-sqlx",
     "crates/kafkaman-worker",
     "crates/kafkaman-rdkafka",
     "crates/kafkaman-test",
     "crates/kafkaman",
-    "examples/axum-outbox",
+    "apps/axum-outbox",
     "tests/durable-send",
 ]
 resolver = "2"
@@ -22,9 +23,11 @@ axum = "0.8"
 rdkafka = { version = "0.36", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json"] }
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting"] }
+toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+kafkaman-config = { path = "../kafkaman-config" }
 kafkaman-core = { path = "../kafkaman-core" }
 kafkaman-sqlx = { path = "../kafkaman-sqlx" }
 kafkaman-worker = { path = "../kafkaman-worker" }

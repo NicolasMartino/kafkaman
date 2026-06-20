@@ -2,11 +2,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kafkaman_core::{
-    ClaimedOutboxRow, Envelope, KafkaMessage, MarkOutcome, OutboxStatus, PublishAck,
+    ClaimedOutboxRow, Envelope, KafkaMessage, MarkOutcome, OutboxStatus, PublishAck, SqlIdentifier,
 };
 use kafkaman_sqlx::{
-    claim_batch, mark_publish_failed, mark_published, migrate, Changeset, CreateOutboxTable,
-    InitSchema,
+    changelog, claim_batch, mark_publish_failed, mark_published, migrate, migrate_dry_run,
+    AddIdempotencyKey, Changeset, CreateOutboxTable, InitSchema, MigrationAction, MigrationContext,
+    OutboxTable, Replay,
 };
 use kafkaman_test::Harness;
 use kafkaman_worker::{BoxError, Publisher};
@@ -57,8 +58,20 @@ async fn migrate_is_idempotent_and_template_generalizes() -> TestResult {
     let cfg = harness.config();
     let changesets = changelog_for_two_messages()?;
 
-    migrate(harness.pool(), &cfg, &changesets).await?;
-    migrate(harness.pool(), &cfg, &changesets).await?;
+    migrate(
+        harness.pool(),
+        &cfg,
+        &MigrationContext::default(),
+        &changesets,
+    )
+    .await?;
+    migrate(
+        harness.pool(),
+        &cfg,
+        &MigrationContext::default(),
+        &changesets,
+    )
+    .await?;
 
     let table_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
@@ -84,15 +97,62 @@ async fn migrate_is_idempotent_and_template_generalizes() -> TestResult {
 }
 
 #[tokio::test]
+async fn worker_run_loop_relays_until_shutdown() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+    let table = harness.outbox_table::<OrderCreated>().await?;
+    let cfg = harness.config();
+
+    for index in 0..3 {
+        harness
+            .enqueue(&Envelope::new(OrderCreated {
+                order_id: format!("order-run-{index}"),
+            }))
+            .await?;
+    }
+
+    let publisher = harness.publisher();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(kafkaman_worker::run(
+        harness.pool().clone(),
+        publisher,
+        table,
+        cfg.relay.clone(),
+        shutdown.clone(),
+    ));
+
+    // Wait for the background loop to drain the backlog, then stop it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while harness.published_on(OrderCreated::TOPIC).len() < 3 {
+        if std::time::Instant::now() > deadline {
+            panic!("worker did not publish all rows before the deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown.cancel();
+    worker.await??;
+
+    assert_eq!(harness.published_on(OrderCreated::TOPIC).len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn durable_send_publishes_record_and_marks_row() -> TestResult {
     let (_postgres, database_url) = start_postgres().await?;
     let harness = Harness::connect(&database_url).await?;
     let event = Envelope::new(OrderCreated {
         order_id: "order-1".to_owned(),
-    });
+    })
+    .with_idempotency_key("idem-order-1");
     let message_id = event.message_id;
 
     harness.enqueue(&event).await?;
+
+    // The idempotency key the caller set must be persisted durably, not dropped.
+    let stored = harness.outbox_row::<OrderCreated>(message_id).await?;
+    assert_eq!(stored.idempotency_key.as_deref(), Some("idem-order-1"));
+
     let stats = harness.relay_once::<OrderCreated>().await?;
 
     assert_eq!(stats.claimed, 1);
@@ -235,13 +295,514 @@ async fn mark_publish_failed_rejects_stale_claim() -> TestResult {
         message_id,
         Uuid::new_v4(),
         "wrong claim",
-        OffsetDateTime::now_utc(),
+        Duration::from_secs(1),
     )
     .await?;
     assert_eq!(outcome, MarkOutcome::StaleClaim);
     harness
         .assert_status::<OrderCreated>(message_id, OutboxStatus::Publishing)
         .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_idempotency_key_upgrades_a_pre_idempotency_outbox_table() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+    let cfg = harness.config();
+    let pool = harness.pool();
+    let descriptor = OrderCreated::descriptor()?;
+    let table = OutboxTable::new(cfg.schema.clone(), descriptor.clone())?;
+
+    // Simulate a table created before idempotency support: no idempotency_key
+    // column, and changeset v2 already recorded as applied so migrate() will not
+    // recreate it.
+    let legacy_ddl = format!(
+        "CREATE TABLE {} (
+            message_id UUID PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            topic TEXT NOT NULL,
+            correlation_id UUID NOT NULL,
+            payload JSONB NOT NULL,
+            occurred_at TIMESTAMPTZ NOT NULL
+        )",
+        table.qualified_name()
+    );
+    sqlx::query(&legacy_ddl).execute(pool).await?;
+    sqlx::query(&format!(
+        "INSERT INTO {}.\"changelog_history\" (version, name) VALUES (2, 'create_outbox_table')",
+        cfg.schema.quoted()
+    ))
+    .execute(pool)
+    .await?;
+
+    assert_eq!(idempotency_key_columns(pool, &cfg).await?, 0);
+
+    let changesets: Vec<Box<dyn Changeset>> = vec![
+        Box::new(InitSchema),
+        Box::new(CreateOutboxTable::new(2, descriptor.clone())),
+        Box::new(AddIdempotencyKey::new(3, descriptor.clone())),
+    ];
+    migrate(pool, &cfg, &MigrationContext::default(), &changesets).await?;
+
+    // The upgrade changeset must have added the column, and re-running is a no-op.
+    assert_eq!(idempotency_key_columns(pool, &cfg).await?, 1);
+    migrate(pool, &cfg, &MigrationContext::default(), &changesets).await?;
+    assert_eq!(idempotency_key_columns(pool, &cfg).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_validation_fails_before_database_work() -> TestResult {
+    let config = kafkaman_test::kafkaman_config::Config::from_str(
+        r#"
+        [database]
+        schema = "kafkaman"
+
+        [relay]
+        worker_id = "worker-a"
+        batch_limit = 10
+        lease_for = "not-a-duration"
+        retry_after = "1s"
+        "#,
+    )?;
+
+    let err = match Harness::connect_with_config(
+        "postgres://postgres:postgres@127.0.0.1:1/should_not_connect",
+        config,
+    )
+    .await
+    {
+        Ok(_) => panic!("config validation must fail before connecting to Postgres"),
+        Err(err) => err,
+    };
+    let rendered = err.to_string();
+    assert!(rendered.contains("relay.lease_for"), "{rendered}");
+    assert!(!rendered.contains("connection refused"), "{rendered}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_retry_config_fails_before_database_work() -> TestResult {
+    // A bad retry/DLQ policy must be rejected by the boot resolver, before any
+    // pool connect or migration. The Postgres URL points at a dead port to prove
+    // resolution never reaches the database.
+    let config = kafkaman_test::kafkaman_config::Config::from_str(
+        r#"
+        [database]
+        schema = "kafkaman"
+
+        [relay]
+        worker_id = "worker-a"
+        batch_limit = 10
+        lease_for = "30s"
+        retry_after = "1s"
+        poll_interval = "250ms"
+
+        [retry.defaults]
+        max_attempts = 0
+        initial_backoff = "100ms"
+        max_backoff = "30s"
+        multiplier = 2.0
+        errors_limit = 16
+        dlq = "table"
+        "#,
+    )?;
+
+    let err = match Harness::connect_with_config(
+        "postgres://postgres:postgres@127.0.0.1:1/should_not_connect",
+        config,
+    )
+    .await
+    {
+        Ok(_) => panic!("retry validation must fail before connecting to Postgres"),
+        Err(err) => err,
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("retry.defaults.max_attempts"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("connection refused"), "{rendered}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dry_run_does_not_mutate_legacy_history() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let pool = sqlx::PgPool::connect(&database_url).await?;
+    let schema = SqlIdentifier::new(format!("kafkaman_test_{}", Uuid::new_v4().simple()))?;
+    let cfg = kafkaman_sqlx::ResolvedConfig::new(schema).with_message(OrderCreated::descriptor()?);
+    let history = format!("{}.{}", cfg.schema().quoted(), "\"changelog_history\"");
+
+    // Seed a pre-idempotency, pre-audit M1-shaped history table with one row.
+    sqlx::query(&format!("CREATE SCHEMA {}", cfg.schema().quoted()))
+        .execute(&pool)
+        .await?;
+    sqlx::query(&format!(
+        "CREATE TABLE {history} (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    ))
+    .execute(&pool)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT INTO {history} (version, name) VALUES (1, 'init_schema')"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let changesets = changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, OrderCreated::descriptor()?),
+    ];
+    let ctx = MigrationContext::default().with_applied_by("dry-runner");
+    let report = migrate_dry_run(&pool, &cfg, &ctx, &changesets).await?;
+    assert_eq!(
+        report.steps()[0].action,
+        MigrationAction::SkippedAlreadyApplied
+    );
+    assert_eq!(report.steps()[1].action, MigrationAction::WouldApply);
+
+    // The bootstrap that adds + backfills `applied_by` ran only inside the
+    // rolled-back dry-run transaction, so the column must not exist afterwards.
+    let applied_by_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'changelog_history' \
+         AND column_name = 'applied_by')",
+    )
+    .bind(cfg.schema().as_str())
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        !applied_by_exists,
+        "dry-run must not persist the applied_by column"
+    );
+
+    let row_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {history}"))
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(row_count, 1, "dry-run must not insert changelog rows");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn migrate_records_report_checksum_and_applied_by() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let pool = sqlx::PgPool::connect(&database_url).await?;
+    let schema = SqlIdentifier::new(format!("kafkaman_test_{}", Uuid::new_v4().simple()))?;
+    let cfg = kafkaman_sqlx::ResolvedConfig::new(schema)
+        .with_message(OrderCreated::descriptor()?)
+        .with_message(InvoiceCreated::descriptor()?);
+    let changesets = changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, OrderCreated::descriptor()?),
+    ];
+    let ctx = MigrationContext::default().with_applied_by("integration-test");
+
+    let report = migrate(&pool, &cfg, &ctx, &changesets).await?;
+    assert_eq!(report.applied_count(), 2);
+
+    let history = format!("{}.{}", cfg.schema().quoted(), "\"changelog_history\"");
+    let rows = sqlx::query(&format!(
+        "SELECT version, checksum, applied_by FROM {history} ORDER BY version"
+    ))
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let checksum: Option<String> = sqlx::Row::try_get(&row, "checksum")?;
+        let applied_by: Option<String> = sqlx::Row::try_get(&row, "applied_by")?;
+        assert!(checksum.as_deref().is_some_and(
+            |value| value.starts_with("sha256:") && value.len() == "sha256:".len() + 64
+        ));
+        assert_eq!(applied_by.as_deref(), Some("integration-test"));
+    }
+
+    let second = migrate(&pool, &cfg, &ctx, &changesets).await?;
+    assert!(second
+        .steps()
+        .iter()
+        .all(|step| step.action == MigrationAction::SkippedAlreadyApplied));
+
+    let mutated = changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, InvoiceCreated::descriptor()?),
+    ];
+    let err = migrate(&pool, &cfg, &ctx, &mutated)
+        .await
+        .expect_err("mutated applied changeset must be rejected");
+    assert!(matches!(err, kafkaman_sqlx::Error::ChecksumMismatch { .. }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_null_checksum_history_upgrades_without_mismatch() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let pool = sqlx::PgPool::connect(&database_url).await?;
+    let schema = SqlIdentifier::new(format!("kafkaman_test_{}", Uuid::new_v4().simple()))?;
+    let cfg = kafkaman_sqlx::ResolvedConfig::new(schema).with_message(OrderCreated::descriptor()?);
+    let history = format!("{}.{}", cfg.schema().quoted(), "\"changelog_history\"");
+
+    sqlx::query(&format!("CREATE SCHEMA {}", cfg.schema().quoted()))
+        .execute(&pool)
+        .await?;
+    sqlx::query(&format!(
+        "CREATE TABLE {history} (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    ))
+    .execute(&pool)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT INTO {history} (version, name) VALUES (1, 'init_schema')"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let changesets = changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, OrderCreated::descriptor()?),
+    ];
+    let report = migrate(
+        &pool,
+        &cfg,
+        &MigrationContext::default().with_applied_by("upgrade-test"),
+        &changesets,
+    )
+    .await?;
+
+    assert_eq!(
+        report.steps()[0].action,
+        MigrationAction::SkippedAlreadyApplied
+    );
+    assert_eq!(report.steps()[1].action, MigrationAction::Applied);
+
+    let legacy = sqlx::query(&format!(
+        "SELECT checksum, applied_by FROM {history} WHERE version = 1"
+    ))
+    .fetch_one(&pool)
+    .await?;
+    let checksum: Option<String> = sqlx::Row::try_get(&legacy, "checksum")?;
+    let applied_by: Option<String> = sqlx::Row::try_get(&legacy, "applied_by")?;
+    assert!(checksum.is_none());
+    assert_eq!(applied_by.as_deref(), Some("unknown"));
+
+    Ok(())
+}
+
+#[test]
+fn changelog_macro_rejects_disordered_or_duplicate_versions() {
+    let disordered = std::panic::catch_unwind(|| {
+        let _ = changelog![
+            CreateOutboxTable::new(2, OrderCreated::descriptor().unwrap()),
+            InitSchema,
+        ];
+    });
+    assert!(disordered.is_err());
+
+    let duplicate = std::panic::catch_unwind(|| {
+        let _ = changelog![
+            InitSchema,
+            CreateOutboxTable::new(2, OrderCreated::descriptor().unwrap()),
+            CreateOutboxTable::new(2, InvoiceCreated::descriptor().unwrap()),
+        ];
+    });
+    assert!(duplicate.is_err());
+}
+
+#[tokio::test]
+async fn replay_is_bounded_context_targeted_dry_runnable_and_republished() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+
+    let events = ["replay-a", "replay-b", "replay-c"]
+        .into_iter()
+        .map(|order_id| {
+            Envelope::new(OrderCreated {
+                order_id: order_id.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    for event in &events {
+        harness.enqueue(event).await?;
+    }
+    let first_relay = harness.relay_once::<OrderCreated>().await?;
+    assert_eq!(first_relay.published, 3);
+
+    let cfg = harness.config();
+    let table = harness.outbox_table::<OrderCreated>().await?;
+    assert_eq!(
+        status_count(harness.pool(), &table, OutboxStatus::Published).await?,
+        3
+    );
+
+    let skipped = changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, OrderCreated::descriptor()?),
+        Replay::outbox::<OrderCreated>(3)?
+            .since(OffsetDateTime::UNIX_EPOCH)
+            .max_rows(2)
+            .contexts(&["prod"]),
+    ];
+    let skipped_report = migrate(
+        harness.pool(),
+        &cfg,
+        &MigrationContext::default().with_context("staging"),
+        &skipped,
+    )
+    .await?;
+    assert_eq!(
+        skipped_report.steps()[2].action,
+        MigrationAction::SkippedContext
+    );
+    assert_eq!(
+        status_count(harness.pool(), &table, OutboxStatus::Published).await?,
+        3
+    );
+
+    let replay = changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, OrderCreated::descriptor()?),
+        Replay::outbox::<OrderCreated>(3)?
+            .since(OffsetDateTime::UNIX_EPOCH)
+            .max_rows(2)
+            .contexts(&["staging"]),
+    ];
+    let ctx = MigrationContext::default().with_context("staging");
+    let dry_run = migrate_dry_run(harness.pool(), &cfg, &ctx, &replay).await?;
+    let preview = dry_run.steps()[2]
+        .preview
+        .as_deref()
+        .expect("replay dry-run should include preview");
+    assert!(preview.contains("~2"), "{preview}");
+    assert_eq!(
+        status_count(harness.pool(), &table, OutboxStatus::Published).await?,
+        3
+    );
+
+    let applied = migrate(harness.pool(), &cfg, &ctx, &replay).await?;
+    assert_eq!(applied.steps()[2].action, MigrationAction::Applied);
+    assert_eq!(
+        status_count(harness.pool(), &table, OutboxStatus::Pending).await?,
+        2
+    );
+    assert_eq!(
+        status_count(harness.pool(), &table, OutboxStatus::Published).await?,
+        1
+    );
+
+    // Replay resets delivery bookkeeping: requeued rows must start a fresh
+    // attempt budget with no carried-over failure state.
+    let stale_requeued: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {name} WHERE status = {pending} \
+         AND (attempts <> 0 OR last_error IS NOT NULL)",
+        name = table.qualified_name(),
+        pending = OutboxStatus::Pending.sql_literal(),
+    ))
+    .fetch_one(harness.pool())
+    .await?;
+    assert_eq!(
+        stale_requeued, 0,
+        "replay must clear attempts and last_error"
+    );
+
+    let rerun = migrate(harness.pool(), &cfg, &ctx, &replay).await?;
+    assert_eq!(
+        rerun.steps()[2].action,
+        MigrationAction::SkippedAlreadyApplied
+    );
+    assert_eq!(
+        status_count(harness.pool(), &table, OutboxStatus::Pending).await?,
+        2
+    );
+
+    let second_relay = harness.relay_once::<OrderCreated>().await?;
+    assert_eq!(second_relay.published, 2);
+    assert_eq!(harness.published_on(OrderCreated::TOPIC).len(), 5);
+
+    Ok(())
+}
+
+async fn idempotency_key_columns(
+    pool: &sqlx::PgPool,
+    cfg: &kafkaman_sqlx::ResolvedConfig,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+         FROM information_schema.columns
+         WHERE table_schema = $1
+           AND table_name = 'outbox_order_created'
+           AND column_name = 'idempotency_key'",
+    )
+    .bind(cfg.schema.as_str())
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+async fn status_count(
+    pool: &sqlx::PgPool,
+    table: &OutboxTable,
+    status: OutboxStatus,
+) -> Result<i64, sqlx::Error> {
+    let sql = format!(
+        "SELECT COUNT(*)::BIGINT FROM {} WHERE status = $1",
+        table.qualified_name()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .bind(status.as_str())
+        .fetch_one(pool)
+        .await
+}
+
+#[tokio::test]
+async fn concurrent_registration_on_one_harness_is_safe() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = std::sync::Arc::new(Harness::connect(&database_url).await?);
+
+    // Many tasks register and use the same not-yet-migrated message type at once.
+    // None may observe the type registered before its table exists.
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let harness = harness.clone();
+        handles.push(tokio::spawn(async move {
+            let event = Envelope::new(InvoiceCreated {
+                invoice_id: format!("invoice-{index}"),
+            });
+            harness.enqueue(&event).await?;
+            harness.relay_once::<InvoiceCreated>().await?;
+            Ok::<(), kafkaman_test::Error>(())
+        }));
+    }
+
+    for handle in handles {
+        handle.await??;
+    }
+
+    assert_eq!(harness.published_on(InvoiceCreated::TOPIC).len(), 8);
+    Ok(())
+}
+
+#[tokio::test]
+async fn enqueue_rejects_reserved_kafkaman_headers() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+
+    let mut event = Envelope::new(OrderCreated {
+        order_id: "order-reserved".to_owned(),
+    });
+    event
+        .headers
+        .insert("kafkaman-message-id".to_owned(), "spoofed".to_owned());
+
+    let error = harness.enqueue(&event).await.expect_err("must be rejected");
+    assert!(
+        error.to_string().contains("reserved"),
+        "unexpected error: {error}"
+    );
 
     Ok(())
 }
@@ -257,10 +818,10 @@ impl Publisher for FailingPublisher {
 }
 
 fn changelog_for_two_messages() -> Result<Vec<Box<dyn Changeset>>, kafkaman_sqlx::Error> {
-    Ok(vec![
-        Box::new(InitSchema),
-        Box::new(CreateOutboxTable::new(2, OrderCreated::descriptor()?)),
-        Box::new(CreateOutboxTable::new(3, InvoiceCreated::descriptor()?)),
+    Ok(changelog![
+        InitSchema,
+        CreateOutboxTable::new(2, OrderCreated::descriptor()?),
+        CreateOutboxTable::new(3, InvoiceCreated::descriptor()?),
     ])
 }
 

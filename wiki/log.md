@@ -1,5 +1,70 @@
 # Wiki Log
 
+## [2026-06-21] create | Direct mode and observability policy proposals
+
+Captured two proposed design directions from user discussion: an explicit non-durable direct Kafka producer/consumer mode for high-throughput or low-durability workloads, and a configurable `tracing`-based observability/logging policy with per-message-type overrides and payload-safety controls.
+
+Pages created:
+- wiki/proposals/03-direct-transport-mode.proposal.md
+- wiki/proposals/04-observability-logging-policy.proposal.md
+
+Pages updated:
+- wiki/index.md
+
+## [2026-06-21] fix | M2 change-engine + config review findings resolved
+
+Implemented the fixes from the M2 implementation review. Code:
+- H1: Axum example resolves config before opening a pool or touching the schema.
+- H2: `ResolvedConfig::from_config` validates a present `[retry]` section on the
+  boot path (new `Config::contains`); boot-path gate test added.
+- H3: checksums are now SHA-256 hex (`sha256:<hex>`, new `sha2` dep), replacing
+  the interim `fnv1a64:` format.
+- H4: `migrate_dry_run` runs inside a rolled-back transaction, so it persists no
+  bootstrap DDL, `applied_by` backfill, or changelog rows; gate test added.
+- M1: `Replay` resets `attempts`/`last_error` on requeued rows.
+- M2: `kafkaman.example.toml` labels `database.url`/`kafka.brokers` as host-owned.
+- M3: dry-run uses `pg_try_advisory_lock`, returns new `Error::MigrationLockBusy`.
+- M4: added boot-path retry and dry-run-legacy-history gate tests.
+- L1/L2/L4/L5: explicit nullable checksum decode, `try_changelog!`, zero-duration
+  rejection, `errors_limit` is `u32`. L3 (bind-carrying statements) deferred.
+
+Verification: fmt/clippy/check clean; 13 unit + 17 durable-send + 1 axum-http
+tests pass. Pages affected: wiki/specs/m2-change-engine-config.spec.md,
+wiki/compatibility/m2-change-engine-config-schema-and-api.compat.md,
+wiki/reviews/m2-change-engine-config-implementation-review.reference.md,
+wiki/log.md.
+
+## [2026-06-21] promote | M2 change-engine/config implementation validated
+
+Implemented M2 change-engine and configuration slice: dedicated `kafkaman-config`
+crate, config-loaded `ResolvedConfig`, migration reports, nullable checksum and
+`applied_by` changelog audit columns, checksum drift enforcement,
+`changelog!`, dry-run preview, and guarded send-side `Replay`.
+Pages affected: wiki/specs/m2-change-engine-config.spec.md,
+wiki/compatibility/m2-change-engine-config-schema-and-api.compat.md,
+wiki/roadmaps/path-to-v1.roadmap.md, wiki/plans/m2-change-engine-config.plan.md,
+wiki/index.md.
+
+## [2026-06-21] create | V1 remaining decision pass
+
+Recorded user-selected options for the remaining V1 planning decisions:
+required idempotency keys for all persisted V1 messages, rejected
+user-supplied `kafkaman-*` headers, per-message retry/backoff/DLQ runtime
+configuration in `kafkaman.toml`, table-backed V1 DLQ, split sub-decision vs
+milestone validation status, and dependency-aware parallel worktrees.
+
+Pages created:
+- wiki/decisions/message-identity-and-header-namespace.decision.md
+- wiki/decisions/retry-backoff-dlq-policy.decision.md
+- wiki/decisions/v1-roadmap-execution-policy.decision.md
+
+Pages affected:
+- wiki/decisions/message-consumption-and-handler-model.decision.md
+- wiki/decisions/configuration-and-environment-model.decision.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
 ## [2026-06-20] promote | M1 durable-send implementation validated
 
 Implemented the M1 durable-send slice on branch `implementation/m1-durable-send`.
@@ -419,5 +484,106 @@ visibility, duplicate descriptors, and unused worker publish-error surface.
 
 Pages affected:
 - wiki/reviews/m1-durable-send-implementation-review.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] create | M1 durable-send implementation re-review
+
+Created a fresh sourced re-review after attempted fixes to the M1 durable-send
+implementation. Verified the current working tree against the plan, active spec,
+tests, examples, and prior review. Recorded fixed items, remaining scope gaps,
+and new risks, including the missing `idempotency_key` upgrade migration for
+existing outbox tables, still-missing Redpanda/full-loop Harness path, remaining
+Harness registration race, strict clippy failure, and reserved Kafka metadata
+header collision risk. Updated the wiki index date and Reviews catalog.
+
+Pages affected:
+- wiki/reviews/m1-durable-send-implementation-rereview.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] implement | M1 durable-send review-fix pass
+
+Resolved both M1 durable-send reviews in code. Implemented the Redpanda
+full-loop path (`Harness::connect_redpanda` + `HarnessPublisher::Redpanda`,
+behind the `redpanda` feature) with a testcontainer gate that publishes through
+`RdkafkaPublisher` and consumes the record back, asserting payload, key, and
+`kafkaman-*` headers. Centralized status SQL via `OutboxStatus`, moved lease and
+retry scheduling to the database clock, made the worker `run()` loop resilient
+with `tracing`, advisory-locked `migrate()`, made `idempotency_key` durable and
+forwarded (with an additive `AddIdempotencyKey` upgrade changeset and test),
+rejected reserved `kafkaman-` headers at enqueue, and closed the Harness
+registration race. Strict clippy and fmt pass. Added `cargo llvm-cov` coverage
+with an 80% workspace line gate (`just test coverage`); current line coverage is
+~93%. The example now consumes the `kafkaman` facade, is split into a testable
+lib + thin bin, and was moved from `examples/` to `apps/axum-outbox` so
+cargo-llvm-cov (which excludes `examples/`) counts it in the workspace total.
+Added a `justfile` with `just test [all|unit|integration|coverage]` (default
+`all` runs the full suite including integration).
+
+Pages affected:
+- wiki/plans/m1-durable-send-implementation.plan.md
+- wiki/compatibility/m1-durable-send-schema-and-api-changes.compatibility.md
+- wiki/index.md
+- wiki/log.md
+- justfile
+- apps/axum-outbox/ (moved from examples/)
+
+## [2026-06-21] review | M2 change-engine + config implementation
+
+Wrote `wiki/reviews/m2-change-engine-config-implementation-review.reference.md`: a
+line-by-line challenge of the M2 implementation against its plan and spec.
+
+Key findings:
+- H1: retry-config validation never invoked on any boot path (unit-test-only),
+  so the spec's "retry validated" / roadmap "fails fast at boot" is unmet for retry.
+- H2: checksum is FNV-1a 64-bit, not the SHA-256 the plan specified; ad-hoc
+  delimiter-based canonical form.
+- H3: migrate_dry_run creates schema/history table and backfills (not side-effect-free).
+- M1: Replay leaves attempts/last_error stale, will fight M4 retry cap.
+- Plus medium/low: noisy from_config error aggregation, NULL/decode conflation in
+  history_row, example.toml advertising ignored keys, exclusive dry-run lock,
+  missing concurrent-migrate and tunable-change gate tests.
+
+Pages affected:
+- wiki/reviews/m2-change-engine-config-implementation-review.reference.md (new)
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] create | M3 durable receive implementation plan
+
+Created the active M3 execution plan for durable receive and toolkit maturity.
+The plan sequences the first Harness-level receive test, received-table schema,
+deterministic dispatch, explicit handler API, receive-side test tooling, Kafka
+ingest, and validation gates.
+
+Pages affected:
+- wiki/plans/m3-durable-receive.plan.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] update | M3 durable receive plan review fixes
+
+Clarified the M3 dispatch transaction model before implementation. The plan now
+chooses the held-transaction row-lock model, removes persistent receive claim
+columns from M3, defines parked retryable failure accounting, requires
+Clock-bound due predicates, adds property and crash gates, includes consume-side
+replay, includes `#[kafkaman::test]`, states crate topology, and adds
+greenfield `idempotency_key NOT NULL` plus bounded-errors ring verification.
+
+Pages affected:
+- wiki/plans/m3-durable-receive.plan.md
+- wiki/log.md
+
+## [2026-06-21] update | M3 durable receive first implementation slice
+
+Recorded the first M3 durable-receive implementation slice: received-table core
+types and DDL, deduplicating received insert, Harness receive helpers, minimal
+message router, and held-transaction `dispatch_once()` success/failure behavior.
+Proof commands recorded in the active M3 plan.
+
+Pages affected:
+- wiki/plans/m3-durable-receive.plan.md
 - wiki/index.md
 - wiki/log.md

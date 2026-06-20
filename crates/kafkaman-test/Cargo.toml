@@ -11,6 +11,7 @@ redpanda = ["dep:kafkaman-rdkafka"]
 
 [dependencies]
 async-trait.workspace = true
+kafkaman-config = { path = "../kafkaman-config" }
 kafkaman-core = { path = "../kafkaman-core" }
 kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true }
 kafkaman-sqlx = { path = "../kafkaman-sqlx" }
@@ -19,4 +20,5 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true

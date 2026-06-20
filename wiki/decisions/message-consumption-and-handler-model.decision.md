@@ -4,12 +4,14 @@
 - Status: Draft
 - Date: 2026-06-20
 - Category: Runtime and integration
-- Scope: How kafkaman consumes from Kafka durably, how received messages are stored and de-duplicated, and the handler programming model (a Tower stack with extractors). Retry/backoff/DLQ *policy* is left as a deferred follow-up; this decision only reserves the fields and seams for it.
+- Scope: How kafkaman consumes from Kafka durably, how received messages are stored and de-duplicated, and the handler programming model (a Tower stack with extractors). Retry/backoff/DLQ policy is defined separately; this decision reserves and uses the fields and seams for it.
 - Sources:
   - raw/design/2026-06-20-kafkaman-architecture-discussion.md
   - wiki/decisions/messaging-scope-and-receive-model.decision.md
   - wiki/decisions/schema-and-change-management.decision.md
   - wiki/decisions/runtime-composition-and-topology.decision.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
 - Related:
   - wiki/decisions/runtime-composition-and-topology.decision.md
   - wiki/decisions/schema-and-change-management.decision.md
@@ -45,9 +47,10 @@
    `processed_at`).
 
 3. **Dedup is a log; failures accumulate in a bounded `errors` JSONB array.**
-   - **Dedup:** ingest does `INSERT … ON CONFLICT DO NOTHING` on the identity
-     `UNIQUE`. A Kafka redelivery is a **logged no-op** — it never blocks ingest
-     and the offset still advances.
+   - **Dedup:** every persisted V1 message has a required `idempotency_key`.
+     Ingest does `INSERT … ON CONFLICT DO NOTHING` on the per-type
+     `UNIQUE(idempotency_key)`. A Kafka redelivery or semantic duplicate is a
+     **logged no-op** — it never blocks ingest and the offset still advances.
    - **`errors` is a JSONB array**, not a single `last_error` string: each failed
      attempt appends `{ attempt, at, error, … }`, so operators see the **recent
      failure history** for writing dedicated fix-up code. **Safeguarded against
@@ -185,25 +188,26 @@
 - A duplicate within the dedup window is silently skipped (logged), not surfaced
   to the handler — intentional, but means dedup is invisible unless inspected.
 
-## Open Question — Dedup Identity (must ratify before M3)
+## Ratified Sub-Decision - Dedup Identity
 
-Dedup hinges on a per-type `UNIQUE`, but **which column(s) it keys on is not yet
-pinned** — and the candidates dedup *different* things:
+Dedup hinges on a per-type `UNIQUE`, and the accepted V1 identity is the
+required business `idempotency_key`.
 
-- **`(topic, partition, offset)`** — dedups Kafka **redeliveries** only. Two
-  semantically-identical events published at different offsets are *not* collapsed.
-- **`message_id`** (envelope UUID, producer-assigned) — dedups *that envelope*
-  across redeliveries and rebalances; the natural envelope-level identity.
-- **business idempotency key** (producer-supplied, domain-meaningful) — dedups
-  *semantic* duplicates (the same logical event re-emitted), which is what
-  effective-once *processing* usually wants.
+Options considered:
 
-**Recommended default (to ratify):** the per-type `UNIQUE` keys on the
-**idempotency key when the envelope carries one, else `message_id`** — semantic
-dedup when producers opt in, envelope-level dedup otherwise. This is a receive-side
-(M3) concern and does **not** block the M1 send PoC, but it must be ratified before
-the inbox tables are designed, because the effective-once guarantee is only as
-correct as this key.
+- **`(topic, partition, offset)`** - dedups Kafka redeliveries only. Two
+  semantically identical events published at different offsets are not collapsed.
+- **`message_id`** - dedups one envelope instance across redeliveries and
+  rebalances, but not the same business event emitted with a new envelope id.
+- **`idempotency_key` when present, else `message_id`** - flexible, but creates
+  two semantic classes of V1 messages.
+- **Required `idempotency_key`** - accepted. It gives kafkaman one semantic
+  dedup contract and forces producers to state the business identity of each
+  durable message.
+
+The separate
+[message identity and header namespace decision](message-identity-and-header-namespace.decision.md)
+owns the envelope-level contract and the reserved `kafkaman-*` header namespace.
 
 ## Revisit When
 

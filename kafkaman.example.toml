@@ -1,38 +1,44 @@
-# kafkaman.example.toml — committed template documenting every config key.
+# kafkaman.example.toml
 #
-# This file is TRACKED in git and contains only dummy values. The real
-# `kafkaman.toml` is gitignored and rendered per environment by CI/CD, with
-# secrets injected from the vault / config manager at deploy time. The running
-# instance reads one already-resolved flat file — there are no [profile] sections.
-#
-# ILLUSTRATIVE / PRE-IMPLEMENTATION: the key set below sketches the intended
-# shape. It is not yet validated by code and will be finalized with the first
-# implementation slice (see wiki/plans/first-poc-outbox-publisher.plan.md).
-#
-# See wiki/decisions/configuration-and-environment-model.decision.md.
+# Copy to kafkaman.toml at deploy time after CI/CD has rendered environment
+# specific secrets. The running process reads one already-resolved file; there
+# are no profiles, overlays, or environment-name sections.
 
-# --- Connections (secrets — injected by CI/CD, never committed resolved) -------
 [database]
-# Postgres connection string. Injected from the vault per environment.
-url = "postgres://user:password@localhost:5432/app"
-# Postgres schema kafkaman owns (configurable for public-only shops).
+# `schema` is the only key in this section that kafkaman's M2 config contract
+# reads; it owns the migration/table namespace.
 schema = "kafkaman"
+#
+# `url` is host-owned sample context, NOT consumed by kafkaman. The example app
+# (apps/axum-outbox) reads its Postgres connection string from the DATABASE_URL
+# environment variable, so this value is ignored if you set it here.
+# url = "postgres://user:password@localhost:5432/app"
 
-[kafka]
-# Comma-separated broker list. Injected from the vault per environment.
-brokers = "localhost:9092"
+# `[kafka].brokers` is likewise host-owned: the example app reads KAFKA_BROKERS
+# from the environment. Kept here only to document the expected shape; it is not
+# part of kafkaman's M2 config contract and is ignored if set.
+# [kafka]
+# brokers = "localhost:9092"
 
-# --- Runtime config (re-read at every boot; tunable via config + redeploy) -----
-# These are NOT changesets: changing a value and redeploying takes effect.
+[relay]
+worker_id = "orders-relay-1"
+batch_limit = 100
+lease_for = "30s"
+retry_after = "1s"
+poll_interval = "250ms"
 
-[retention]
-# How long to keep terminal (published / processed) rows before purge.
-# Per-env: e.g. short in preprod, long in prod.
-window = "168h"
+[retry.defaults]
+max_attempts = 5
+initial_backoff = "500ms"
+max_backoff = "30s"
+multiplier = 2.0
+errors_limit = 16
+dlq = "table"
 
-[runtime]
-# Relay/scheduler claim batch size and pacing.
-claim_batch_size = 100
-# Mandatory rate limiting for bulk operations (purge enforcer, replay drain).
-purge_batch_size = 500
-purge_rate_per_sec = 1000
+[retry.messages.order_created]
+max_attempts = 8
+initial_backoff = "250ms"
+max_backoff = "60s"
+multiplier = 1.5
+errors_limit = 32
+dlq = "table"

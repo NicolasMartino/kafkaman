@@ -17,6 +17,9 @@ pub enum Error {
     #[error("invalid outbox status `{0}`")]
     InvalidOutboxStatus(String),
 
+    #[error("invalid receive status `{0}`")]
+    InvalidReceiveStatus(String),
+
     #[error("message descriptor is invalid: {0}")]
     InvalidMessageDescriptor(String),
 }
@@ -133,6 +136,25 @@ impl MessageDescriptor {
     }
 }
 
+/// Header keys beginning with this prefix are reserved for kafkaman-managed
+/// metadata (message id, correlation id, causation id, idempotency key) and may
+/// not be set by callers, so user headers can never shadow or spoof them.
+pub const RESERVED_HEADER_PREFIX: &str = "kafkaman-";
+
+/// Returns the first envelope header key that intrudes on the reserved
+/// `kafkaman-` namespace, if any. Comparison is ASCII case-insensitive, so
+/// `Kafkaman-Message-Id` is rejected just like `kafkaman-message-id`.
+pub fn reserved_header(headers: &BTreeMap<String, String>) -> Option<&str> {
+    let prefix = RESERVED_HEADER_PREFIX.as_bytes();
+    headers
+        .keys()
+        .find(|key| {
+            let bytes = key.as_bytes();
+            bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+        })
+        .map(String::as_str)
+}
+
 pub trait KafkaMessage: Serialize {
     const MESSAGE_TYPE: &'static str;
     const TOPIC: &'static str;
@@ -179,6 +201,11 @@ impl<P> Envelope<P> {
         self.correlation_id = correlation_id;
         self
     }
+
+    pub fn with_idempotency_key(mut self, idempotency_key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(idempotency_key.into());
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -190,6 +217,16 @@ pub enum OutboxStatus {
 }
 
 impl OutboxStatus {
+    /// Every status value, in declaration order. SQL generators build CHECK
+    /// constraints and `IN (...)` lists from this so the database can never
+    /// drift from the Rust enum.
+    pub const ALL: [OutboxStatus; 4] = [
+        Self::Pending,
+        Self::Publishing,
+        Self::Published,
+        Self::Failed,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "Pending",
@@ -197,6 +234,23 @@ impl OutboxStatus {
             Self::Published => "Published",
             Self::Failed => "Failed",
         }
+    }
+
+    /// The status rendered as a single-quoted SQL string literal, e.g.
+    /// `'Pending'`. Status names are fixed ASCII identifiers, so this is safe to
+    /// interpolate directly into generated SQL.
+    pub fn sql_literal(self) -> String {
+        format!("'{}'", self.as_str())
+    }
+
+    /// Comma-separated SQL literal list of every status, for use in `IN (...)`
+    /// expressions and CHECK constraints.
+    pub fn sql_literal_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|status| status.sql_literal())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -220,9 +274,103 @@ impl FromStr for OutboxStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReceiveStatus {
+    Pending,
+    Processing,
+    Processed,
+    Retryable,
+    Failed,
+}
+
+impl ReceiveStatus {
+    /// Every receive status, in declaration order. SQL generators derive CHECK
+    /// constraints from this so received tables cannot drift from the Rust enum.
+    pub const ALL: [ReceiveStatus; 5] = [
+        Self::Pending,
+        Self::Processing,
+        Self::Processed,
+        Self::Retryable,
+        Self::Failed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Processing => "Processing",
+            Self::Processed => "Processed",
+            Self::Retryable => "Retryable",
+            Self::Failed => "Failed",
+        }
+    }
+
+    pub fn sql_literal(self) -> String {
+        format!("'{}'", self.as_str())
+    }
+
+    pub fn sql_literal_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|status| status.sql_literal())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl fmt::Display for ReceiveStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReceiveStatus {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "Pending" => Ok(Self::Pending),
+            "Processing" => Ok(Self::Processing),
+            "Processed" => Ok(Self::Processed),
+            "Retryable" => Ok(Self::Retryable),
+            "Failed" => Ok(Self::Failed),
+            other => Err(Error::InvalidReceiveStatus(other.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceivedError {
+    pub message: String,
+    pub occurred_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceivedRow {
+    pub message_id: Uuid,
+    pub idempotency_key: String,
+    pub status: ReceiveStatus,
+    pub attempts: i32,
+    pub next_attempt_at: Option<OffsetDateTime>,
+    pub errors: Vec<ReceivedError>,
+    pub source_topic: String,
+    pub source_partition: i32,
+    pub source_offset: i64,
+    pub key: Option<Vec<u8>>,
+    pub message_type: String,
+    pub message_version: i32,
+    pub headers: BTreeMap<String, String>,
+    pub payload: serde_json::Value,
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub occurred_at: OffsetDateTime,
+    pub created_at: OffsetDateTime,
+    pub processed_at: Option<OffsetDateTime>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
     pub message_id: Uuid,
+    pub idempotency_key: Option<String>,
     pub status: OutboxStatus,
     pub attempts: i32,
     pub next_attempt_at: OffsetDateTime,
@@ -297,12 +445,35 @@ impl Default for RelayConfig {
     }
 }
 
+impl RelayConfig {
+    /// Reject configurations that would break relay correctness or spin the
+    /// worker. A zero lease is the dangerous one: the claim would expire the
+    /// instant it is taken, so another worker could reclaim and republish in a
+    /// tight loop. `retry_after` may be zero (immediate retry is legitimate).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.lease_for.is_zero() {
+            return Err("lease_for must be greater than zero".to_owned());
+        }
+        if self.batch_limit <= 0 {
+            return Err("batch_limit must be greater than zero".to_owned());
+        }
+        if self.poll_interval.is_zero() {
+            return Err("poll_interval must be greater than zero".to_owned());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelayStats {
     pub claimed: usize,
     pub published: usize,
     pub failed: usize,
+    /// A mark was rejected because the row's claim had been lost to another
+    /// worker (lease expired and reclaimed).
     pub stale: usize,
+    /// A mark found no row at all (the outbox row was deleted/purged).
+    pub missing: usize,
 }
 
 #[cfg(test)]
@@ -324,5 +495,47 @@ mod tests {
             OutboxStatus::Pending
         );
         assert!("Nope".parse::<OutboxStatus>().is_err());
+    }
+
+    #[test]
+    fn relay_config_rejects_unsafe_durations() {
+        let cfg = RelayConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        let zero_lease = RelayConfig {
+            lease_for: Duration::from_secs(0),
+            ..RelayConfig::default()
+        };
+        assert!(zero_lease.validate().is_err());
+
+        let zero_poll = RelayConfig {
+            poll_interval: Duration::from_secs(0),
+            ..RelayConfig::default()
+        };
+        assert!(zero_poll.validate().is_err());
+    }
+
+    #[test]
+    fn detects_reserved_header_namespace() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-trace-id".to_owned(), "abc".to_owned());
+        assert!(reserved_header(&headers).is_none());
+
+        headers.insert("Kafkaman-Message-Id".to_owned(), "spoof".to_owned());
+        assert_eq!(reserved_header(&headers), Some("Kafkaman-Message-Id"));
+    }
+
+    #[test]
+    fn status_sql_helpers_stay_aligned_with_enum() {
+        for status in OutboxStatus::ALL {
+            // The SQL literal, the display string, and the parser must all agree
+            // on the same canonical name for every status.
+            assert_eq!(status.sql_literal(), format!("'{status}'"));
+            assert_eq!(status.as_str().parse::<OutboxStatus>().unwrap(), status);
+        }
+        assert_eq!(
+            OutboxStatus::sql_literal_list(),
+            "'Pending', 'Publishing', 'Published', 'Failed'"
+        );
     }
 }

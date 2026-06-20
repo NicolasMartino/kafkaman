@@ -10,6 +10,7 @@
   - wiki/decisions/schema-and-change-management.decision.md
 - Related:
   - wiki/decisions/schema-and-change-management.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
   - wiki/proposals/01-kafkaman-objectives.proposal.md
 
 ## Decision
@@ -41,11 +42,15 @@
    - **Runtime subsystems** (purge enforcer, schedulers) **re-read it at every
      boot**. This is why tunable settings live here.
 6. **Tunable settings are runtime config, not changesets.** Retention windows,
-   batch sizes, and rate limits are read by the runtime at boot. Because the
+   batch sizes, rate limits, and retry/backoff/DLQ policies are read by the
+   runtime at boot. Because the
    file is re-rendered per env and re-read each boot, **changing a value +
    redeploying takes effect** — no new changeset required. (A run-once changeset
    could not do this: once applied, it never re-runs.) This supersedes the
    earlier "`SetRetention` changeset" idea.
+   Per-message retry policy uses common defaults plus message-type overrides in
+   `kafkaman.toml`; these are environment-rendered runtime values, not schema
+   history.
 7. **Config selects values, not structure — enforced by the contract.** A
    changeset may pull a *value* from `cfg` but must not branch *structural* logic
    on configuration. Because `cfg` hands over typed values rather than an

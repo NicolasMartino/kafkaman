@@ -63,6 +63,13 @@ impl RdkafkaPublisher {
                 value: Some(correlation_id.as_str()),
             });
 
+        if let Some(idempotency_key) = row.row.idempotency_key.as_deref() {
+            headers = headers.insert(Header {
+                key: "kafkaman-idempotency-key",
+                value: Some(idempotency_key),
+            });
+        }
+
         let causation_id;
         if let Some(id) = row.row.causation_id {
             causation_id = id.to_string();

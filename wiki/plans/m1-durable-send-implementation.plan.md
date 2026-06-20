@@ -47,7 +47,7 @@ kafkaman/
 │   ├── kafkaman-worker/         # relay_once/run, generic over publisher trait
 │   ├── kafkaman-test/           # Harness seed
 │   └── kafkaman/                # facade re-export crate (optional in M1)
-├── examples/
+├── apps/
 │   └── axum-outbox/             # runnable Axum + SQLx durable-send example
 └── tests/
     └── durable_send.rs          # workspace-level tests that use kafkaman-test
@@ -70,7 +70,7 @@ DDL and SQL-builder tests through the Harness."
   `tracing`.
 - `rdkafka` only in `kafkaman-rdkafka` and full-loop test features.
 - `testcontainers` only in workspace integration tests / full-loop feature.
-- `axum` + `axum-sqlx-tx` only in `examples/axum-outbox`. M1 does **not** build
+- `axum` + `axum-sqlx-tx` only in `apps/axum-outbox`. M1 does **not** build
   `kafkaman-axum`; the example calls `kafkaman-sqlx::enqueue(...)` directly.
 
 ## kafkaman-core
@@ -453,3 +453,30 @@ validated identifier/table naming, per-type outbox DDL, the M1 `migrate()` subse
 transactional enqueue, relay claim/lease semantics, and the send-side Harness API.
 Do **not** promote the full change-engine/config/retry contracts until their later
 milestones validate them.
+
+## Post-Review Fix Pass (2026-06-21)
+
+Two implementation reviews
+([review](../reviews/m1-durable-send-implementation-review.reference.md),
+[re-review](../reviews/m1-durable-send-implementation-rereview.reference.md))
+were resolved after the initial completion. Outcome:
+
+- **Redpanda / full-loop path implemented** (was the standing scope gap). The
+  plan's broker-backed gate now exists as a `redpanda`-feature-gated test that
+  starts Redpanda as a testcontainer, publishes through `RdkafkaPublisher` via
+  `Harness::connect_redpanda` (new `HarnessPublisher::Redpanda` variant), and
+  asserts the consumed record's payload, key, and `kafkaman-*` headers. It is a
+  testcontainer gate rather than docker-compose, but proves the same path.
+- **Status SQL centralized** through `OutboxStatus` helpers; **lease and retry
+  scheduling moved to the database clock**; **worker `run()` no longer dies** on a
+  transient relay error (logs via `tracing` and continues); **`migrate()` is
+  advisory-locked** against concurrent boots; **`idempotency_key` is durable** and
+  forwarded, with an additive `AddIdempotencyKey` upgrade changeset for
+  pre-existing tables; **reserved `kafkaman-` headers are rejected** at enqueue;
+  the **Harness registration race** is closed; **strict clippy** passes.
+- **Coverage:** workspace line coverage is gated at 80% via `cargo llvm-cov`
+  (`just test coverage`); the example now lives in `apps/` so it counts toward the
+  total. See the compatibility note for schema/API impact.
+
+Schema and API impact is recorded in
+[compatibility/m1-durable-send-schema-and-api-changes.compatibility.md](../compatibility/m1-durable-send-schema-and-api-changes.compatibility.md).
