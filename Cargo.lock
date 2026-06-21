@@ -530,7 +530,9 @@ name = "durable-send-tests"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "kafkaman-config",
  "kafkaman-core",
+ "kafkaman-rdkafka",
  "kafkaman-sqlx",
  "kafkaman-test",
  "kafkaman-worker",
@@ -1266,10 +1268,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "kafkaman-core",
+ "kafkaman-sqlx",
  "kafkaman-worker",
  "rdkafka",
+ "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

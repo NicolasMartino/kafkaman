@@ -338,8 +338,29 @@ impl FromStr for ReceiveStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReceivedFailureKind {
+    MissingHandler,
+    InvalidPayload,
+    Infrastructure,
+    #[default]
+    Handler,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReceivedIngestFailureKind {
+    MissingPayload,
+    MissingIdempotencyKey,
+    InvalidPayload,
+    InvalidHeader,
+    UnexpectedTopic,
+    MessageIdConflict,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReceivedError {
+    #[serde(default)]
+    pub kind: ReceivedFailureKind,
     pub message: String,
     pub occurred_at: OffsetDateTime,
 }
@@ -365,6 +386,50 @@ pub struct ReceivedRow {
     pub occurred_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
     pub processed_at: Option<OffsetDateTime>,
+}
+
+/// Read-only message metadata handed to a dispatch handler alongside the
+/// deserialized payload. Carries the identity, routing, and provenance fields
+/// persisted on [`ReceivedRow`] so handlers can correlate, trace, and inspect
+/// delivery state without re-querying the received table. `attempts` reflects
+/// the count at claim time, i.e. the number of prior failed dispatches.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReceivedMeta {
+    pub message_id: Uuid,
+    pub idempotency_key: String,
+    pub message_type: String,
+    pub message_version: i32,
+    pub attempts: i32,
+    pub headers: BTreeMap<String, String>,
+    pub source_topic: String,
+    pub source_partition: i32,
+    pub source_offset: i64,
+    pub key: Option<Vec<u8>>,
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub occurred_at: OffsetDateTime,
+    pub created_at: OffsetDateTime,
+}
+
+impl From<&ReceivedRow> for ReceivedMeta {
+    fn from(row: &ReceivedRow) -> Self {
+        Self {
+            message_id: row.message_id,
+            idempotency_key: row.idempotency_key.clone(),
+            message_type: row.message_type.clone(),
+            message_version: row.message_version,
+            attempts: row.attempts,
+            headers: row.headers.clone(),
+            source_topic: row.source_topic.clone(),
+            source_partition: row.source_partition,
+            source_offset: row.source_offset,
+            key: row.key.clone(),
+            correlation_id: row.correlation_id,
+            causation_id: row.causation_id,
+            occurred_at: row.occurred_at,
+            created_at: row.created_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

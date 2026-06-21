@@ -1,8 +1,8 @@
 # Wiki Index
 
 Project: kafkaman
-Stage: M3 durable receive plan active
-Updated: 2026-06-21
+Stage: M4 retry/backoff/DLQ active
+Updated: 2026-06-22
 
 One-line: A Rust library plus optional worker runtime for reliable Kafka-backed
 service messaging, using Postgres as the durable execution ledger.
@@ -17,6 +17,20 @@ service messaging, using Postgres as the durable execution ledger.
   Validated M2 behavior: `kafkaman.toml` loader, fail-fast resolved config,
   migration reports, checksums, `applied_by`, `changelog!`, dry-run, and guarded
   send-side `Replay`. Status: Active.
+- [specs/m4-retry-backoff-dlq.spec.md](specs/m4-retry-backoff-dlq.spec.md) -
+  Validated M4 reliability behavior: per-type retry policy resolution, exponential
+  backoff with due-gated dispatch, terminal table-backed DLQ on exhaustion,
+  bounded error history, the `received_failed_rows`/`received_failed_count` DLQ
+  inspect surface with `ReceivedFailureFilter`, and guarded `Replay::received`
+  redrive (kind filter, history-preserving by default, opt-in `clear_history`).
+  Status: Active.
+- [specs/m3-durable-receive.spec.md](specs/m3-durable-receive.spec.md) -
+  Validated M3 durable receive behavior: Kafka ingest writes a durable received
+  row or quarantine row before committing offsets, idempotency-key dedup,
+  message-id conflict quarantine, dispatcher row claiming, locked-row receive
+  failure accounting with handler savepoints, `Replay::received`, production
+  ingest/dispatcher loops, and atomic consume-then-produce through `ReceivedMeta` plus
+  `enqueue_on_connection`. Status: Active.
 
 ## Reviews
 
@@ -36,6 +50,34 @@ service messaging, using Postgres as the durable execution ledger.
   validation never being wired into any boot path, the checksum being FNV-1a (not
   the specified SHA-256), a non-side-effect-free dry-run, and stale `attempts` on
   replay. Status: Sourced.
+- [reviews/m3-durable-receive-implementation-review.reference.md](reviews/m3-durable-receive-implementation-review.reference.md)
+  - Review of the first M3 durable-receive slice. Follow-up implementation
+  resolves the stale failure-accounting race, the Harness send/receive
+  registration conflict, the missing stale-failure/crash/randomized-redelivery/
+  bounded-error-ring/transient-processing-write/missing-received-row gates, and
+  the handler metadata-access (`ReceivedMeta`) and `correlation_id` nullability
+  findings. All H/M/L findings are closed; only out-of-scope new M3 surface area
+  (`FromMessage`/`Rx`/Tower, `Replay::received`, injected clock, macros, Kafka
+  ingest, full-loop) remains, tracked in the plan. Status: Resolved.
+- [reviews/m3-durable-completion-implementation-review.reference.md](reviews/m3-durable-completion-implementation-review.reference.md)
+  - Adversarial review of the M3 durable-completion slice (ingest loop,
+  dispatcher loop, `Replay::received`). Original F1-F9 findings are closed by
+  the 2026-06-22 follow-up implementation: deterministic ingest skips with
+  offset commit, receive insert conflict hardening, dispatcher drain and
+  mid-dispatch shutdown tests, retryable-only `Replay::received`, structured
+  receive failure causes, and Redpanda poison/redelivery/topic-provenance
+  coverage. Broader M3 closure gates remain in the active plan. Status: Sourced.
+- [reviews/m3-durable-completion-implementation-rereview.reference.md](reviews/m3-durable-completion-implementation-rereview.reference.md)
+  - Second pass after the review-fix slice. Confirms F1-F5 closed and test-pinned,
+  but finds the fixes traded partition stalls for silent drops: deterministic
+  ingest skip loses data with no durable trace (G1), schema skew is treated as
+  poison and silently dropped topic-wide (G2), untargeted `ON CONFLICT` silently
+  drops a different logical message on `message_id` collision (G3), failure `kind`
+  is derived from the error variant not the failure domain (G4), and replay erases
+  the error history of the rows it targets (G5). Follow-up implementation adds
+  durable ingest quarantine, a consecutive-skip circuit breaker, explicit
+  message-id conflict outcome/quarantine, handler-domain SQL classification, and
+  replay history preservation. Status: Sourced.
 
 ## Compatibility
 
@@ -46,11 +88,52 @@ service messaging, using Postgres as the durable execution ledger.
   rejection. Status: Active.
 - [compatibility/m2-change-engine-config-schema-and-api.compat.md](compatibility/m2-change-engine-config-schema-and-api.compat.md)
   - M2 schema/API changes: nullable `checksum` and `applied_by`
-  `changelog_history` columns, `migrate(..., MigrationContext, ...) ->
-  MigrationReport` signature break, dry-run, and guarded replay behavior.
-  Status: Draft.
+    `changelog_history` columns, `migrate(..., MigrationContext, ...) ->
+    MigrationReport` signature break, dry-run, and guarded replay behavior.
+    Status: Draft.
+- [compatibility/m3-durable-receive-review-fix-api.compat.md](compatibility/m3-durable-receive-review-fix-api.compat.md)
+  - M3 receive review-fix API and operational-data changes:
+    `IngestStats.skipped`, `RdkafkaConsumer::Error::UnexpectedTopic`,
+    `RdkafkaConsumer::Error::ConsecutiveSkipLimitExceeded`,
+    `IngestLoopStats`, `RdkafkaConsumer::run_ingester`, `test-hooks`
+    ingest/dispatch hook APIs, `ReceivedError.kind`,
+    `ReceivedIngestFailureKind`, `ReceivedInsertOutcome`, deterministic ingest
+    quarantine, receive insert conflict classification, and retryable-only
+    `Replay::received`. Status: Active.
+
+- [compatibility/m4-retry-backoff-runtime-api.compat.md](compatibility/m4-retry-backoff-runtime-api.compat.md)
+  - M4 retry/backoff runtime API and behavior changes: default retry policy,
+    `ResolvedConfig.retry`, `ReceivedTable.retry`, scheduled `next_attempt_at`,
+    terminal `Failed` status, and configured error-history bounds. Status:
+    Active.
 
 ## Decisions
+
+- [decisions/missing-handler-dispatch-policy.decision.md](decisions/missing-handler-dispatch-policy.decision.md)
+  - Missing handlers are row-level durable dispatch failures recorded under the
+    claimed row lock, parking the row without head-of-line blocking younger
+    rows. Status: Accepted.
+- [decisions/dispatch-infrastructure-error-classification.decision.md](decisions/dispatch-infrastructure-error-classification.decision.md)
+  - Post-handler infrastructure errors, including poisoned transactions after a
+    swallowed SQL error, are recorded as receive failure accounting with a
+    separate-connection fallback when rollback cannot run. Status: Accepted.
+- [decisions/dispatch-stats-semantics.decision.md](decisions/dispatch-stats-semantics.decision.md)
+  - `DispatchStats.failed` counts committed durable failure records; competing
+    dispatchers skip a locked row while failure accounting is in flight. Status:
+    Accepted.
+- [decisions/kafka-ingest-identity-and-ordering.decision.md](decisions/kafka-ingest-identity-and-ordering.decision.md)
+  - Kafka ingest requires an idempotency key, writes the received row before
+    committing the broker offset, and preserves reserved kafkaman metadata
+    headers separately from user headers. Status: Accepted.
+- [decisions/ingest-poison-quarantine-policy.decision.md](decisions/ingest-poison-quarantine-policy.decision.md)
+  - Ingest may commit past deterministic poison only after a durable quarantine
+    row is written; repeated schema/deserialization skips trip a circuit breaker;
+    message-id conflicts are identity anomalies, not normal duplicates. Status:
+    Accepted.
+- [decisions/receive-handler-surface-scope.decision.md](decisions/receive-handler-surface-scope.decision.md)
+  - M3 keeps the closure + `ReceivedMeta` handler surface and adds
+    `enqueue_on_connection` for consume-then-produce atomicity; the larger Tower
+    handler surface remains deferred. Status: Accepted.
 
 - [decisions/messaging-scope-and-receive-model.decision.md](decisions/messaging-scope-and-receive-model.decision.md)
   - Durable-execution-first core; Kafka-only transport in v1; HTTP and synchronous
@@ -82,8 +165,9 @@ service messaging, using Postgres as the durable execution ledger.
   enqueue/relay core. Status: Draft.
 - [decisions/message-consumption-and-handler-model.decision.md](decisions/message-consumption-and-handler-model.decision.md)
   - Receive side uses ingest and dispatch schedulers, per-type received tables,
-  required idempotency-key dedup-as-log, bounded errors, and a Tower-style
-  message handler stack. Status: Draft.
+    required idempotency-key dedup-as-log, bounded errors, and a Tower-style
+    message handler stack. M3 accepts the closure + `ReceivedMeta` surface with
+    `enqueue_on_connection` for atomic consume-then-produce. Status: Accepted.
 - [decisions/library-test-strategy.decision.md](decisions/library-test-strategy.decision.md)
   - kafkaman tests itself with unit, Postgres integration, and full-loop tiers;
   dogfooding-first where tests sit at or above toolkit abstractions. Status:
@@ -95,10 +179,10 @@ service messaging, using Postgres as the durable execution ledger.
 ## Roadmaps
 
 - [roadmaps/path-to-v1.roadmap.md](roadmaps/path-to-v1.roadmap.md) - Six
-  milestones to V1: M1 durable send completed, then change-engine/config,
-  durable receive/toolkit maturity, retry/DLQ, observability, and hardening.
-  Retry/DLQ and parallel-worktree execution policies are now accepted. Status:
-  Draft.
+  milestones to V1: M1 durable send completed, M2 change-engine/config
+  complete, M3 durable receive spec active, M4 retry/DLQ active, then
+  observability and hardening. Retry/DLQ and parallel-worktree execution
+  policies are accepted. Status: Draft.
 
 ## References
 
@@ -120,6 +204,16 @@ service messaging, using Postgres as the durable execution ledger.
 - [proposals/04-observability-logging-policy.proposal.md](proposals/04-observability-logging-policy.proposal.md)
   - Configurable tracing, logging, metrics, payload safety, and per-message-type
   observability policy. Status: Proposed.
+- [proposals/05-deep-durability-testing.proposal.md](proposals/05-deep-durability-testing.proposal.md)
+  - Reviewed living catalog of adversarial concurrency, crash, ingest, send,
+  cancellation, identity-collision, atomic-chain, observability, and chaos/model
+    tests for durable-execution paths. Tracks landed receive regressions and
+    prioritizes rare-failure tests such as `MissingHandler` head-of-line
+    blocking, failure-accounting crash windows,
+  poisoned transactions after swallowed handler DB errors, consume-then-produce
+  API gaps, suppressed stale-failure stats, ambiguous commit, identity conflicts,
+  reserved status drift, received message-version drift, and timestamp
+  test-oracle precision. Status: Proposed.
 
 ## Plans
 
@@ -134,6 +228,21 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
 - Active M3 execution plan for durable receive: received tables, deterministic
   dispatch, handler API, Harness maturity, and Kafka ingest. First Postgres
   storage/dispatch slice implemented 2026-06-21. Status: Active.
+- [plans/m3-durable-completion.plan.md](plans/m3-durable-completion.plan.md)
+- Sequenced completion of M3 after the first slice and its review fixes.
+  Tests-lead phases: harden the `dispatch_once` seam against the deep-testing
+  catalog (gap-revealing C1/C3/M3-stats + forced decisions), then operational
+  replay/injected clock, Kafka ingest + dispatcher loop, the decision-gated
+  handler surface, and spec promotion. Completed by
+  [specs/m3-durable-receive.spec.md](specs/m3-durable-receive.spec.md);
+  remaining chaos/model cases stay in the deep-durability hardening backlog.
+  Status: Completed.
+
+- [plans/m4-retry-backoff-dlq.plan.md](plans/m4-retry-backoff-dlq.plan.md)
+- Active M4 reliability plan for policy-driven receive retry scheduling,
+  table-backed terminal `Failed`/DLQ state, bounded error history, and
+  redrive/admin surfaces. First slice landed retry scheduling and terminal
+  failure tests. Status: Active.
 
 ## Checklists
 

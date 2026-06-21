@@ -1,9 +1,13 @@
-use std::error::Error as StdError;
+use std::{error::Error as StdError, time::Duration};
 
 use async_trait::async_trait;
 use kafkaman_core::{ClaimedOutboxRow, MarkOutcome, PublishAck, RelayConfig, RelayStats};
-use kafkaman_sqlx::{claim_batch, mark_publish_failed, mark_published, OutboxTable};
+use kafkaman_sqlx::{
+    claim_batch, dispatch_once, mark_publish_failed, mark_published, MessageRouter, OutboxTable,
+    ReceivedTable,
+};
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 pub use kafkaman_core;
@@ -108,6 +112,52 @@ pub async fn run<P: Publisher>(
 
         tokio::select! {
             _ = tokio::time::sleep(cfg.poll_interval) => {}
+            _ = shutdown.cancelled() => break,
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn run_dispatcher(
+    pool: PgPool,
+    table: ReceivedTable,
+    router: MessageRouter,
+    poll_interval: Duration,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        let claimed = match dispatch_once(&pool, &table, &router, OffsetDateTime::now_utc()).await {
+            Ok(stats) => {
+                if stats.claimed > 0 {
+                    tracing::debug!(
+                        claimed = stats.claimed,
+                        processed = stats.processed,
+                        failed = stats.failed,
+                        "receive dispatch cycle complete"
+                    );
+                }
+                stats.claimed
+            }
+            Err(err) => {
+                tracing::error!(
+                error = %err,
+                "receive dispatch cycle failed; retrying after poll interval"
+                );
+                0
+            }
+        };
+
+        if claimed > 0 {
+            continue;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
             _ = shutdown.cancelled() => break,
         }
     }

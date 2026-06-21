@@ -1,5 +1,261 @@
 # Wiki Log
 
+## [2026-06-22] promote | M4 retry/backoff/DLQ spec
+
+Completed M4 Phase 3/4 and promoted validated behavior into an Active spec
+`specs/m4-retry-backoff-dlq.spec.md`. Added `ReceivedFailureFilter` (since +
+kind) narrowing on the DLQ inspect surface, `Replay::failure_kind` to scope
+redrive by failure kind, and `Replay::clear_history` for clean-slate redrive
+(default redrive preserves attempts and error history). Phase 4 added no Redpanda
+coverage by design — retry/backoff/DLQ is Postgres-side. Updated the M4 plan to
+Completed, the roadmap M4 status, the index, and the runtime-API compat note.
+
+## [2026-06-22] add | M4 Phase 3 DLQ inspect surface
+
+Added `received_failed_rows` and `received_failed_count` to `kafkaman-sqlx` so
+operators can inspect the terminal `Failed` (DLQ) backlog before redriving with
+`Replay::received`. The list is oldest-first, `limit`-bounded, and preserves
+attempts and error history. Recorded under the M4 plan Phase 3 progress. Test:
+`received_failed_rows_inspect_surface_lists_terminal_dlq_rows`.
+
+## [2026-06-22] fix | Replay::received redrive targets terminal Failed rows
+
+The M4 retry-backoff slice scheduled a `next_attempt_at` on every `Retryable`
+failure, which made the prior `Retryable` + `next_attempt_at IS NULL` parked
+shape unreachable and stranded the `Replay::received` operational surface.
+Repointed redrive at exhausted terminal `Failed` rows, preserving attempts and
+error history. Reconciled the M3 spec replay paragraph and limitation note, and
+recorded the change under M4 plan Phase 3. Test renamed to
+`replay_received_redrives_failed_rows_without_replaying_processed_rows`.
+
+## [2026-06-22] promote | M3 durable receive spec
+
+Promoted validated M3 durable receive behavior into an Active spec. The spec
+captures Kafka ingest ordering, durable quarantine, consecutive-skip breaker,
+idempotency-key dedup, message-id conflict quarantine, receive dispatch,
+failure classification, replay semantics, production loops, and atomic
+consume-then-produce evidence. Updated the project stage and marked the M3
+completion plan completed while leaving remaining chaos/model cases in the
+deep-durability hardening backlog.
+
+Pages affected:
+- wiki/specs/m3-durable-receive.spec.md
+- wiki/index.md
+- wiki/log.md
+- wiki/plans/m3-durable-completion.plan.md
+
+## [2026-06-22] update | M3 Phase 4 consume-then-produce J3
+
+Extended the consume-then-produce atomicity test through J3. The existing
+handler surface (`&mut PgConnection`, `ReceivedMeta`, and `enqueue_on_connection`)
+now proves success commits business row plus follow-up outbox, failure rolls
+both back, and duplicate input redelivery deduplicates without a second business
+effect or outbox row. Reconciled and accepted the central
+`message-consumption-and-handler-model` decision for the shipped M3 surface.
+
+Proof:
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive handler_enqueues_outbox_atomically_with_receive_transaction`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop full_loop_consume_then_produce_deduplicates_duplicate_input -- --test-threads=1`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop -- --test-threads=1`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests`
+- `rtk cargo test --workspace --all-features`
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Pages affected:
+- wiki/decisions/message-consumption-and-handler-model.decision.md
+- wiki/index.md
+- wiki/log.md
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/proposals/05-deep-durability-testing.proposal.md
+
+## [2026-06-22] update | M3 A1 real two-worker dispatch interleaving
+
+Added `kafkaman-sqlx` `test-hooks` support for pausing after a failed handler
+transaction rolls back and before failure accounting is recorded. Added the
+real two-worker A1 regression: worker A fails and pauses before stale failure
+accounting, worker B processes the same durable row through normal
+`dispatch_once`, and worker A resumes without clobbering the processed row or
+over-reporting failure stats.
+
+Proof:
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests`
+- `rtk cargo test --workspace --all-features`
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Pages affected:
+- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- wiki/index.md
+- wiki/log.md
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/proposals/05-deep-durability-testing.proposal.md
+
+## [2026-06-22] update | M3 G1/G2 ingest uncertainty gates
+
+Added `kafkaman-rdkafka` `test-hooks` support for injecting a failure after
+the durable receive write commits and before Kafka offset commit. Added
+Redpanda tests for G1 crash-window redelivery and G2 runner-level offset commit
+uncertainty; both prove same-group redelivery deduplicates to the existing
+received row and then commits the broker offset.
+
+Proof:
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop -- --test-threads=1`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests`
+- `rtk cargo test --workspace --all-features`
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Pages affected:
+- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- wiki/index.md
+- wiki/log.md
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/proposals/05-deep-durability-testing.proposal.md
+
+## [2026-06-22] update | M3 production ingest runner
+
+Added the production rdkafka ingest runner slice. The compatibility note now
+records `IngestLoopStats` and `RdkafkaConsumer::run_ingester`, and the M3
+completion plan notes the cancellable loop, transient retry backoff, and loud
+poison-breaker stop semantics.
+
+Proof:
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop -- --test-threads=1`
+- `rtk cargo test --workspace --all-features`
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Pages affected:
+- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- wiki/index.md
+- wiki/log.md
+- wiki/plans/m3-durable-completion.plan.md
+
+## [2026-06-22] update | M3 durable completion implementation slice
+
+Implemented and documented the M3 durable completion slice covering Phase 1A
+dispatch hardening, Phase 2 receive replay, Phase 3 receive ingest/dispatcher
+loop, and the Phase 4 minimal consume-then-produce handler surface. Added
+accepted decisions for MissingHandler policy, post-handler infrastructure error
+classification, dispatch stats semantics, Kafka ingest identity/ordering, and
+receive handler surface scope. Proof commands recorded in the plan progress:
+`cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`; `cargo test --workspace --all-features`;
+`cargo test --manifest-path tests/durable-send/Cargo.toml --tests`;
+`cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda
+--test redpanda_full_loop`.
+
+Pages affected:
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/index.md
+- wiki/proposals/05-deep-durability-testing.proposal.md
+- wiki/decisions/missing-handler-dispatch-policy.decision.md
+- wiki/decisions/dispatch-infrastructure-error-classification.decision.md
+- wiki/decisions/dispatch-stats-semantics.decision.md
+- wiki/decisions/kafka-ingest-identity-and-ordering.decision.md
+- wiki/decisions/receive-handler-surface-scope.decision.md
+
+## [2026-06-22] update | M3 durable completion plan review fixes
+
+Applied a plan review (all five findings verified valid). Phase 1 split into
+Phase 1A blockers (C1 head-of-line, C3 poisoned-tx, M3-stats, A1 real-worker) that
+gate Phase 3 and Phase 1B invariant pins (B2, D1-D3, E2, I1, K4, K5) that may
+defer. Scoped Phase 3's full-loop gate to receive-only effective-once and added a
+Phase 4 consume-then-produce full-loop gate so a green Phase 3 cannot read as
+end-to-end. Added Phase 2 and Phase 4 specific verification gates (injected-clock
+due-boundary; Replay dry-run/apply/audit/guardrail/idempotence). Added a closure
+step to accept/reconcile the still-Draft `message-consumption-and-handler-model`
+decision before spec promotion. Bumped the index Updated date to 2026-06-22.
+
+Pages affected:
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] create | M3 durable completion plan
+
+Created a dedicated completion plan sequencing the remaining M3 work after the
+first slice and its review fixes. Adopts a tests-lead strategy grounded in the
+deep-durability-testing proposal: Phase 0 scaffolding (interleaving primitive +
+P1 oracle fix), Phase 1 hardening of the `dispatch_once` seam against the
+gap-revealing catalog (A1 real workers, C3 poisoned-tx, C1 head-of-line block,
+B2 crash window, M3 stats, D/E/I/K pins) with each forced choice recorded as its
+own decision doc, Phase 2 operational replay + injected clock, Phase 3 Kafka
+ingest + dispatcher loop with full-loop Redpanda coverage, Phase 4 decision-gated
+handler surface for consume-then-produce, and Phase 5 chaos/model + spec
+promotion. Rationale: the proposal predicts real defects in current `dispatch_once`
+(C1/C3) and forces ingest-shaping decisions (I2/G3/K5), so the seam is hardened
+and its contracts decided before an engine wraps it.
+
+Pages affected:
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] update | M3 review M1/L3 follow-up resolved
+
+Landed handler metadata access (M1) and the L3 nullability note, closing the last
+two M3 implementation-review findings. Added `ReceivedMeta` to `kafkaman-core`,
+rethreaded `MessageRouter::handler`/`dispatch_once`/the erased handler trait to
+pass `Fn(&mut PgConnection, ReceivedMeta, P)`, documented the nullable
+`correlation_id`/`causation_id` columns inline, and added the
+`dispatch_exposes_message_metadata_to_handler` gate (durable_receive now 11
+tests). Marked the review Resolved and recorded the slice in the M3 plan Progress;
+only out-of-scope M3 surface area (`FromMessage`/`Rx`/Tower, `Replay::received`,
+injected clock, macros, Kafka ingest, full-loop) remains.
+
+Pages affected:
+- wiki/reviews/m3-durable-receive-implementation-review.reference.md
+- wiki/plans/m3-durable-receive.plan.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] update | Deep durability testing second review verification
+
+Verified the second follow-up review against the proposal, M3 review, dispatch
+SQL/control flow, handler API, received insert path, and receive tests. Updated
+the proposal to remove the unsupported "incorrect review claim" framing, narrow
+B1's landed status to panic-only rollback, align A2/A3 matrix status with their
+landed sequential tests, and add verified gaps for stale-failure `DispatchStats`
+over-reporting, consume-then-produce API support, hard-coded received
+`message_version = 1`, and the load-bearing success/failure status-guard
+asymmetry.
+
+Pages updated:
+- wiki/proposals/05-deep-durability-testing.proposal.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] update | Deep durability testing review verification
+
+Double-checked the follow-up review against `dispatch_once`,
+`record_received_failure`, received-table DDL, core receive statuses, Harness
+registration paths, and receive integration tests. Updated the proposal to
+correct B2's attempt-accounting mechanism, strengthen C1's head-of-line
+description, add the poisoned-transaction success-branch gap, track parked
+retryables as already test-pinned, add reserved status variant drift coverage,
+and add timestamp precision test-oracle hardening. Confirmed that parked
+retryables are already covered by
+`dispatch_failure_rolls_back_effect_and_parks_retryable`.
+
+Pages updated:
+- wiki/proposals/05-deep-durability-testing.proposal.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] update | Deep durability testing proposal review
+
+Expanded the deep durability testing proposal from the original M3 receive-focused
+catalog into a reviewed durability-test roadmap. Marked landed receive
+regressions, added rare-failure classes for ambiguous commits, cancellation,
+Kafka offset uncertainty, idempotency/source-offset collisions,
+consume-then-produce atomicity, schema/config drift, observability safety,
+send-side mirrors, and model/chaos testing, and refreshed priority order.
+
+Pages updated:
+- wiki/proposals/05-deep-durability-testing.proposal.md
+- wiki/index.md
+
 ## [2026-06-21] create | Direct mode and observability policy proposals
 
 Captured two proposed design directions from user discussion: an explicit non-durable direct Kafka producer/consumer mode for high-throughput or low-durability workloads, and a configurable `tracing`-based observability/logging policy with per-message-type overrides and payload-safety controls.
@@ -587,3 +843,209 @@ Pages affected:
 - wiki/plans/m3-durable-receive.plan.md
 - wiki/index.md
 - wiki/log.md
+
+## [2026-06-21] review | M3 durable receive implementation review
+
+Wrote a sourced post-implementation review of the first M3 durable-receive slice
+against the active plan. Static review plus re-run of the cheap gates
+(`cargo fmt --check`, `cargo check`, `cargo clippy`, `kafkaman-sqlx` lib tests —
+all clean); Postgres integration suite not re-executed (Docker/testcontainers).
+Headline finding (H1, high): the failure-path accounting update runs outside the
+held transaction with an unguarded `WHERE message_id = $1`, so under concurrent
+dispatch it can overwrite a row another worker committed as `Processed`,
+producing a double effect — an effective-once hole the single-call tests cannot
+catch. Also flagged the minimal handler surface vs plan scope, a Harness
+send/receive registration conflict, the missing property/crash/ring gates, and
+low-severity polish.
+
+Pages affected:
+- wiki/reviews/m3-durable-receive-implementation-review.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] update | M3 durable receive review follow-up fixes
+
+Resolved the H1 stale failure-accounting race by guarding receive failure
+accounting to `Pending`/`Retryable` rows, fixed Harness send/receive migration
+registration for same-type send-after-receive use, removed the transient
+in-transaction `Processing` write, and changed missing receive lookups to report
+the missing idempotency key. Added receive integration gates for stale failure
+interleaving, crash redrive, randomized duplicate redelivery convergence,
+bounded 20-entry error retention, and missing received-row error reporting.
+Serialized the Docker-backed durable receive integration file with an in-process
+async mutex to avoid local Postgres container pool flakiness under the default
+parallel test runner.
+
+Verification passed:
+
+- `cargo fmt --all -- --check`
+- `cargo check --workspace --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+- `cargo test -p kafkaman-sqlx --lib`
+- `cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive`
+
+Pages affected:
+
+- wiki/reviews/m3-durable-receive-implementation-review.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] update | M3 durable receive review double-check
+
+Double-checked the sourced M3 durable-receive implementation review against the
+landed code and tests. Re-ran the cheap gates (`cargo fmt --all -- --check`,
+`cargo check --workspace --all-features`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo test -p kafkaman-sqlx
+--lib`) and the Docker/testcontainers-backed receive integration suite
+(`cargo test --manifest-path tests/durable-send/Cargo.toml --test
+durable_receive`); all passed after escalating the integration run for Docker
+access. Confirmed H1 by exact failure-path SQL/control-flow inspection and
+confirmed M2 with a temporary regression test that failed with PostgreSQL
+`42P01` missing outbox relation after receive-side registration. Corrected the
+review and index to state that the bounded error-ring SQL is inspected as
+correct, but the 20-entry cap is not yet test-pinned.
+
+Pages affected:
+- wiki/reviews/m3-durable-receive-implementation-review.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-21] create | Deep durability testing proposal
+
+Added a living deep-testing proposal cataloguing adversarial concurrency, crash,
+and durability test designs for kafkaman's durable-execution paths, plus the
+invariant-escape technique that surfaced the M3 review's H1. Seeded with 13
+test designs across concurrency, crash, robustness, atomicity, bounded-resource,
+clock, and ingest classes, a priority order, a status-tracking table, and open
+design questions (crash-durable receive `attempts`; parking on `MissingHandler`;
+the controlled-interleaving primitive for `kafkaman-test`). Predicts A1, B2, and
+C1 reveal real defects today.
+
+Pages affected:
+- wiki/proposals/05-deep-durability-testing.proposal.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] review | M3 durable-completion implementation
+
+Adversarial in-depth review of the M3 durable-completion slice against landed
+code, focused on failure modes the deep-durability catalog does not anticipate.
+Findings: F1 ingest poison stalls the partition (offset never advances on any
+pre-commit error); F2 PK-vs-`ON CONFLICT`-target mismatch is a second stall
+vector; F3 the dispatcher loop does not drain (one row per poll interval, against
+the plan's stated "drain"); F4 parked failure/missing-handler rows are
+unrecoverable through the shipped API (`Replay::received` is Processed-only and
+dispatch never reclaims Retryable/NULL); F5 `Replay::received` re-executes handler
+side effects on already-processed rows. Also recorded plan-accuracy gaps: the
+Phase 0 interleaving primitive, the real two-worker A1 test, and the Phase 4 J3
+consume-then-produce full-loop are claimed in Progress but not present in code.
+
+Pages affected:
+- wiki/reviews/m3-durable-completion-implementation-review.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] update | M3 durable-completion review fixes
+
+Recorded implementation follow-up for the M3 durable-completion review fixes.
+F1-F9 are now closed by deterministic ingest poison skips with offset commit,
+receive insert conflict hardening, dispatcher backlog drain and mid-dispatch
+shutdown tests, retryable-only `Replay::received`, structured receive failure
+causes, and Redpanda poison/redelivery/topic-provenance coverage. The active
+plan still keeps broader M3 closure gates open: controlled interleaving, real
+two-worker A1, G1/G2 crash/offset uncertainty, consume-then-produce Redpanda J3,
+handler-model reconciliation, and M3 spec promotion.
+Pages affected:
+- wiki/reviews/m3-durable-completion-implementation-review.reference.md
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] update | M3 ingest poison quarantine policy
+
+Implemented and documented the ingest poison quarantine policy prompted by the
+G1-G5 review. Added accepted decision `ingest-poison-quarantine-policy`, durable
+`received_ingest_failures` quarantine table, consecutive-skip circuit breaker,
+explicit receive insert outcomes for idempotency duplicate vs message-id
+conflict, handler-domain SQL failure classification, and replay history
+preservation. Evidence: `rtk cargo test --manifest-path
+tests/durable-send/Cargo.toml --tests` (37 passed), `rtk cargo test
+--manifest-path tests/durable-send/Cargo.toml --features redpanda --test
+redpanda_full_loop -- --test-threads=1` (5 passed), and `rtk cargo test
+--workspace --all-features` (61 passed).
+Pages affected:
+- wiki/decisions/ingest-poison-quarantine-policy.decision.md
+- wiki/reviews/m3-durable-completion-implementation-rereview.reference.md
+- wiki/reviews/m3-durable-completion-implementation-review.reference.md
+- wiki/plans/m3-durable-completion.plan.md
+- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] update | M3 durable-completion review double-check
+
+Added follow-up verification notes to the M3 durable-completion implementation
+review after checking each claim against the current code and tests. Clarified
+the scope of F1/F2, confirmed F1-F6 and the plan-accuracy gaps, and added three
+missed gaps: case-variant reserved headers can poison ingest before offset
+commit (F7), consumed source topic is not checked or persisted from the broker
+record (F8), and graceful shutdown mid-dispatch is not proven by the shipped
+dispatcher cancellation test (F9/H3). Updated the index summary accordingly.
+
+Pages affected:
+- wiki/reviews/m3-durable-completion-implementation-review.reference.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-06-22] rereview | M3 durable-completion fixes
+
+Second-pass review after the review-fix slice. Confirmed F1-F5 closed and
+test-pinned (ingest poison skip, untargeted ON CONFLICT, dispatcher drain,
+retryable-only Replay::received). Found the fixes traded stalls for silent drops:
+G1 ingest skip is silent/untraceable data loss; G2 schema skew is treated as
+poison and dropped topic-wide on a bad deploy ordering; G3 untargeted ON CONFLICT
+silently drops a different logical message on message_id collision; G4 failure
+`kind` keys off the Rust error variant (handler SQL errors mis-bucket as
+Infrastructure); G5 replay erases the error history of the parked rows it targets.
+Recommended a single ingest-poison/dead-letter policy decision. Noted residual
+scope: no run_ingest loop, Phase 0 primitive / real two-worker A1 / J3 still absent.
+
+Pages affected:
+- wiki/reviews/m3-durable-completion-implementation-rereview.reference.md
+- wiki/index.md
+- wiki/log.md
+## [2026-06-22] update | M4 retry/backoff/DLQ first slice
+
+Started M4 reliability work. Added active M4 plan and compatibility note,
+marked M3 completed and M4 active in the V1 roadmap, and implemented
+policy-driven receive retry scheduling: `ResolvedConfig` retains `RetryConfig`,
+`ReceivedTable` carries the per-message retry policy, receive failure accounting
+computes `next_attempt_at`, honors configured `errors_limit`, and moves
+exhausted rows to terminal `Failed` table-backed DLQ state. Redrive/admin
+surfaces remain in the active M4 plan.
+Pages affected: `crates/kafkaman-config/src/lib.rs`,
+`crates/kafkaman-sqlx/src/lib.rs`, `tests/durable-send/Cargo.toml`,
+`tests/durable-send/tests/durable_receive.rs`,
+`wiki/plans/m4-retry-backoff-dlq.plan.md`,
+`wiki/compatibility/m4-retry-backoff-runtime-api.compat.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-06-22] update | dispatch failure accounting hardening
+
+Changed receive dispatch failure accounting to hold the claimed row lock through
+normal failure recording by using a handler savepoint, with best-effort rollback
+and separate-connection fallback only when the transaction connection is already
+unusable. Updated M3 spec, dispatch decisions, compatibility note, and
+deep-durability proposal evidence to match the new single-flight behavior.
+Pages affected: `crates/kafkaman-sqlx/src/lib.rs`,
+`tests/durable-send/tests/durable_receive.rs`,
+`wiki/specs/m3-durable-receive.spec.md`,
+`wiki/decisions/dispatch-infrastructure-error-classification.decision.md`,
+`wiki/decisions/dispatch-stats-semantics.decision.md`,
+`wiki/decisions/missing-handler-dispatch-policy.decision.md`,
+`wiki/compatibility/m3-durable-receive-review-fix-api.compat.md`,
+`wiki/proposals/05-deep-durability-testing.proposal.md`,
+`wiki/reviews/m3-durable-completion-implementation-review.reference.md`,
+`wiki/index.md`, `wiki/log.md`.

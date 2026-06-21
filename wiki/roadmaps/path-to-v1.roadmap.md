@@ -64,6 +64,9 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
   missing required key fails fast at boot; `Replay` runs under the guardrails.
 
 ### M3 — Durable receive (consume) + toolkit maturity
+- **Status:** Completed. Validated behavior is promoted to
+  [m3-durable-receive.spec.md](../specs/m3-durable-receive.spec.md); remaining
+  chaos/model checks stay in the deep-durability hardening backlog.
 - **Goal:** the receive half of the core promise.
 - **Delivers:** the ingest + dispatch schedulers, per-type received tables, dedup-
   as-log with the bounded `errors` array, the `MessageRouter` Tower stack +
@@ -79,7 +82,12 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
   stalls the partition; handler stacks are `oneshot`-testable.
 
 ### M4 — Reliability (retry / backoff / DLQ)
-- **Goal:** turn "it’s durable" into "it recovers."
+- **Status:** Completed. Validated behavior is promoted to
+  [m4-retry-backoff-dlq.spec.md](../specs/m4-retry-backoff-dlq.spec.md); backoff
+  jitter, terminal-row retention/purge, and operator dashboards stay later work.
+  Execution plan:
+  [m4-retry-backoff-dlq.plan.md](../plans/m4-retry-backoff-dlq.plan.md).
+- **Goal:** turn “it’s durable” into “it recovers.”
 - **Implements:** the accepted retry/backoff/DLQ taxonomy: retryable vs terminal
   errors, per-message config with common defaults in `kafkaman.toml`, backoff
   schedule, max attempts, poison classification, and terminal to table-backed

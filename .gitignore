@@ -24,3 +24,4 @@ kafkaman.toml
 # for reference but intentionally not committed. The distilled summary,
 # manifest, and small web/crate sources stay tracked.
 raw/research/2026-06-20-kafkaman-objectives-rust-microservice-architecture/sources/01-cqrs-fullstack/
+.serena

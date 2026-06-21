@@ -4,10 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kafkaman_config::{Config, ConfigErrors, ConfigSchema};
+use kafkaman_config::{Config, ConfigErrors, ConfigSchema, RetryConfig, RetryPolicy};
 use kafkaman_core::{
     ClaimedOutboxRow, Envelope, KafkaMessage, MarkOutcome, MessageDescriptor, OutboxRow,
-    OutboxStatus, ReceiveStatus, ReceivedError, ReceivedRow, RelayConfig, SqlIdentifier,
+    OutboxStatus, ReceiveStatus, ReceivedError, ReceivedFailureKind, ReceivedIngestFailureKind,
+    ReceivedMeta, ReceivedRow, RelayConfig, SqlIdentifier,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -21,6 +22,73 @@ use uuid::Uuid;
 pub use kafkaman_core;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(feature = "test-hooks")]
+type DispatchHookFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+#[cfg(feature = "test-hooks")]
+type BeforeRecordFailureHook =
+    dyn Fn(DispatchFailureHookContext) -> DispatchHookFuture + Send + Sync + 'static;
+
+#[cfg(feature = "test-hooks")]
+type BeforeFailureRollbackHook =
+    dyn Fn(DispatchFailureHookContext) -> DispatchHookFuture + Send + Sync + 'static;
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchFailureHookContext {
+    pub message_id: Uuid,
+    pub idempotency_key: String,
+    pub message_type: String,
+    pub kind: ReceivedFailureKind,
+    pub message: String,
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Default)]
+pub struct DispatchTestHooks {
+    before_failure_rollback: Option<Arc<BeforeFailureRollbackHook>>,
+    before_record_failure: Option<Arc<BeforeRecordFailureHook>>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl DispatchTestHooks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn before_record_failure<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(DispatchFailureHookContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.before_record_failure = Some(Arc::new(move |context| Box::pin(hook(context))));
+        self
+    }
+
+    pub fn before_failure_rollback<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(DispatchFailureHookContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.before_failure_rollback = Some(Arc::new(move |context| Box::pin(hook(context))));
+        self
+    }
+
+    async fn run_before_record_failure(&self, context: DispatchFailureHookContext) -> Result<()> {
+        if let Some(hook) = &self.before_record_failure {
+            hook(context).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_before_failure_rollback(&self, context: DispatchFailureHookContext) -> Result<()> {
+        if let Some(hook) = &self.before_failure_rollback {
+            hook(context).await?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -57,6 +125,12 @@ pub enum Error {
     #[error("invalid replay changeset {version}: {message}")]
     InvalidReplay { version: i64, message: String },
 
+    #[error("invalid received ingest failure kind `{0}`")]
+    InvalidIngestFailureKind(String),
+
+    #[error("invalid received failure filter: {0}")]
+    InvalidReceivedFilter(String),
+
     #[error("migration advisory lock is held by another migration; dry-run skipped")]
     MigrationLockBusy,
 
@@ -80,6 +154,7 @@ pub enum Error {
 pub struct ResolvedConfig {
     pub schema: SqlIdentifier,
     pub relay: RelayConfig,
+    pub retry: RetryConfig,
     messages: Vec<MessageDescriptor>,
 }
 
@@ -88,6 +163,7 @@ impl ResolvedConfig {
         Self {
             schema,
             relay: RelayConfig::default(),
+            retry: RetryConfig::default(),
             messages: Vec::new(),
         }
     }
@@ -145,27 +221,30 @@ impl ResolvedConfig {
             }
         };
 
-        // Validate the optional retry/DLQ policy on the same boot path that opens
-        // and migrates the database, so a bad policy is rejected before any DB
-        // work. Runtime retry processing is M4 scope, but the config contract is
-        // enforced here. Only message types registered with this resolver may
-        // carry per-message overrides.
-        if cfg.contains("retry") {
+        let retry = if cfg.contains("retry") {
             let registered = messages
                 .iter()
                 .map(|descriptor| descriptor.message_type.as_str().to_owned())
                 .collect::<Vec<_>>();
-            if let Err(retry_errors) = cfg.retry_config(registered) {
-                issues.extend(retry_errors.into_issues());
+            match cfg.retry_config(registered) {
+                Ok(retry) => Some(retry),
+                Err(retry_errors) => {
+                    issues.extend(retry_errors.into_issues());
+                    None
+                }
             }
-        }
+        } else {
+            Some(RetryConfig::default())
+        };
 
         if !issues.is_empty() {
             return Err(Error::ConfigErrors(ConfigErrors::new(issues)));
         }
 
         let schema = SqlIdentifier::new(schema.expect("schema was validated"))?;
-        let mut resolved = Self::new(schema).with_relay(relay.expect("relay was validated"));
+        let mut resolved = Self::new(schema)
+            .with_relay(relay.expect("relay was validated"))
+            .with_retry(retry.expect("retry was validated"));
         for message in messages {
             resolved = resolved.with_message(message);
         }
@@ -189,6 +268,11 @@ impl ResolvedConfig {
 
     pub fn with_relay(mut self, relay: RelayConfig) -> Self {
         self.relay = relay;
+        self
+    }
+
+    pub fn with_retry(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -270,20 +354,32 @@ pub struct ReceivedTable {
     pub schema: SqlIdentifier,
     pub table: SqlIdentifier,
     pub descriptor: MessageDescriptor,
+    pub retry: RetryPolicy,
 }
 
 impl ReceivedTable {
     pub fn new(schema: SqlIdentifier, descriptor: MessageDescriptor) -> Result<Self> {
+        Self::new_with_retry(schema, descriptor, RetryPolicy::default())
+    }
+
+    fn new_with_retry(
+        schema: SqlIdentifier,
+        descriptor: MessageDescriptor,
+        retry: RetryPolicy,
+    ) -> Result<Self> {
         let table = SqlIdentifier::new(format!("received_{}", descriptor.message_type.as_str()))?;
         Ok(Self {
             schema,
             table,
             descriptor,
+            retry,
         })
     }
 
     pub fn for_message<P: KafkaMessage>(cfg: &ResolvedConfig) -> Result<Self> {
-        Self::new(cfg.schema.clone(), cfg.descriptor_for::<P>()?)
+        let descriptor = cfg.descriptor_for::<P>()?;
+        let retry = cfg.retry.policy_for(descriptor.message_type.as_str());
+        Self::new_with_retry(cfg.schema.clone(), descriptor, retry)
     }
 
     pub fn qualified_name(&self) -> String {
@@ -322,6 +418,7 @@ trait ErasedMessageHandler: Send + Sync {
     fn handle<'a>(
         &'a self,
         conn: &'a mut PgConnection,
+        meta: ReceivedMeta,
         payload: serde_json::Value,
     ) -> HandlerFuture<'a>;
 }
@@ -334,16 +431,20 @@ struct TypedMessageHandler<P, F> {
 impl<P, F> ErasedMessageHandler for TypedMessageHandler<P, F>
 where
     P: DeserializeOwned + Send + 'static,
-    F: for<'a> Fn(&'a mut PgConnection, P) -> HandlerFuture<'a> + Send + Sync + 'static,
+    F: for<'a> Fn(&'a mut PgConnection, ReceivedMeta, P) -> HandlerFuture<'a>
+        + Send
+        + Sync
+        + 'static,
 {
     fn handle<'a>(
         &'a self,
         conn: &'a mut PgConnection,
+        meta: ReceivedMeta,
         payload: serde_json::Value,
     ) -> HandlerFuture<'a> {
         Box::pin(async move {
             let message = serde_json::from_value(payload)?;
-            (self.handler)(conn, message).await
+            (self.handler)(conn, meta, message).await
         })
     }
 }
@@ -360,7 +461,10 @@ impl MessageRouter {
 
     pub fn handler<P>(
         mut self,
-        handler: impl for<'a> Fn(&'a mut PgConnection, P) -> HandlerFuture<'a> + Send + Sync + 'static,
+        handler: impl for<'a> Fn(&'a mut PgConnection, ReceivedMeta, P) -> HandlerFuture<'a>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self
     where
         P: KafkaMessage + DeserializeOwned + Send + 'static,
@@ -386,6 +490,42 @@ pub struct DispatchStats {
     pub claimed: usize,
     pub processed: usize,
     pub failed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceivedInsertOutcome {
+    Inserted,
+    DuplicateIdempotencyKey,
+    MessageIdConflict,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReceivedIngestFailure {
+    pub source_topic: String,
+    pub source_partition: i32,
+    pub source_offset: i64,
+    pub key: Option<Vec<u8>>,
+    pub headers: serde_json::Value,
+    pub payload: Option<Vec<u8>>,
+    pub message_type: String,
+    pub expected_topic: String,
+    pub kind: ReceivedIngestFailureKind,
+    pub error: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReceivedIngestFailureRow {
+    pub source_topic: String,
+    pub source_partition: i32,
+    pub source_offset: i64,
+    pub key: Option<Vec<u8>>,
+    pub headers: serde_json::Value,
+    pub payload: Option<Vec<u8>>,
+    pub message_type: String,
+    pub expected_topic: String,
+    pub kind: ReceivedIngestFailureKind,
+    pub error: String,
+    pub created_at: OffsetDateTime,
 }
 
 pub struct ChangeBuilder {
@@ -715,20 +855,45 @@ pub fn add_idempotency_key_sql(table: &OutboxTable) -> String {
 #[derive(Clone, Debug)]
 pub struct Replay {
     version: i64,
+    target: ReplayTarget,
     descriptor: MessageDescriptor,
     occurred_after: Option<OffsetDateTime>,
     max_rows: Option<i64>,
     contexts: Vec<String>,
+    failure_kind: Option<ReceivedFailureKind>,
+    clear_history: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayTarget {
+    Outbox,
+    Received,
 }
 
 impl Replay {
     pub fn outbox<P: KafkaMessage>(version: i64) -> Result<Self> {
         Ok(Self {
             version,
+            target: ReplayTarget::Outbox,
             descriptor: P::descriptor()?,
             occurred_after: None,
             max_rows: None,
             contexts: Vec::new(),
+            failure_kind: None,
+            clear_history: false,
+        })
+    }
+
+    pub fn received<P: KafkaMessage>(version: i64) -> Result<Self> {
+        Ok(Self {
+            version,
+            target: ReplayTarget::Received,
+            descriptor: P::descriptor()?,
+            occurred_after: None,
+            max_rows: None,
+            contexts: Vec::new(),
+            failure_kind: None,
+            clear_history: false,
         })
     }
 
@@ -747,6 +912,24 @@ impl Replay {
             .iter()
             .map(|context| (*context).to_owned())
             .collect();
+        self
+    }
+
+    /// Narrow a received redrive to terminal rows whose most recent failure was
+    /// of the given kind, e.g. redrive only `Handler` failures after fixing a
+    /// handler bug while leaving `InvalidPayload` rows parked. Received-only; it
+    /// has no effect on an outbox replay.
+    pub fn failure_kind(mut self, kind: ReceivedFailureKind) -> Self {
+        self.failure_kind = Some(kind);
+        self
+    }
+
+    /// Erase forensic history on redrive: reset `attempts` to zero and clear the
+    /// stored error array so the row redrives with a full retry budget and no
+    /// past failures. The default redrive preserves both for triage; this opts
+    /// into a clean slate. Received-only.
+    pub fn clear_history(mut self) -> Self {
+        self.clear_history = true;
         self
     }
 
@@ -771,12 +954,23 @@ impl Changeset for Replay {
     }
 
     fn name(&self) -> &str {
-        "replay_outbox"
+        match self.target {
+            ReplayTarget::Outbox => "replay_outbox",
+            ReplayTarget::Received => "replay_received",
+        }
     }
 
     fn build(&self, cfg: &ResolvedConfig, builder: &mut ChangeBuilder) -> Result<()> {
-        let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
-        builder.push(replay_outbox_update_sql(&table, self)?);
+        match self.target {
+            ReplayTarget::Outbox => {
+                let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+                builder.push(replay_outbox_update_sql(&table, self)?);
+            }
+            ReplayTarget::Received => {
+                let table = ReceivedTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+                builder.push(replay_received_update_sql(&table, self)?);
+            }
+        }
         Ok(())
     }
 
@@ -789,8 +983,12 @@ impl Changeset for Replay {
                     .unwrap_or_else(|_| timestamp.to_string())
             })
             .unwrap_or_else(|| "none".to_owned());
+        let failure_kind = self
+            .failure_kind
+            .map(received_failure_kind_str)
+            .unwrap_or("none");
         format!(
-            "version={};name={};message_type={};topic={};occurred_after={};max_rows={};contexts={}",
+            "version={};name={};message_type={};topic={};occurred_after={};max_rows={};contexts={};failure_kind={};clear_history={}",
             self.version(),
             self.name(),
             self.descriptor.message_type.as_str(),
@@ -799,7 +997,9 @@ impl Changeset for Replay {
             self.max_rows
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
-            self.contexts.join(",")
+            self.contexts.join(","),
+            failure_kind,
+            self.clear_history,
         )
     }
 
@@ -808,11 +1008,22 @@ impl Changeset for Replay {
     }
 
     fn dry_run_preview(&self, cfg: &ResolvedConfig) -> Result<String> {
-        let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
-        Ok(format!(
-            "would requeue ~N rows in {}",
-            table.qualified_name()
-        ))
+        match self.target {
+            ReplayTarget::Outbox => {
+                let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+                Ok(format!(
+                    "would requeue ~N rows in {}",
+                    table.qualified_name()
+                ))
+            }
+            ReplayTarget::Received => {
+                let table = ReceivedTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+                Ok(format!(
+                    "would requeue ~N received rows in {}",
+                    table.qualified_name()
+                ))
+            }
+        }
     }
 
     fn estimate_replay_count<'a>(
@@ -821,8 +1032,16 @@ impl Changeset for Replay {
         tx: &'a mut Transaction<'_, Postgres>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i64>>> + Send + 'a>> {
         Box::pin(async move {
-            let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
-            let sql = replay_outbox_count_sql(&table, self)?;
+            let sql = match self.target {
+                ReplayTarget::Outbox => {
+                    let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+                    replay_outbox_count_sql(&table, self)?
+                }
+                ReplayTarget::Received => {
+                    let table = ReceivedTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+                    replay_received_count_sql(&table, self)?
+                }
+            };
             let count = sqlx::query_scalar::<_, i64>(&sql)
                 .fetch_one(&mut **tx)
                 .await?;
@@ -888,6 +1107,100 @@ fn replay_outbox_filter_sql(replay: &Replay) -> Result<String> {
         filter.push_str("::timestamptz");
     }
     Ok(filter)
+}
+
+fn replay_received_update_sql(table: &ReceivedTable, replay: &Replay) -> Result<String> {
+    let max_rows = replay.max_rows_or_error()?;
+    let filter = replay_received_filter_sql(replay)?;
+    // Default redrive preserves attempts and error history for triage; an
+    // explicit `clear_history()` resets the row to a clean slate with a full
+    // retry budget.
+    let history_reset = if replay.clear_history {
+        ",\n            attempts = 0,\n            errors = '[]'::jsonb"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "WITH candidates AS (
+         SELECT message_id FROM {name}
+         WHERE {filter}
+         ORDER BY occurred_at, message_id
+         LIMIT {max_rows}
+        )
+        UPDATE {name}
+        SET status = {pending},
+            next_attempt_at = NULL,
+            processed_at = NULL{history_reset}
+        WHERE message_id IN (SELECT message_id FROM candidates)",
+        name = table.qualified_name(),
+        filter = filter,
+        max_rows = max_rows,
+        pending = ReceiveStatus::Pending.sql_literal(),
+        history_reset = history_reset,
+    ))
+}
+
+fn replay_received_count_sql(table: &ReceivedTable, replay: &Replay) -> Result<String> {
+    let max_rows = replay.max_rows_or_error()?;
+    let filter = replay_received_filter_sql(replay)?;
+    Ok(format!(
+        "SELECT count(*) FROM (
+         SELECT message_id FROM {name}
+         WHERE {filter}
+         ORDER BY occurred_at, message_id
+         LIMIT {max_rows}
+         ) candidates",
+        name = table.qualified_name(),
+        filter = filter,
+        max_rows = max_rows,
+    ))
+}
+
+fn replay_received_filter_sql(replay: &Replay) -> Result<String> {
+    // Redrive targets terminal rows. With retry backoff in place a receive row
+    // reaches `Failed` only after its retry budget is exhausted; non-exhausted
+    // failures stay `Retryable` with a scheduled `next_attempt_at` and recover on
+    // their own, so they must not be replayed. Replay moves the exhausted rows
+    // back to `Pending` for one more reprocessing pass, preserving attempts and
+    // error history for triage.
+    let mut filter = format!("status = {}", ReceiveStatus::Failed.sql_literal());
+    if let Some(occurred_after) = replay.occurred_after {
+        let formatted = occurred_after
+            .format(&Rfc3339)
+            .map_err(|err| Error::InvalidReplay {
+                version: replay.version,
+                message: err.to_string(),
+            })?;
+        filter.push_str(" AND occurred_at >= ");
+        filter.push_str(&sql_string_literal(&formatted));
+        filter.push_str("::timestamptz");
+    }
+    if let Some(kind) = replay.failure_kind {
+        filter.push_str(&latest_failure_kind_clause(kind));
+    }
+    Ok(filter)
+}
+
+/// The canonical serialized name for a [`ReceivedFailureKind`], matching the
+/// `kind` field serde writes into the stored `errors` JSONB and the discriminant
+/// used in redrive/inspect filters and replay checksums.
+fn received_failure_kind_str(kind: ReceivedFailureKind) -> &'static str {
+    match kind {
+        ReceivedFailureKind::MissingHandler => "MissingHandler",
+        ReceivedFailureKind::InvalidPayload => "InvalidPayload",
+        ReceivedFailureKind::Infrastructure => "Infrastructure",
+        ReceivedFailureKind::Handler => "Handler",
+    }
+}
+
+/// SQL predicate fragment (` AND ...`) selecting received rows whose most recent
+/// stored error is of `kind`. The error array is appended newest-last, so its
+/// final element (`errors -> -1`) is the failure that currently parks the row.
+fn latest_failure_kind_clause(kind: ReceivedFailureKind) -> String {
+    format!(
+        " AND (errors -> -1 ->> 'kind') = {}",
+        sql_string_literal(received_failure_kind_str(kind))
+    )
 }
 
 pub async fn migrate(
@@ -1172,6 +1485,11 @@ async fn bootstrap_history(conn: &mut PgConnection, cfg: &ResolvedConfig) -> Res
         format!("UPDATE {history} SET applied_by = 'unknown' WHERE applied_by IS NULL");
     sqlx::query(&backfill_sql).execute(&mut *conn).await?;
 
+    let ingest_failures_sql = create_received_ingest_failures_table_sql(cfg)?;
+    sqlx::query(&ingest_failures_sql)
+        .execute(&mut *conn)
+        .await?;
+
     Ok(())
 }
 
@@ -1279,6 +1597,34 @@ fn history_table_name(cfg: &ResolvedConfig) -> Result<String> {
     ))
 }
 
+fn received_ingest_failures_table_name(cfg: &ResolvedConfig) -> Result<String> {
+    Ok(format!(
+        "{}.{}",
+        cfg.schema.quoted(),
+        SqlIdentifier::new("received_ingest_failures")?.quoted()
+    ))
+}
+
+fn create_received_ingest_failures_table_sql(cfg: &ResolvedConfig) -> Result<String> {
+    let name = received_ingest_failures_table_name(cfg)?;
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS {name} (
+            source_topic TEXT NOT NULL,
+            source_partition INT NOT NULL,
+            source_offset BIGINT NOT NULL,
+            key BYTEA,
+            headers JSONB NOT NULL,
+            payload BYTEA,
+            message_type TEXT NOT NULL,
+            expected_topic TEXT NOT NULL,
+            failure_kind TEXT NOT NULL,
+            error TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (source_topic, source_partition, source_offset)
+        )"
+    ))
+}
+
 pub fn create_outbox_table_sql(table: &OutboxTable) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {name} (
@@ -1317,6 +1663,11 @@ pub fn create_outbox_state_index_sql(table: &OutboxTable) -> String {
 }
 
 pub fn create_received_table_sql(table: &ReceivedTable) -> String {
+    // `correlation_id`/`causation_id` are intentionally nullable: rows inserted
+    // through `insert_received` always carry a correlation id from the kafkaman
+    // `Envelope`, but the future Kafka-ingest path (Step 7) may persist records
+    // that lack kafkaman correlation metadata. Keeping the columns nullable now
+    // avoids a later migration when that path lands.
     format!(
         "CREATE TABLE IF NOT EXISTS {name} (\n            message_id UUID PRIMARY KEY,\n            idempotency_key TEXT NOT NULL,\n            status TEXT NOT NULL DEFAULT {pending} CHECK (status IN ({statuses})),\n            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),\n            next_attempt_at TIMESTAMPTZ,\n            errors JSONB NOT NULL DEFAULT '[]'::jsonb,\n            source_topic TEXT NOT NULL,\n            source_partition INTEGER NOT NULL,\n            source_offset BIGINT NOT NULL,\n            key BYTEA,\n            message_type TEXT NOT NULL,\n            message_version INTEGER NOT NULL DEFAULT 1 CHECK (message_version >= 1),\n            headers JSONB NOT NULL DEFAULT '{{}}'::jsonb,\n            payload JSONB NOT NULL,\n            correlation_id UUID,\n            causation_id UUID,\n            occurred_at TIMESTAMPTZ NOT NULL,\n            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n            processed_at TIMESTAMPTZ\n        )",
         name = table.qualified_name(),
@@ -1343,6 +1694,17 @@ pub fn create_received_state_index_sql(table: &ReceivedTable) -> String {
 
 pub async fn enqueue<P>(
     tx: &mut Transaction<'_, Postgres>,
+    cfg: &ResolvedConfig,
+    evt: &Envelope<P>,
+) -> Result<()>
+where
+    P: KafkaMessage + Serialize,
+{
+    enqueue_on_connection(tx, cfg, evt).await
+}
+
+pub async fn enqueue_on_connection<P>(
+    conn: &mut PgConnection,
     cfg: &ResolvedConfig,
     evt: &Envelope<P>,
 ) -> Result<()>
@@ -1376,7 +1738,7 @@ where
         .bind(headers)
         .bind(payload)
         .bind(evt.occurred_at)
-        .execute(&mut **tx)
+        .execute(&mut *conn)
         .await?;
 
     Ok(())
@@ -1390,6 +1752,23 @@ pub async fn insert_received<P>(
     source_offset: i64,
     key: Option<&[u8]>,
 ) -> Result<bool>
+where
+    P: KafkaMessage + Serialize,
+{
+    Ok(matches!(
+        insert_received_with_outcome(tx, cfg, evt, source_partition, source_offset, key).await?,
+        ReceivedInsertOutcome::Inserted
+    ))
+}
+
+pub async fn insert_received_with_outcome<P>(
+    tx: &mut Transaction<'_, Postgres>,
+    cfg: &ResolvedConfig,
+    evt: &Envelope<P>,
+    source_partition: i32,
+    source_offset: i64,
+    key: Option<&[u8]>,
+) -> Result<ReceivedInsertOutcome>
 where
     P: KafkaMessage + Serialize,
 {
@@ -1413,7 +1792,7 @@ where
             $1, $2, {pending}, 0, NULL, '[]'::jsonb,
             $3, $4, $5, $6, $7, 1,
             $8, $9, $10, $11, $12
-        ) ON CONFLICT (idempotency_key) DO NOTHING",
+        ) ON CONFLICT DO NOTHING",
         name = table.qualified_name(),
         pending = ReceiveStatus::Pending.sql_literal(),
     );
@@ -1434,7 +1813,141 @@ where
         .execute(&mut **tx)
         .await?;
 
+    if result.rows_affected() == 1 {
+        return Ok(ReceivedInsertOutcome::Inserted);
+    }
+
+    received_insert_conflict_outcome(tx, &table, evt.message_id, idempotency_key).await
+}
+
+async fn received_insert_conflict_outcome(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &ReceivedTable,
+    message_id: Uuid,
+    idempotency_key: &str,
+) -> Result<ReceivedInsertOutcome> {
+    let sql = format!(
+        "SELECT message_id, idempotency_key
+         FROM {}
+         WHERE message_id = $1 OR idempotency_key = $2",
+        table.qualified_name()
+    );
+    let rows = sqlx::query(&sql)
+        .bind(message_id)
+        .bind(idempotency_key)
+        .fetch_all(&mut **tx)
+        .await?;
+
+    let mut saw_message_id = false;
+    for row in rows {
+        let row_message_id: Uuid = row.try_get("message_id")?;
+        let row_idempotency_key: String = row.try_get("idempotency_key")?;
+        if row_idempotency_key == idempotency_key {
+            return Ok(ReceivedInsertOutcome::DuplicateIdempotencyKey);
+        }
+        saw_message_id |= row_message_id == message_id;
+    }
+
+    if saw_message_id {
+        Ok(ReceivedInsertOutcome::MessageIdConflict)
+    } else {
+        Ok(ReceivedInsertOutcome::DuplicateIdempotencyKey)
+    }
+}
+
+pub async fn insert_received_ingest_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    cfg: &ResolvedConfig,
+    failure: &ReceivedIngestFailure,
+) -> Result<bool> {
+    let table = received_ingest_failures_table_name(cfg)?;
+    let sql = format!(
+        "INSERT INTO {table} (
+            source_topic, source_partition, source_offset, key, headers, payload,
+            message_type, expected_topic, failure_kind, error
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (source_topic, source_partition, source_offset) DO NOTHING"
+    );
+    let result = sqlx::query(&sql)
+        .bind(failure.source_topic.as_str())
+        .bind(failure.source_partition)
+        .bind(failure.source_offset)
+        .bind(failure.key.as_deref())
+        .bind(&failure.headers)
+        .bind(failure.payload.as_deref())
+        .bind(failure.message_type.as_str())
+        .bind(failure.expected_topic.as_str())
+        .bind(received_ingest_failure_kind_str(failure.kind))
+        .bind(failure.error.as_str())
+        .execute(&mut **tx)
+        .await?;
+
     Ok(result.rows_affected() == 1)
+}
+
+pub async fn received_ingest_failure_by_source(
+    pool: &PgPool,
+    cfg: &ResolvedConfig,
+    source_topic: &str,
+    source_partition: i32,
+    source_offset: i64,
+) -> Result<Option<ReceivedIngestFailureRow>> {
+    let table = received_ingest_failures_table_name(cfg)?;
+    let sql = format!(
+        "SELECT *
+         FROM {table}
+         WHERE source_topic = $1
+           AND source_partition = $2
+           AND source_offset = $3"
+    );
+    let row = sqlx::query(&sql)
+        .bind(source_topic)
+        .bind(source_partition)
+        .bind(source_offset)
+        .fetch_optional(pool)
+        .await?;
+
+    row.map(received_ingest_failure_row_from_pg).transpose()
+}
+
+fn received_ingest_failure_row_from_pg(row: PgRow) -> Result<ReceivedIngestFailureRow> {
+    let kind: String = row.try_get("failure_kind")?;
+    Ok(ReceivedIngestFailureRow {
+        source_topic: row.try_get("source_topic")?,
+        source_partition: row.try_get("source_partition")?,
+        source_offset: row.try_get("source_offset")?,
+        key: row.try_get("key")?,
+        headers: row.try_get("headers")?,
+        payload: row.try_get("payload")?,
+        message_type: row.try_get("message_type")?,
+        expected_topic: row.try_get("expected_topic")?,
+        kind: parse_received_ingest_failure_kind(&kind)?,
+        error: row.try_get("error")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn received_ingest_failure_kind_str(kind: ReceivedIngestFailureKind) -> &'static str {
+    match kind {
+        ReceivedIngestFailureKind::MissingPayload => "MissingPayload",
+        ReceivedIngestFailureKind::MissingIdempotencyKey => "MissingIdempotencyKey",
+        ReceivedIngestFailureKind::InvalidPayload => "InvalidPayload",
+        ReceivedIngestFailureKind::InvalidHeader => "InvalidHeader",
+        ReceivedIngestFailureKind::UnexpectedTopic => "UnexpectedTopic",
+        ReceivedIngestFailureKind::MessageIdConflict => "MessageIdConflict",
+    }
+}
+
+fn parse_received_ingest_failure_kind(value: &str) -> Result<ReceivedIngestFailureKind> {
+    match value {
+        "MissingPayload" => Ok(ReceivedIngestFailureKind::MissingPayload),
+        "MissingIdempotencyKey" => Ok(ReceivedIngestFailureKind::MissingIdempotencyKey),
+        "InvalidPayload" => Ok(ReceivedIngestFailureKind::InvalidPayload),
+        "InvalidHeader" => Ok(ReceivedIngestFailureKind::InvalidHeader),
+        "UnexpectedTopic" => Ok(ReceivedIngestFailureKind::UnexpectedTopic),
+        "MessageIdConflict" => Ok(ReceivedIngestFailureKind::MessageIdConflict),
+        other => Err(Error::InvalidIngestFailureKind(other.to_owned())),
+    }
 }
 
 pub async fn dispatch_once(
@@ -1443,38 +1956,261 @@ pub async fn dispatch_once(
     router: &MessageRouter,
     due_at: OffsetDateTime,
 ) -> Result<DispatchStats> {
+    #[cfg(feature = "test-hooks")]
+    {
+        dispatch_once_inner(pool, table, router, due_at, None).await
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        dispatch_once_inner(pool, table, router, due_at).await
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+pub async fn dispatch_once_with_hooks(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    router: &MessageRouter,
+    due_at: OffsetDateTime,
+    hooks: &DispatchTestHooks,
+) -> Result<DispatchStats> {
+    dispatch_once_inner(pool, table, router, due_at, Some(hooks)).await
+}
+
+async fn dispatch_once_inner(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    router: &MessageRouter,
+    due_at: OffsetDateTime,
+    #[cfg(feature = "test-hooks")] hooks: Option<&DispatchTestHooks>,
+) -> Result<DispatchStats> {
     let mut tx = pool.begin().await?;
     let Some(row) = claim_received_row(&mut tx, table, due_at).await? else {
         tx.commit().await?;
         return Ok(DispatchStats::default());
     };
 
-    let handler = router
-        .handler_for(&row.message_type)
-        .ok_or_else(|| Error::MissingHandler(row.message_type.clone()))?;
+    let Some(handler) = router.handler_for(&row.message_type) else {
+        let message = Error::MissingHandler(row.message_type.clone()).to_string();
+        #[cfg(feature = "test-hooks")]
+        run_before_record_failure_hook(
+            hooks,
+            &row,
+            ReceivedFailureKind::MissingHandler,
+            message.clone(),
+        )
+        .await?;
+        let outcome = record_received_failure_in_tx(
+            &mut tx,
+            table,
+            row.message_id,
+            ReceivedFailureKind::MissingHandler,
+            message,
+            due_at,
+            row.attempts,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(dispatch_failure_stats(outcome));
+    };
 
-    mark_received_processing(&mut tx, table, row.message_id).await?;
-    let handler_result = handler.handle(&mut tx, row.payload.clone()).await;
+    create_dispatch_handler_savepoint(&mut tx).await?;
+    let meta = ReceivedMeta::from(&row);
+    let handler_result = handler.handle(&mut tx, meta, row.payload.clone()).await;
     match handler_result {
-        Ok(()) => {
-            mark_received_processed(&mut tx, table, row.message_id, due_at).await?;
-            tx.commit().await?;
-            Ok(DispatchStats {
-                claimed: 1,
-                processed: 1,
-                failed: 0,
-            })
-        }
+        Ok(()) => match mark_received_processed(&mut tx, table, row.message_id, due_at).await {
+            Ok(MarkOutcome::Updated) => {
+                tx.commit().await?;
+                Ok(DispatchStats {
+                    claimed: 1,
+                    processed: 1,
+                    failed: 0,
+                })
+            }
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(DispatchStats {
+                    claimed: 1,
+                    processed: 0,
+                    failed: 0,
+                })
+            }
+            Err(err) => {
+                let kind = received_failure_kind(&err);
+                let message = err.to_string();
+                #[cfg(feature = "test-hooks")]
+                run_before_failure_rollback_hook(hooks, &row, kind, message.clone()).await?;
+                #[cfg(feature = "test-hooks")]
+                run_before_record_failure_hook(hooks, &row, kind, message.clone()).await?;
+                let outcome = rollback_handler_and_record_received_failure(
+                    tx,
+                    pool,
+                    table,
+                    ReceivedFailureRecord {
+                        message_id: row.message_id,
+                        kind,
+                        message,
+                        occurred_at: due_at,
+                        current_attempts: row.attempts,
+                    },
+                )
+                .await?;
+                Ok(dispatch_failure_stats(outcome))
+            }
+        },
         Err(err) => {
+            let kind = handler_failure_kind(&err);
             let message = err.to_string();
-            tx.rollback().await?;
-            record_received_failure(pool, table, row.message_id, message, due_at).await?;
-            Ok(DispatchStats {
-                claimed: 1,
-                processed: 0,
-                failed: 1,
-            })
+            #[cfg(feature = "test-hooks")]
+            run_before_failure_rollback_hook(hooks, &row, kind, message.clone()).await?;
+            #[cfg(feature = "test-hooks")]
+            run_before_record_failure_hook(hooks, &row, kind, message.clone()).await?;
+            let outcome = rollback_handler_and_record_received_failure(
+                tx,
+                pool,
+                table,
+                ReceivedFailureRecord {
+                    message_id: row.message_id,
+                    kind,
+                    message,
+                    occurred_at: due_at,
+                    current_attempts: row.attempts,
+                },
+            )
+            .await?;
+            Ok(dispatch_failure_stats(outcome))
         }
+    }
+}
+
+async fn create_dispatch_handler_savepoint(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SAVEPOINT kafkaman_dispatch_handler")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn rollback_to_dispatch_handler_savepoint(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("ROLLBACK TO SAVEPOINT kafkaman_dispatch_handler")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+struct ReceivedFailureRecord {
+    message_id: Uuid,
+    kind: ReceivedFailureKind,
+    message: String,
+    occurred_at: OffsetDateTime,
+    current_attempts: i32,
+}
+
+async fn rollback_handler_and_record_received_failure(
+    mut tx: Transaction<'_, Postgres>,
+    pool: &PgPool,
+    table: &ReceivedTable,
+    failure: ReceivedFailureRecord,
+) -> Result<MarkOutcome> {
+    if rollback_to_dispatch_handler_savepoint(&mut tx)
+        .await
+        .is_ok()
+    {
+        let outcome = record_received_failure_in_tx(
+            &mut tx,
+            table,
+            failure.message_id,
+            failure.kind,
+            failure.message,
+            failure.occurred_at,
+            failure.current_attempts,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(outcome);
+    }
+
+    rollback_before_failure_record(tx).await;
+    record_received_failure(
+        pool,
+        table,
+        failure.message_id,
+        failure.kind,
+        failure.message,
+        failure.occurred_at,
+        failure.current_attempts,
+    )
+    .await
+}
+
+async fn rollback_before_failure_record(tx: Transaction<'_, Postgres>) {
+    let _ = tx.rollback().await;
+}
+
+#[cfg(feature = "test-hooks")]
+async fn run_before_failure_rollback_hook(
+    hooks: Option<&DispatchTestHooks>,
+    row: &ReceivedRow,
+    kind: ReceivedFailureKind,
+    message: String,
+) -> Result<()> {
+    if let Some(hooks) = hooks {
+        hooks
+            .run_before_failure_rollback(DispatchFailureHookContext {
+                message_id: row.message_id,
+                idempotency_key: row.idempotency_key.clone(),
+                message_type: row.message_type.clone(),
+                kind,
+                message,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+async fn run_before_record_failure_hook(
+    hooks: Option<&DispatchTestHooks>,
+    row: &ReceivedRow,
+    kind: ReceivedFailureKind,
+    message: String,
+) -> Result<()> {
+    if let Some(hooks) = hooks {
+        hooks
+            .run_before_record_failure(DispatchFailureHookContext {
+                message_id: row.message_id,
+                idempotency_key: row.idempotency_key.clone(),
+                message_type: row.message_type.clone(),
+                kind,
+                message,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+fn dispatch_failure_stats(outcome: MarkOutcome) -> DispatchStats {
+    DispatchStats {
+        claimed: 1,
+        processed: 0,
+        failed: usize::from(outcome == MarkOutcome::Updated),
+    }
+}
+
+fn received_failure_kind(error: &Error) -> ReceivedFailureKind {
+    match error {
+        Error::MissingHandler(_) => ReceivedFailureKind::MissingHandler,
+        Error::Serde(_) => ReceivedFailureKind::InvalidPayload,
+        Error::Sqlx(_) => ReceivedFailureKind::Infrastructure,
+        Error::Handler(_) => ReceivedFailureKind::Handler,
+        _ => ReceivedFailureKind::Infrastructure,
+    }
+}
+
+fn handler_failure_kind(error: &Error) -> ReceivedFailureKind {
+    match error {
+        Error::Serde(_) => ReceivedFailureKind::InvalidPayload,
+        _ => ReceivedFailureKind::Handler,
     }
 }
 
@@ -1506,58 +2242,153 @@ async fn claim_received_row(
     row.map(received_row_from_pg).transpose()
 }
 
-async fn mark_received_processing(
-    tx: &mut Transaction<'_, Postgres>,
-    table: &ReceivedTable,
-    message_id: Uuid,
-) -> Result<()> {
-    let sql = format!(
-        "UPDATE {} SET status = {} WHERE message_id = $1",
-        table.qualified_name(),
-        ReceiveStatus::Processing.sql_literal(),
-    );
-    sqlx::query(&sql)
-        .bind(message_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
 async fn mark_received_processed(
     tx: &mut Transaction<'_, Postgres>,
     table: &ReceivedTable,
     message_id: Uuid,
     processed_at: OffsetDateTime,
-) -> Result<()> {
+) -> Result<MarkOutcome> {
     let sql = format!(
-        "UPDATE {} SET status = {}, processed_at = $2 WHERE message_id = $1",
+        "UPDATE {} SET status = {}, processed_at = $2 WHERE message_id = $1 AND status IN ({}, {})",
         table.qualified_name(),
         ReceiveStatus::Processed.sql_literal(),
+        ReceiveStatus::Pending.sql_literal(),
+        ReceiveStatus::Retryable.sql_literal(),
     );
-    sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(message_id)
         .bind(processed_at)
         .execute(&mut **tx)
         .await?;
-    Ok(())
+    if result.rows_affected() == 1 {
+        Ok(MarkOutcome::Updated)
+    } else {
+        received_mark_miss_outcome_in_tx(tx, table, message_id).await
+    }
 }
 
 async fn record_received_failure(
     pool: &PgPool,
     table: &ReceivedTable,
     message_id: Uuid,
+    kind: ReceivedFailureKind,
     message: String,
     occurred_at: OffsetDateTime,
-) -> Result<()> {
-    let error = serde_json::to_value(ReceivedError {
+    current_attempts: i32,
+) -> Result<MarkOutcome> {
+    let error = received_failure_error(kind, message, occurred_at)?;
+    let schedule = received_failure_schedule(table, current_attempts, occurred_at);
+    let sql = record_received_failure_sql(table);
+    let result = sqlx::query(&sql)
+        .bind(message_id)
+        .bind(error)
+        .bind(schedule.exhausted)
+        .bind(schedule.next_attempt_at)
+        .bind(schedule.errors_limit)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 1 {
+        Ok(MarkOutcome::Updated)
+    } else {
+        received_mark_miss_outcome(pool, table, message_id).await
+    }
+}
+
+async fn record_received_failure_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &ReceivedTable,
+    message_id: Uuid,
+    kind: ReceivedFailureKind,
+    message: String,
+    occurred_at: OffsetDateTime,
+    current_attempts: i32,
+) -> Result<MarkOutcome> {
+    let error = received_failure_error(kind, message, occurred_at)?;
+    let schedule = received_failure_schedule(table, current_attempts, occurred_at);
+    let sql = record_received_failure_sql(table);
+    let result = sqlx::query(&sql)
+        .bind(message_id)
+        .bind(error)
+        .bind(schedule.exhausted)
+        .bind(schedule.next_attempt_at)
+        .bind(schedule.errors_limit)
+        .execute(&mut **tx)
+        .await?;
+    if result.rows_affected() == 1 {
+        Ok(MarkOutcome::Updated)
+    } else {
+        received_mark_miss_outcome_in_tx(tx, table, message_id).await
+    }
+}
+
+fn received_failure_error(
+    kind: ReceivedFailureKind,
+    message: String,
+    occurred_at: OffsetDateTime,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(ReceivedError {
+        kind,
         message,
         occurred_at,
-    })?;
-    let sql = format!(
+    })?)
+}
+
+struct ReceivedFailureSchedule {
+    exhausted: bool,
+    next_attempt_at: Option<OffsetDateTime>,
+    errors_limit: i64,
+}
+
+fn received_failure_schedule(
+    table: &ReceivedTable,
+    current_attempts: i32,
+    occurred_at: OffsetDateTime,
+) -> ReceivedFailureSchedule {
+    let current_attempts = u32::try_from(current_attempts).unwrap_or(0);
+    let next_attempts = current_attempts.saturating_add(1);
+    let exhausted = next_attempts >= table.retry.max_attempts;
+    let next_attempt_at = if exhausted {
+        None
+    } else {
+        Some(occurred_at + duration_to_time(retry_backoff(&table.retry, current_attempts)))
+    };
+
+    ReceivedFailureSchedule {
+        exhausted,
+        next_attempt_at,
+        errors_limit: i64::from(table.retry.errors_limit.max(1)),
+    }
+}
+
+fn retry_backoff(policy: &RetryPolicy, current_attempts: u32) -> Duration {
+    let multiplier = if current_attempts == 0 {
+        1.0
+    } else {
+        policy
+            .multiplier
+            .powi(current_attempts.min(i32::MAX as u32) as i32)
+    };
+    let max = policy.max_backoff.as_secs_f64();
+    let candidate = policy.initial_backoff.as_secs_f64() * multiplier;
+    if !candidate.is_finite() {
+        return policy.max_backoff;
+    }
+    Duration::from_secs_f64(candidate.min(max))
+}
+
+fn duration_to_time(duration: Duration) -> time::Duration {
+    time::Duration::new(
+        duration.as_secs().min(i64::MAX as u64) as i64,
+        duration.subsec_nanos() as i32,
+    )
+}
+
+fn record_received_failure_sql(table: &ReceivedTable) -> String {
+    format!(
         "UPDATE {name}
-         SET status = {retryable},
+         SET status = CASE WHEN $3::bool THEN {failed} ELSE {retryable} END,
              attempts = attempts + 1,
-             next_attempt_at = NULL,
+             next_attempt_at = CASE WHEN $3::bool THEN NULL ELSE $4::timestamptz END,
              errors = COALESCE((
                  SELECT jsonb_agg(value ORDER BY ord)
                  FROM (
@@ -1565,19 +2396,58 @@ async fn record_received_failure(
                      FROM jsonb_array_elements(errors || jsonb_build_array($2::jsonb))
                          WITH ORDINALITY AS entries(value, ord)
                      ORDER BY ord DESC
-                     LIMIT 20
+                     LIMIT $5
                  ) kept
              ), '[]'::jsonb)
-         WHERE message_id = $1",
+         WHERE message_id = $1
+           AND status IN ({pending}, {retryable})",
         name = table.qualified_name(),
+        pending = ReceiveStatus::Pending.sql_literal(),
         retryable = ReceiveStatus::Retryable.sql_literal(),
+        failed = ReceiveStatus::Failed.sql_literal(),
+    )
+}
+
+async fn received_mark_miss_outcome(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    message_id: Uuid,
+) -> Result<MarkOutcome> {
+    let sql = format!(
+        "SELECT message_id FROM {} WHERE message_id = $1",
+        table.qualified_name()
     );
-    sqlx::query(&sql)
+    let exists = sqlx::query(&sql)
         .bind(message_id)
-        .bind(error)
-        .execute(pool)
-        .await?;
-    Ok(())
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+    Ok(if exists {
+        MarkOutcome::StaleClaim
+    } else {
+        MarkOutcome::Missing
+    })
+}
+
+async fn received_mark_miss_outcome_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &ReceivedTable,
+    message_id: Uuid,
+) -> Result<MarkOutcome> {
+    let sql = format!(
+        "SELECT message_id FROM {} WHERE message_id = $1",
+        table.qualified_name()
+    );
+    let exists = sqlx::query(&sql)
+        .bind(message_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some();
+    Ok(if exists {
+        MarkOutcome::StaleClaim
+    } else {
+        MarkOutcome::Missing
+    })
 }
 
 pub async fn claim_batch(
@@ -1816,6 +2686,86 @@ pub async fn received_row_by_idempotency_key(
         .fetch_optional(pool)
         .await?;
     row.map(received_row_from_pg).transpose()
+}
+
+/// Narrows a terminal-failure (DLQ) inspection or redrive to a subset of the
+/// `Failed` rows. An empty filter matches every terminal row.
+#[derive(Clone, Debug, Default)]
+pub struct ReceivedFailureFilter {
+    /// Only rows whose business `occurred_at` is at or after this instant.
+    pub occurred_after: Option<OffsetDateTime>,
+    /// Only rows whose most recent failure was of this kind.
+    pub kind: Option<ReceivedFailureKind>,
+}
+
+impl ReceivedFailureFilter {
+    pub fn since(mut self, occurred_after: OffsetDateTime) -> Self {
+        self.occurred_after = Some(occurred_after);
+        self
+    }
+
+    pub fn kind(mut self, kind: ReceivedFailureKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+}
+
+fn received_failed_where_sql(filter: &ReceivedFailureFilter) -> Result<String> {
+    let mut sql = format!("status = {}", ReceiveStatus::Failed.sql_literal());
+    if let Some(occurred_after) = filter.occurred_after {
+        let formatted = occurred_after
+            .format(&Rfc3339)
+            .map_err(|err| Error::InvalidReceivedFilter(err.to_string()))?;
+        sql.push_str(" AND occurred_at >= ");
+        sql.push_str(&sql_string_literal(&formatted));
+        sql.push_str("::timestamptz");
+    }
+    if let Some(kind) = filter.kind {
+        sql.push_str(&latest_failure_kind_clause(kind));
+    }
+    Ok(sql)
+}
+
+/// List terminal `Failed` (DLQ) receive rows for triage, oldest failure first.
+/// A row reaches `Failed` only after its retry budget is exhausted, so these are
+/// the rows an operator inspects before redriving them with [`Replay::received`].
+/// `filter` narrows by failure time and/or most-recent failure kind; `limit`
+/// bounds the page size (clamped to non-negative). Each row carries its
+/// preserved attempts and bounded error history intact.
+pub async fn received_failed_rows(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    filter: &ReceivedFailureFilter,
+    limit: i64,
+) -> Result<Vec<ReceivedRow>> {
+    let sql = format!(
+        "SELECT * FROM {name}
+         WHERE {where_sql}
+         ORDER BY created_at, message_id
+         LIMIT $1",
+        name = table.qualified_name(),
+        where_sql = received_failed_where_sql(filter)?,
+    );
+    let rows = sqlx::query(&sql)
+        .bind(limit.max(0))
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(received_row_from_pg).collect()
+}
+
+/// Count terminal `Failed` (DLQ) receive rows matching `filter` (an empty filter
+/// counts the whole terminal backlog).
+pub async fn received_failed_count(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    filter: &ReceivedFailureFilter,
+) -> Result<i64> {
+    let sql = format!(
+        "SELECT count(*) FROM {name} WHERE {where_sql}",
+        name = table.qualified_name(),
+        where_sql = received_failed_where_sql(filter)?,
+    );
+    Ok(sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await?)
 }
 
 fn received_row_from_pg(row: PgRow) -> Result<ReceivedRow> {

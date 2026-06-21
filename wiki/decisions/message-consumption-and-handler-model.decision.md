@@ -1,7 +1,7 @@
 # Message Consumption and Handler Model
 
 - Document Class: Decision
-- Status: Draft
+- Status: Accepted
 - Date: 2026-06-20
 - Category: Runtime and integration
 - Scope: How kafkaman consumes from Kafka durably, how received messages are stored and de-duplicated, and the handler programming model (a Tower stack with extractors). Retry/backoff/DLQ policy is defined separately; this decision reserves and uses the fields and seams for it.
@@ -18,6 +18,15 @@
   - wiki/proposals/01-kafkaman-objectives.proposal.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
 
+## Accepted Reconciliation
+
+M3 accepts the shipped closure-based handler surface:
+`MessageRouter::handler::<P>(Fn(&mut PgConnection, ReceivedMeta, P))`.
+Handlers can perform business SQL and call `enqueue_on_connection` on the same
+connection, so consume-then-produce commits atomically with the received-row
+status update. The larger Tower/extractor/Rx surface remains future design
+space; it is not required for M3 acceptance.
+
 ## Decision
 
 1. **Two schedulers — "messages must flow."** Consumption is split so user code
@@ -29,7 +38,7 @@
      rebalance churn.
    - **Dispatch scheduler** (DB-facing): claims **due** rows
      (`WHERE status IN ('Pending','Retryable') AND next_attempt_at <= now()`) with
-     `FOR UPDATE SKIP LOCKED`, marks them `Processing`, drives the user's handler
+     `FOR UPDATE SKIP LOCKED`, drives the user's handler
      stack, and on the outcome moves the row to `Processed` (Ok) or back to
      `Retryable` / on to terminal `Failed` (Err — see point 6). This is the only
      place user code runs. **The claim predicate and the status set are fixed by
@@ -40,8 +49,8 @@
    Each row carries: message **identity** (message_id + idempotency key), topic /
    partition / offset, partition **key**, **payload** + type/version, headers,
    `correlation_id` / `causation_id`, `status` (the receive **state machine** —
-   `Pending → Processing → Processed` on success, `Processing → Retryable →
-   Processing` on a retryable failure, `Processing → Failed` on a terminal one;
+   `Pending → Processed` on success, `Pending/Retryable → Retryable` on a
+   retryable failure; `Processing` and `Failed` remain reserved future states;
    see point 6), `attempts` (monotonic int), **`errors`** (see point 3),
    `next_attempt_at` (the re-drive gate), and timestamps (`received_at`,
    `processed_at`).

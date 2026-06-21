@@ -43,6 +43,9 @@ pub enum Error {
     #[error("outbox row `{0}` was not found")]
     MissingRow(Uuid),
 
+    #[error("received row with idempotency key `{0}` was not found")]
+    MissingReceivedRow(String),
+
     #[error("outbox row `{message_id}` expected status `{expected}` but found `{actual}`")]
     UnexpectedStatus {
         message_id: Uuid,
@@ -312,7 +315,7 @@ impl Harness {
         let table = ReceivedTable::for_message::<P>(&cfg)?;
         received_row_by_idempotency_key(&self.pool, &table, idempotency_key)
             .await?
-            .ok_or(Error::MissingRow(Uuid::nil()))
+            .ok_or_else(|| Error::MissingReceivedRow(idempotency_key.to_owned()))
     }
 
     async fn ensure_message<P>(&self) -> Result<ResolvedConfig>
@@ -324,35 +327,29 @@ impl Harness {
         // only released once migration has committed, so no concurrent caller
         // can see the type registered before its table exists.
         let _guard = self.registration_lock.lock().await;
-        let already_registered = {
-            let cfg = self.cfg.lock().expect("harness config mutex poisoned");
-            cfg.messages()
+        let next = {
+            let mut cfg = self.cfg.lock().expect("harness config mutex poisoned");
+            if !cfg
+                .messages()
                 .iter()
                 .any(|candidate| candidate.message_type == descriptor.message_type)
-        };
-        if !already_registered {
-            let next = {
-                let mut cfg = self.cfg.lock().expect("harness config mutex poisoned");
+            {
                 *cfg = cfg.clone().with_message(descriptor);
-                cfg.clone()
-            };
-            let report = migrate(
-                &self.pool,
-                &next,
-                &MigrationContext::default(),
-                &changesets_for(&next),
-            )
-            .await?;
-            *self
-                .last_migration_report
-                .lock()
-                .expect("harness migration report mutex poisoned") = report;
-        }
-        Ok(self
-            .cfg
+            }
+            cfg.clone()
+        };
+        let report = migrate(
+            &self.pool,
+            &next,
+            &MigrationContext::default(),
+            &changesets_for(&next),
+        )
+        .await?;
+        *self
+            .last_migration_report
             .lock()
-            .expect("harness config mutex poisoned")
-            .clone())
+            .expect("harness migration report mutex poisoned") = report;
+        Ok(next)
     }
 
     async fn ensure_received_message<P>(&self) -> Result<ResolvedConfig>

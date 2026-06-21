@@ -442,7 +442,7 @@ impl RetrySection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RetryConfig {
     pub defaults: RetryPolicy,
     pub overrides: BTreeMap<String, RetryPolicyOverride>,
@@ -468,6 +468,19 @@ pub struct RetryPolicy {
     pub multiplier: f64,
     pub errors_limit: u32,
     pub dlq: DlqMode,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 10,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(300),
+            multiplier: 2.0,
+            errors_limit: 20,
+            dlq: DlqMode::Table,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]

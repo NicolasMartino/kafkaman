@@ -225,9 +225,23 @@ Adding `tower` to workspace dependencies is part of M3, but the HTTP-specific
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
   `cargo test --workspace --all-features`, and
   `cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive`.
-- Remaining M3 work: randomized effective-once property gate, crash-during-dispatch
-  gate, `Replay::received::<T>`, injected Harness `Clock`, `#[kafkaman::test]`,
-  derive macro, Kafka ingest, and full-loop Redpanda coverage.
+- 2026-06-21 (review follow-up): addressed the implementation review's H1
+  failure-accounting clobber (status-guarded `record_received_failure`), the M2
+  Harness send/receive registration conflict, and L1/L2 polish; added the
+  stale-failure interleaving, crash-during-dispatch, randomized redelivery
+  convergence, and bounded 20-entry error-ring gates.
+- 2026-06-22 (review follow-up): handlers now receive message metadata via
+  `ReceivedMeta` (`message_id`, `idempotency_key`, `attempts`, `headers`,
+  `correlation_id`/`causation_id`, source topic/partition/offset/key);
+  `MessageRouter::handler` and `dispatch_once` thread it through, with the
+  `dispatch_exposes_message_metadata_to_handler` gate. This satisfies the review's
+  "land at least metadata access" bar (M1) and documents the L3 nullability choice
+  inline. The broader `FromMessage`/`Rx`/state and Tower handler abstractions
+  remain pending.
+- Remaining M3 work: `FromMessage`/`Rx`/state extractors and Tower layer
+  compatibility, `Replay::received::<T>`, injected Harness `Clock`,
+  `#[kafkaman::test]`, derive macro, Kafka ingest, and full-loop Redpanda
+  coverage.
 
 ## Wiki Updates
 
