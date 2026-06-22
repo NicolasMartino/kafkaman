@@ -1609,19 +1609,15 @@ async fn replay_received_redrives_failed_rows_without_replaying_processed_rows()
     .execute(harness.pool())
     .await?;
 
-    let failed_events = [
-        "replay-failed-a",
-        "replay-failed-b",
-        "replay-failed-c",
-    ]
-    .into_iter()
-    .map(|order_id| {
-        Envelope::new(OrderCreated {
-            order_id: order_id.to_owned(),
+    let failed_events = ["replay-failed-a", "replay-failed-b", "replay-failed-c"]
+        .into_iter()
+        .map(|order_id| {
+            Envelope::new(OrderCreated {
+                order_id: order_id.to_owned(),
+            })
+            .with_idempotency_key(format!("idem-{order_id}"))
         })
-        .with_idempotency_key(format!("idem-{order_id}"))
-    })
-    .collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     for (idx, event) in failed_events.iter().enumerate() {
         assert!(
             harness
@@ -1806,7 +1802,10 @@ async fn received_failed_rows_inspect_surface_lists_terminal_dlq_rows() -> TestR
     // Count and list reflect exactly the three terminal rows; the pending row is
     // excluded.
     let all = ReceivedFailureFilter::default();
-    assert_eq!(received_failed_count(harness.pool(), &table, &all).await?, 3);
+    assert_eq!(
+        received_failed_count(harness.pool(), &table, &all).await?,
+        3
+    );
 
     let listed = received_failed_rows(harness.pool(), &table, &all, 10).await?;
     assert_eq!(listed.len(), 3);
@@ -1850,8 +1849,16 @@ async fn received_failed_filter_narrows_by_kind_and_since() -> TestResult {
     // Seed three terminal rows with controlled business time and most-recent
     // failure kind: two Handler (one old, one new) and one new InvalidPayload.
     let seed = [
-        ("handler-old", 1_700_000_000_i64, ReceivedFailureKind::Handler),
-        ("handler-new", 1_700_100_000_i64, ReceivedFailureKind::Handler),
+        (
+            "handler-old",
+            1_700_000_000_i64,
+            ReceivedFailureKind::Handler,
+        ),
+        (
+            "handler-new",
+            1_700_100_000_i64,
+            ReceivedFailureKind::Handler,
+        ),
         (
             "invalid-new",
             1_700_100_000_i64,

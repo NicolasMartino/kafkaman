@@ -2746,10 +2746,7 @@ pub async fn received_failed_rows(
         name = table.qualified_name(),
         where_sql = received_failed_where_sql(filter)?,
     );
-    let rows = sqlx::query(&sql)
-        .bind(limit.max(0))
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(&sql).bind(limit.max(0)).fetch_all(pool).await?;
     rows.into_iter().map(received_row_from_pg).collect()
 }
 
