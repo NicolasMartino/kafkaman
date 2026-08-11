@@ -1,5 +1,225 @@
 # Wiki Log
 
+## [2026-08-12] ingest | error-row rule scope and ownership recorded
+
+Promoted the reserved-header question from an open asymmetry to a decided
+boundary, extending the typed-idempotency decision rather than filing a new page
+since that decision already owns the error-row rule.
+
+The rule now has an explicit scope: it applies to a send whose envelope is
+structurally safe to persist. A send rejected *because its own content must not
+enter the ledger* fails before any database work. That draws the line at
+"would recording it write something the ledger must not contain" rather than at
+severity, and it explains the reserved-header path as consistent with an
+existing house pattern — invalid config and invalid retry settings already fail
+before touching the database, with tests asserting exactly that — instead of as
+an oversight in the error-row rule. Concretely, an audit row for a reserved
+header would persist the offending `kafkaman-*` header into the row's `headers`
+JSONB, so downstream tooling reading `headers` would observe a spoofed
+`kafkaman-message-id`.
+
+Also recorded that the send/receive difference follows from transaction
+ownership: on receive kafkaman owns the transaction and can roll back to a
+savepoint while persisting its failure record, whereas on send the caller owns
+the transaction and the business write inside it. An earlier reading of this as
+a design flaw was wrong.
+
+Consequences added: reserved-header rejections leave no ledger trace, so that
+failure mode is only visible in application logs; and a caller that commits
+after an invalid send holds business state with no corresponding event, which is
+a deliberate election of forensics over atomicity that the caller must
+reconcile. Revisit triggers added for wanting a durable record of reserved-header
+rejections (which would mean persisting the envelope with the header stripped
+and the removal noted) and for making identity required at construction or via
+typestate, which would remove the missing-identity error row entirely.
+
+Pages affected: wiki/decisions/typed-idempotency-identity-and-error-row-symmetry.decision.md,
+wiki/index.md, wiki/log.md.
+
+## [2026-08-12] implementation | tests for caller-controlled invalid-send audit
+
+Reworked the invalid-send tests to demonstrate the property they claim. Both
+existing tests exercised the commit and rollback branches but wrote no business
+data, so neither proved the thing that makes the choice meaningful: that the
+caller's own rows share the fate of the audit row. Both now write business data
+inside the same transaction and assert it survives a commit and is discarded by
+a rollback.
+
+Added the recovery path that makes rollback safe rather than lossy. A
+consume-then-produce handler whose enqueue is rejected has its business write
+and the audit row discarded together by the handler savepoint, leaves the
+receive row `Retryable` with its failure recorded and `processed_at` unset, and
+the message is delivered again — completing on the next attempt once the handler
+supplies an identity. The recorded failure is asserted to be the rejected
+enqueue rather than an incidental error.
+
+Clarified during discussion that the send/receive asymmetry follows from
+transaction ownership, not inconsistency: on receive kafkaman owns the
+transaction and can roll back to a savepoint while persisting its failure
+record, whereas on send the caller owns the transaction and the business write
+inside it, so kafkaman must not decide whether that write survives. An earlier
+reading of this as a design flaw was wrong.
+
+The reserved-header path is pinned by a test rather than left implicit: a
+rejection returns before the insert, so it leaves the caller nothing to commit
+even if they want the record, while a missing idempotency identity does. That
+behaviour was kept and is now decided rather than open — see the follow-up entry
+above.
+
+Verified: durable_send 20 passed, durable_receive 27 passed, redpanda_full_loop
+10 passed, workspace 85 passed across 23 suites, clippy clean.
+
+Pages affected: wiki/compatibility/typed-idempotency-identity-api.compat.md,
+wiki/log.md.
+
+## [2026-08-12] implementation | typed idempotency fix verified against Docker
+
+Ran the Docker-backed gates that the typed idempotency fix plan had never
+executed. The earlier `CreateContainer(RequestTimeoutError)` was a cold Docker
+daemon, not a defect. First execution produced seven `durable_receive` failures
+in three classes: a latent serialization defect exposed by the F3/F4 fix, two
+tests querying `idempotency_key` with pre-digest plaintext, and a
+diagnosability regression where a missing row was reported by its digest rather
+than the caller's key.
+
+The load-bearing finding is the first. `ReceivedError::occurred_at` was a bare
+`OffsetDateTime`, so `time`'s default serde wrote a component array that
+`(errors -> -1 ->> 'occurred_at')::timestamptz` cannot parse. Nothing had ever
+cast that field, so the wrong format was invisible until the fix reached for it.
+The deeper problem was the cast itself: deriving triage state from audit JSON
+couples DLQ queries to a serialization format. Failure time and kind were
+promoted to `last_failed_at` and `last_failure_kind` columns, which decouples
+them, makes triage indexable, and frees the audit records to carry annotated
+RFC 9557 timestamps that PostgreSQL cannot cast at all.
+
+Confirmed empirically against PostgreSQL 16 that `timestamptz` rejects both
+`...Z[UTC]` and `...+01:00[Europe/London]`, and that RFC 9557 is a strict
+superset of RFC 3339, so an unannotated timestamp is valid under both. Stored
+failure records were reshaped as RFC 9457 problem details (`type` as a stable
+`urn:kafkaman:problem:*` URI, `title`, `detail`, `occurred_at` as an extension
+member; `status` omitted as HTTP-specific), with read-side aliases so
+pre-problem-detail rows stay readable and an unknown `type` degrades to the
+default kind rather than failing the read.
+
+Two further defects surfaced while fixing these. DLQ inspection and bounded
+redrive ordered by failure time with a random `message_id` tiebreak, so a
+`max_rows` redrive could select an unpredictable subset of rows failed by the
+same dispatch pass; ordering is now `last_failed_at, created_at, message_id`.
+And `apps/axum-outbox` enqueued without an idempotency identity, so the
+reference example had silently stopped working under the F1 contract — its
+error type renders as a 200 with a text body, which is why its test asserted a
+successful status and then failed parsing JSON.
+
+Verified: `durable_send` 19 passed, `durable_receive` 26 passed,
+`redpanda_full_loop` 10 passed, workspace 83 passed across 23 suites, clippy
+clean. All five pre-merge review findings are closed and the branch now meets
+its own merge gate.
+
+Pages affected: wiki/plans/typed-idempotency-identity-error-row-fix.plan.md
+(Active to Completed), wiki/compatibility/typed-idempotency-identity-api.compat.md
+(Draft to Active, expanded), wiki/reviews/m3-m4-pre-merge-branch-review.reference.md
+(resolution section), wiki/index.md, wiki/log.md.
+
+## [2026-08-12] ingest | entity-first propagation design discussion
+
+Ingested the 2026-08-12 design discussion that settled kafkaman's positioning as
+a reference propagation system and the identity model that positioning requires.
+Central finding: dedup is not convergence. The existing `idempotency_key`
+answers "have I executed this work item", while a replica needs "is this newer
+than what I hold", and diff-and-upsert cannot close the gap because kafkaman's
+own retry backoff, `Replay::received` redrive, redelivery, and bootstrap replay
+all reorder application by design. Fixed a required `entity_version` sourced
+from the outbox sequence by default and overridable by a domain version, since
+direct transport mode has no outbox and republish-based drift repair corrupts
+the replica under sequence versioning. Adopted entity-only messages across the
+existing inbox plus a new guarded per-entity replica table, an outbox
+monotonicity constraint as source-side defense-in-depth, and advisory
+`#[non_exhaustive]` origin intent with a mandatory catch-all wire variant —
+without which a single new variant can trip the ingest circuit breaker
+topic-wide. Reversed proposal 07's emission choice to soft-delete-first, because
+real tombstones are reclaimed after `delete.retention.ms` and a long-offline
+replica misses the delete; proposal 07 keeps real-tombstone ingestion for
+foreign producers. Filed the bootstrap/backfill gap left open by the previous
+ingest as proposal 10. Implementation planning deliberately deferred until
+M3/M4 merges and the typed-idempotency fix plan lands.
+Contradiction resolved: proposal 07's selected option (per-type real tombstones
+on send and receive) conflicted with soft-delete-first; the user resolved it in
+favor of soft delete during the discussion, and proposal 07 was revised in place
+with the reversal recorded rather than silently rewritten.
+Pages affected: `raw/design/2026-08-12-entity-first-propagation-discussion.md`,
+`wiki/proposals/09-entity-first-propagation.proposal.md`,
+`wiki/proposals/10-replica-bootstrap-and-readiness.proposal.md`,
+`wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md`,
+`wiki/decisions/entity-first-propagation-model.decision.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-12] ingest | prior-art review of cqrs-fullstack messaging
+
+Reviewed the `cqrs-fullstack` messaging implementation in the workout2 project
+snapshot as external prior art for kafkaman's durable send/receive model. The
+snapshot implements the same pattern by hand: a transactional `outbox_events`
+table with claim-by-`SKIP LOCKED`, stuck-row reclaim, attempt counters, and a
+retention purge; and per-topic inbox tables where the consumer only enqueues and
+commits offsets before a separate dispatcher executes domain work with retry and
+dead-letter state. Two capability gaps were identified and filed as proposals:
+Kafka tombstones are unrepresentable in kafkaman and currently quarantine as
+`MissingPayload`, and both schedulers poll on a fixed interval with no
+notification-driven wakeup. A third gap, bootstrap/backfill of a new reference
+replica, was identified but not yet filed pending a positioning decision on
+kafkaman as a reference builder.
+Pages affected: `wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md`,
+`wiki/proposals/08-listen-notify-scheduler-wakeup.proposal.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-12] implement | typed idempotency identity fixes
+
+Implemented typed SHA-256 idempotency identity with retained source JSON,
+transactional invalid-send outbox audit rows, digest Kafka header parsing,
+latest-failure-time DLQ/redrive filtering, and received-only replay checksum
+cleanup. Added regression tests and a draft compatibility note. Verification
+passed for non-Docker compile/tests and clippy; Docker-backed integration
+execution is pending because testcontainer creation timed out with
+`CreateContainer(RequestTimeoutError)`.
+
+Pages affected:
+- `wiki/compatibility/typed-idempotency-identity-api.compat.md`
+- `wiki/plans/typed-idempotency-identity-error-row-fix.plan.md`
+- `wiki/index.md`
+- `wiki/log.md`
+
+## [2026-08-12] create | typed idempotency identity and error-row symmetry
+
+Accepted the typed idempotency identity proposal and recorded the durable
+decision that kafkaman idempotency is a SHA-256 digest plus caller-provided JSON
+source material. Added an active implementation plan to close the M3/M4
+pre-merge review findings and to apply the send/receive rule: record invalid or
+problem work transactionally, return an error, allow caller rollback, and have
+workers claim only non-error rows.
+
+Pages affected:
+- `wiki/proposals/06-typed-idempotency-identity-and-error-row-symmetry.proposal.md`
+- `wiki/decisions/typed-idempotency-identity-and-error-row-symmetry.decision.md`
+- `wiki/plans/typed-idempotency-identity-error-row-fix.plan.md`
+- `wiki/index.md`
+- `wiki/log.md`
+
+## [2026-06-23] review | M3/M4 pre-merge branch
+
+Recorded an adversarial pre-merge review of branch
+`implementation/m3-durable-receive` against local `main`. Findings: send-side
+idempotency remains optional while receive-side ingest requires
+`kafkaman-idempotency-key`; empty idempotency keys are accepted and collapse
+unrelated receive rows; DLQ inspect/redrive "failure time" semantics use business
+or row time instead of latest failure time; received-only replay knobs can alter
+outbox replay checksums without changing outbox SQL. Verification recorded:
+workspace all-features compile/tests and clippy passed; one durable-send package
+`PoolTimedOut` flake passed when rerun in isolation.
+
+Pages affected:
+- `wiki/reviews/m3-m4-pre-merge-branch-review.reference.md`
+- `wiki/index.md`
+- `wiki/log.md`
+
 ## [2026-06-22] promote | M4 retry/backoff/DLQ spec
 
 Completed M4 Phase 3/4 and promoted validated behavior into an Active spec

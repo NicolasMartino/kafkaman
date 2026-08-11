@@ -1,7 +1,7 @@
 use kafkaman_config::Config;
 use kafkaman_core::{
-    Envelope, KafkaMessage, OutboxStatus, ReceiveStatus, ReceivedError, ReceivedFailureKind,
-    ReceivedMeta,
+    Envelope, IdempotencyIdentity, IdempotencyKey, KafkaMessage, OutboxStatus, ReceiveStatus,
+    ReceivedError, ReceivedFailureKind, ReceivedMeta,
 };
 use kafkaman_sqlx::{
     changelog, dispatch_once, dispatch_once_with_hooks, enqueue_on_connection,
@@ -28,6 +28,12 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+fn idem_key(value: &str) -> IdempotencyKey {
+    IdempotencyIdentity::derive_legacy_string(value)
+        .expect("test idempotency source is valid")
+        .key
+}
 
 fn receive_test_lock() -> &'static Mutex<()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
@@ -63,12 +69,16 @@ fn retry_test_config(schema: &str, max_attempts: u32, errors_limit: u32) -> Conf
 /// does (serde-serialized `ReceivedError`), so it round-trips back through
 /// `ReceivedRow` deserialization in assertions.
 fn failure_errors_json(kind: ReceivedFailureKind, count: usize) -> serde_json::Value {
+    failure_errors_json_at(kind, count, OffsetDateTime::now_utc())
+}
+
+fn failure_errors_json_at(
+    kind: ReceivedFailureKind,
+    count: usize,
+    occurred_at: OffsetDateTime,
+) -> serde_json::Value {
     let errors = (0..count)
-        .map(|idx| ReceivedError {
-            kind,
-            message: format!("boom-{idx}"),
-            occurred_at: OffsetDateTime::now_utc(),
-        })
+        .map(|idx| ReceivedError::new(kind, format!("boom-{idx}"), occurred_at))
         .collect::<Vec<_>>();
     serde_json::to_value(errors).expect("serialize received errors")
 }
@@ -237,6 +247,10 @@ async fn dispatch_exposes_message_metadata_to_handler() -> TestResult {
         .expect("handler should have observed metadata");
     assert_eq!(meta.message_id, envelope.message_id);
     assert_eq!(meta.idempotency_key, "idem-meta");
+    assert_eq!(
+        meta.idempotency_source,
+        Some(serde_json::json!("idem-meta"))
+    );
     assert_eq!(meta.message_type, "order_created");
     assert_eq!(meta.attempts, 0);
     assert_eq!(meta.correlation_id, Some(correlation_id));
@@ -294,7 +308,7 @@ async fn dispatch_failure_rolls_back_effect_and_parks_retryable() -> TestResult 
     assert!(row.next_attempt_at.is_some_and(|retry_at| retry_at > now));
     assert_eq!(row.errors.len(), 1);
     assert_eq!(row.errors[0].kind, ReceivedFailureKind::Handler);
-    assert!(row.errors[0].message.contains("boom"));
+    assert!(row.errors[0].detail.contains("boom"));
 
     let handled: i64 = sqlx::query_scalar("SELECT count(*) FROM handled_orders")
         .fetch_one(harness.pool())
@@ -358,7 +372,7 @@ async fn missing_handler_is_recorded_and_does_not_block_younger_rows() -> TestRe
     assert_eq!(row.attempts, 1);
     assert_eq!(row.errors.len(), 1);
     assert_eq!(row.errors[0].kind, ReceivedFailureKind::MissingHandler);
-    assert!(row.errors[0].message.contains("no handler registered"));
+    assert!(row.errors[0].detail.contains("no handler registered"));
 
     let success_router = MessageRouter::new().handler::<OrderCreated>(|conn, _meta, msg| {
         Box::pin(async move {
@@ -434,7 +448,7 @@ async fn poisoned_handler_transaction_is_recorded_as_dispatch_failure() -> TestR
     assert_eq!(row.errors.len(), 1);
     assert_eq!(row.errors[0].kind, ReceivedFailureKind::Infrastructure);
     assert!(row.errors[0]
-        .message
+        .detail
         .contains("current transaction is aborted"));
 
     Ok(())
@@ -522,7 +536,7 @@ async fn rollback_failure_still_records_infrastructure_dispatch_failure() -> Tes
     assert_eq!(row.errors.len(), 1);
     assert_eq!(row.errors[0].kind, ReceivedFailureKind::Infrastructure);
     assert!(row.errors[0]
-        .message
+        .detail
         .contains("current transaction is aborted"));
 
     Ok(())
@@ -551,7 +565,7 @@ async fn corrupted_received_payload_is_recorded_as_invalid_payload_failure() -> 
          SET payload = jsonb_build_object('order_id', 42)
          WHERE idempotency_key = $1"
     ))
-    .bind("idem-corrupted-payload")
+    .bind(idem_key("idem-corrupted-payload").to_string())
     .execute(harness.pool())
     .await?;
 
@@ -760,7 +774,7 @@ async fn max_attempts_moves_received_row_to_failed_with_bounded_errors() -> Test
     assert_eq!(row.attempts, 1);
     assert_eq!(row.next_attempt_at, Some(now + time::Duration::seconds(2)));
     assert_eq!(row.errors.len(), 1);
-    assert!(row.errors[0].message.contains("terminal-retry-1"));
+    assert!(row.errors[0].detail.contains("terminal-retry-1"));
 
     let second = dispatch_once(
         harness.pool(),
@@ -780,7 +794,7 @@ async fn max_attempts_moves_received_row_to_failed_with_bounded_errors() -> Test
     assert_eq!(row.attempts, 2);
     assert_eq!(row.next_attempt_at, None);
     assert_eq!(row.errors.len(), 1);
-    assert!(row.errors[0].message.contains("terminal-retry-2"));
+    assert!(row.errors[0].detail.contains("terminal-retry-2"));
 
     let later = dispatch_once(
         harness.pool(),
@@ -1021,7 +1035,7 @@ async fn received_failure_errors_keep_most_recent_twenty_entries() -> TestResult
                  WHERE idempotency_key = $1"
             );
             sqlx::query(&unpark_sql)
-                .bind("idem-error-ring")
+                .bind(idem_key("idem-error-ring").to_string())
                 .bind(OffsetDateTime::now_utc())
                 .execute(harness.pool())
                 .await?;
@@ -1045,8 +1059,8 @@ async fn received_failure_errors_keep_most_recent_twenty_entries() -> TestResult
     assert_eq!(row.status, ReceiveStatus::Retryable);
     assert_eq!(row.attempts, 25);
     assert_eq!(row.errors.len(), 20);
-    assert!(row.errors[0].message.contains("boom-5"));
-    assert!(row.errors[19].message.contains("boom-24"));
+    assert!(row.errors[0].detail.contains("boom-5"));
+    assert!(row.errors[19].detail.contains("boom-24"));
 
     Ok(())
 }
@@ -1181,6 +1195,142 @@ async fn random_redeliveries_converge_to_one_effect_per_idempotency_key() -> Tes
     Ok(())
 }
 
+/// The consume-then-produce recovery path: when a handler's enqueue is rejected,
+/// nothing it wrote survives, the receive row is never acknowledged, and the
+/// message is delivered again. This is what makes rolling back an invalid send
+/// safe rather than lossy — the work is recovered by redelivery, not by the
+/// audit row that the rollback discards.
+#[tokio::test]
+async fn handler_enqueue_failure_is_rolled_back_and_the_message_redelivered() -> TestResult {
+    let _test_guard = receive_test_lock().lock().await;
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+    let received_table = harness.received_table::<OrderCreated>().await?;
+    let outbox_table = harness.outbox_table::<OrderAccepted>().await?;
+    let outbox_name = outbox_table.qualified_name();
+
+    sqlx::query("CREATE TABLE handled_orders (order_id TEXT PRIMARY KEY)")
+        .execute(harness.pool())
+        .await?;
+
+    let event = Envelope::new(OrderCreated {
+        order_id: "order-redelivered".to_owned(),
+    })
+    .with_idempotency_key("idem-order-redelivered");
+    assert!(
+        harness
+            .insert_received(&event, 9, 9, Some(b"order-redelivered"))
+            .await?
+    );
+
+    // The handler writes a business row and then enqueues an envelope carrying
+    // no idempotency identity, which `enqueue_on_connection` rejects.
+    let cfg = harness.config();
+    let failing_router = MessageRouter::new().handler::<OrderCreated>(move |conn, _meta, msg| {
+        let cfg = cfg.clone();
+        Box::pin(async move {
+            sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
+                .bind(msg.order_id.as_str())
+                .execute(&mut *conn)
+                .await?;
+            let accepted = Envelope::new(OrderAccepted {
+                order_id: msg.order_id,
+            });
+            enqueue_on_connection(conn, &cfg, &accepted).await?;
+            Ok(())
+        })
+    });
+
+    let first = dispatch_once(
+        harness.pool(),
+        &received_table,
+        &failing_router,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    assert_eq!(first.processed, 0);
+    assert_eq!(first.failed, 1);
+
+    // The handler's business write and the invalid-send audit row are discarded
+    // together by the handler savepoint rollback.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM handled_orders")
+            .fetch_one(harness.pool())
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {outbox_name}"))
+            .fetch_one(harness.pool())
+            .await?,
+        0
+    );
+
+    // The message is not acknowledged: the row still owes work rather than
+    // having been consumed.
+    let row = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-redelivered")
+        .await?;
+    assert_eq!(row.status, ReceiveStatus::Retryable);
+    assert_eq!(row.attempts, 1);
+    assert!(row.processed_at.is_none());
+    // kafkaman owns the receive transaction, so unlike the send path it keeps its
+    // own failure record even though the handler's work was rolled back.
+    assert_eq!(row.errors.len(), 1);
+    assert!(
+        row.errors[0].detail.contains("idempotency"),
+        "the recorded failure must be the rejected enqueue, not an incidental \
+         error: {}",
+        row.errors[0].detail
+    );
+
+    // And it is delivered again. A handler that supplies an identity completes
+    // the same message on its next attempt, past the retry backoff.
+    let cfg = harness.config();
+    let recovering_router = MessageRouter::new().handler::<OrderCreated>(move |conn, _meta, msg| {
+        let cfg = cfg.clone();
+        Box::pin(async move {
+            sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
+                .bind(msg.order_id.as_str())
+                .execute(&mut *conn)
+                .await?;
+            let accepted = Envelope::new(OrderAccepted {
+                order_id: msg.order_id,
+            })
+            .with_idempotency_key("accepted-order-redelivered");
+            enqueue_on_connection(conn, &cfg, &accepted).await?;
+            Ok(())
+        })
+    });
+
+    let second = dispatch_once(
+        harness.pool(),
+        &received_table,
+        &recovering_router,
+        OffsetDateTime::now_utc() + Duration::from_secs(3_600),
+    )
+    .await?;
+    assert_eq!(second.processed, 1);
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM handled_orders")
+            .fetch_one(harness.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT count(*) FROM {outbox_name} WHERE status = {}",
+            OutboxStatus::Pending.sql_literal()
+        ))
+        .fetch_one(harness.pool())
+        .await?,
+        1
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn handler_enqueues_outbox_atomically_with_receive_transaction() -> TestResult {
     let _test_guard = receive_test_lock().lock().await;
@@ -1248,7 +1398,7 @@ async fn handler_enqueues_outbox_atomically_with_receive_transaction() -> TestRe
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT count(*) FROM {outbox_name} WHERE idempotency_key = $1"
         ))
-        .bind("accepted-consume-produce-ok")
+        .bind(idem_key("accepted-consume-produce-ok").to_string())
         .fetch_one(harness.pool())
         .await?,
         1
@@ -1297,7 +1447,7 @@ async fn handler_enqueues_outbox_atomically_with_receive_transaction() -> TestRe
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT count(*) FROM {outbox_name} WHERE idempotency_key = $1"
         ))
-        .bind("accepted-consume-produce-ok")
+        .bind(idem_key("accepted-consume-produce-ok").to_string())
         .fetch_one(harness.pool())
         .await?,
         1
@@ -1345,7 +1495,7 @@ async fn handler_enqueues_outbox_atomically_with_receive_transaction() -> TestRe
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT count(*) FROM {outbox_name} WHERE idempotency_key = $1"
         ))
-        .bind("accepted-consume-produce-rollback")
+        .bind(idem_key("accepted-consume-produce-rollback").to_string())
         .fetch_one(harness.pool())
         .await?,
         0
@@ -1599,10 +1749,16 @@ async fn replay_received_redrives_failed_rows_without_replaying_processed_rows()
         3
     );
 
+    // Give the processed rows a failure history too, so the redrive below is
+    // proven to skip them on status rather than on absence of failure metadata.
+    // The legacy `message` key is deliberate: it exercises the compatibility
+    // alias that keeps pre-problem-detail rows readable.
     sqlx::query(&format!(
         "UPDATE {table_name}
          SET attempts = 3,
              errors = jsonb_build_array(jsonb_build_object('message', 'old', 'occurred_at', now())),
+             last_failed_at = now(),
+             last_failure_kind = 'Handler',
              processed_at = now()
          WHERE status = {processed}"
     ))
@@ -1630,16 +1786,26 @@ async fn replay_received_redrives_failed_rows_without_replaying_processed_rows()
                 .await?
         );
     }
-    sqlx::query(&format!(
+    // Match on stored digests: `idempotency_key` holds a SHA-256 hex digest, so
+    // a prefix LIKE against the plaintext key would silently match no rows.
+    let failed_keys = failed_events
+        .iter()
+        .map(|event| idem_key(&format!("idem-{}", event.payload.order_id)).to_string())
+        .collect::<Vec<_>>();
+    let seeded = sqlx::query(&format!(
         "UPDATE {table_name}
          SET status = {failed},
              attempts = 3,
              next_attempt_at = NULL,
-             errors = jsonb_build_array(jsonb_build_object('message', 'old', 'occurred_at', now()))
-         WHERE idempotency_key LIKE 'idem-replay-failed-%'"
+             errors = jsonb_build_array(jsonb_build_object('message', 'old', 'occurred_at', now())),
+             last_failed_at = now(),
+             last_failure_kind = 'Handler'
+         WHERE idempotency_key = ANY($1)"
     ))
+    .bind(&failed_keys)
     .execute(harness.pool())
     .await?;
+    assert_eq!(seeded.rows_affected(), failed_events.len() as u64);
 
     let cfg = harness.config();
     let skipped = changelog![
@@ -1813,13 +1979,20 @@ async fn received_failed_rows_inspect_surface_lists_terminal_dlq_rows() -> TestR
     assert!(listed.iter().all(|row| row.attempts == 1));
     // Forensic error history is preserved on every terminal row.
     assert!(listed.iter().all(|row| !row.errors.is_empty()));
-    // Oldest failure first, by created_at.
+    // Oldest failure first. All three failed in the same dispatch pass and so
+    // share a `last_failed_at`; the order below is guaranteed by the `created_at`
+    // tiebreak, which resolves a tied group by row age rather than by random
+    // message id.
     assert_eq!(
         listed
             .iter()
-            .map(|row| row.idempotency_key.as_str())
+            .map(|row| row.idempotency_key)
             .collect::<Vec<_>>(),
-        ["idem-dlq-a", "idem-dlq-b", "idem-dlq-c"]
+        [
+            idem_key("idem-dlq-a"),
+            idem_key("idem-dlq-b"),
+            idem_key("idem-dlq-c")
+        ]
     );
     // The non-terminal pending row never appears in the DLQ inspect surface.
     assert!(listed
@@ -1830,9 +2003,9 @@ async fn received_failed_rows_inspect_surface_lists_terminal_dlq_rows() -> TestR
     let page = received_failed_rows(harness.pool(), &table, &all, 2).await?;
     assert_eq!(
         page.iter()
-            .map(|row| row.idempotency_key.as_str())
+            .map(|row| row.idempotency_key)
             .collect::<Vec<_>>(),
-        ["idem-dlq-a", "idem-dlq-b"]
+        [idem_key("idem-dlq-a"), idem_key("idem-dlq-b")]
     );
 
     Ok(())
@@ -1847,25 +2020,30 @@ async fn received_failed_filter_narrows_by_kind_and_since() -> TestResult {
     let table_name = table.qualified_name();
 
     // Seed three terminal rows with controlled business time and most-recent
-    // failure kind: two Handler (one old, one new) and one new InvalidPayload.
+    // failure time/kind. Business time is deliberately misleading: the old
+    // business event can fail recently, and a newer business event can have an
+    // older failure.
     let seed = [
         (
             "handler-old",
+            1_700_100_000_i64,
             1_700_000_000_i64,
             ReceivedFailureKind::Handler,
         ),
         (
             "handler-new",
+            1_700_000_000_i64,
             1_700_100_000_i64,
             ReceivedFailureKind::Handler,
         ),
         (
             "invalid-new",
             1_700_100_000_i64,
+            1_700_100_000_i64,
             ReceivedFailureKind::InvalidPayload,
         ),
     ];
-    for (idx, (label, _, _)) in seed.iter().enumerate() {
+    for (idx, (label, _, _, _)) in seed.iter().enumerate() {
         let envelope = Envelope::new(OrderCreated {
             order_id: (*label).to_owned(),
         })
@@ -1876,18 +2054,23 @@ async fn received_failed_filter_narrows_by_kind_and_since() -> TestResult {
                 .await?
         );
     }
-    for (label, epoch, kind) in seed {
-        let errors = failure_errors_json(kind, 1);
+    for (label, business_epoch, failure_epoch, kind) in seed {
+        let errors =
+            failure_errors_json_at(kind, 1, OffsetDateTime::from_unix_timestamp(failure_epoch)?);
         sqlx::query(&format!(
             "UPDATE {table_name}
              SET status = 'Failed',
                  occurred_at = to_timestamp($1),
-                 errors = $2::jsonb
+                 errors = $2::jsonb,
+                 last_failed_at = to_timestamp($4),
+                 last_failure_kind = $5
              WHERE idempotency_key = $3"
         ))
-        .bind(epoch)
+        .bind(business_epoch)
         .bind(errors)
-        .bind(format!("idem-{label}"))
+        .bind(idem_key(&format!("idem-{label}")).to_string())
+        .bind(failure_epoch)
+        .bind(kind.discriminant())
         .execute(harness.pool())
         .await?;
     }
@@ -1904,7 +2087,7 @@ async fn received_failed_filter_narrows_by_kind_and_since() -> TestResult {
         received_failed_rows(harness.pool(), &table, &handlers, 10)
             .await?
             .iter()
-            .map(|row| row.idempotency_key.clone())
+            .map(|row| row.idempotency_key)
             .collect::<Vec<_>>(),
         ["idem-handler-old", "idem-handler-new"]
     );
@@ -1956,11 +2139,14 @@ async fn replay_received_redrive_filters_by_kind_and_clears_history_on_request()
             "UPDATE {table_name}
              SET status = 'Failed',
                  attempts = 5,
-                 errors = $1::jsonb
+                 errors = $1::jsonb,
+                 last_failed_at = now(),
+                 last_failure_kind = $3
              WHERE idempotency_key = $2"
         ))
         .bind(failure_errors_json(kind, 2))
-        .bind(format!("idem-{label}"))
+        .bind(idem_key(&format!("idem-{label}")).to_string())
+        .bind(kind.discriminant())
         .execute(harness.pool())
         .await?;
     }

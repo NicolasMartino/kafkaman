@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use kafkaman_config::{Config, ConfigErrors, ConfigSchema, RetryConfig, RetryPolicy};
 use kafkaman_core::{
-    ClaimedOutboxRow, Envelope, KafkaMessage, MarkOutcome, MessageDescriptor, OutboxRow,
-    OutboxStatus, ReceiveStatus, ReceivedError, ReceivedFailureKind, ReceivedIngestFailureKind,
-    ReceivedMeta, ReceivedRow, RelayConfig, SqlIdentifier,
+    ClaimedOutboxRow, Envelope, IdempotencyKey, KafkaMessage, MarkOutcome, MessageDescriptor,
+    OutboxRow, OutboxStatus, ReceiveStatus, ReceivedError, ReceivedFailureKind,
+    ReceivedIngestFailureKind, ReceivedMeta, ReceivedRow, RelayConfig, SqlIdentifier,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -38,7 +38,7 @@ type BeforeFailureRollbackHook =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatchFailureHookContext {
     pub message_id: Uuid,
-    pub idempotency_key: String,
+    pub idempotency_key: IdempotencyKey,
     pub message_type: String,
     pub kind: ReceivedFailureKind,
     pub message: String,
@@ -831,6 +831,7 @@ impl Changeset for AddIdempotencyKey {
     fn build(&self, cfg: &ResolvedConfig, builder: &mut ChangeBuilder) -> Result<()> {
         let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
         builder.push(add_idempotency_key_sql(&table));
+        builder.push(add_idempotency_source_sql(&table));
         Ok(())
     }
 
@@ -848,6 +849,13 @@ impl Changeset for AddIdempotencyKey {
 pub fn add_idempotency_key_sql(table: &OutboxTable) -> String {
     format!(
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
+        table.qualified_name()
+    )
+}
+
+pub fn add_idempotency_source_sql(table: &OutboxTable) -> String {
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS idempotency_source JSONB",
         table.qualified_name()
     )
 }
@@ -983,10 +991,15 @@ impl Changeset for Replay {
                     .unwrap_or_else(|_| timestamp.to_string())
             })
             .unwrap_or_else(|| "none".to_owned());
-        let failure_kind = self
-            .failure_kind
-            .map(received_failure_kind_str)
-            .unwrap_or("none");
+        let (failure_kind, clear_history) = match self.target {
+            ReplayTarget::Received => (
+                self.failure_kind
+                    .map(received_failure_kind_str)
+                    .unwrap_or("none"),
+                self.clear_history,
+            ),
+            ReplayTarget::Outbox => ("none", false),
+        };
         format!(
             "version={};name={};message_type={};topic={};occurred_after={};max_rows={};contexts={};failure_kind={};clear_history={}",
             self.version(),
@@ -999,7 +1012,7 @@ impl Changeset for Replay {
                 .unwrap_or_else(|| "none".to_owned()),
             self.contexts.join(","),
             failure_kind,
-            self.clear_history,
+            clear_history,
         )
     }
 
@@ -1051,6 +1064,7 @@ impl Changeset for Replay {
 }
 
 fn replay_outbox_update_sql(table: &OutboxTable, replay: &Replay) -> Result<String> {
+    reject_received_only_replay_options(replay)?;
     let max_rows = replay.max_rows_or_error()?;
     let filter = replay_outbox_filter_sql(replay)?;
     Ok(format!(
@@ -1078,6 +1092,7 @@ fn replay_outbox_update_sql(table: &OutboxTable, replay: &Replay) -> Result<Stri
 }
 
 fn replay_outbox_count_sql(table: &OutboxTable, replay: &Replay) -> Result<String> {
+    reject_received_only_replay_options(replay)?;
     let max_rows = replay.max_rows_or_error()?;
     let filter = replay_outbox_filter_sql(replay)?;
     Ok(format!(
@@ -1115,8 +1130,11 @@ fn replay_received_update_sql(table: &ReceivedTable, replay: &Replay) -> Result<
     // Default redrive preserves attempts and error history for triage; an
     // explicit `clear_history()` resets the row to a clean slate with a full
     // retry budget.
+    // A clean slate must also drop the denormalized failure columns, or a
+    // history-erased row would still be matched by a `since`/`kind` filter that
+    // reads them.
     let history_reset = if replay.clear_history {
-        ",\n            attempts = 0,\n            errors = '[]'::jsonb"
+        ",\n            attempts = 0,\n            errors = '[]'::jsonb,\n            last_failed_at = NULL,\n            last_failure_kind = NULL"
     } else {
         ""
     };
@@ -1124,7 +1142,7 @@ fn replay_received_update_sql(table: &ReceivedTable, replay: &Replay) -> Result<
         "WITH candidates AS (
          SELECT message_id FROM {name}
          WHERE {filter}
-         ORDER BY occurred_at, message_id
+         ORDER BY {failure_order}
          LIMIT {max_rows}
         )
         UPDATE {name}
@@ -1134,6 +1152,7 @@ fn replay_received_update_sql(table: &ReceivedTable, replay: &Replay) -> Result<
         WHERE message_id IN (SELECT message_id FROM candidates)",
         name = table.qualified_name(),
         filter = filter,
+        failure_order = received_failure_order_sql(),
         max_rows = max_rows,
         pending = ReceiveStatus::Pending.sql_literal(),
         history_reset = history_reset,
@@ -1147,11 +1166,12 @@ fn replay_received_count_sql(table: &ReceivedTable, replay: &Replay) -> Result<S
         "SELECT count(*) FROM (
          SELECT message_id FROM {name}
          WHERE {filter}
-         ORDER BY occurred_at, message_id
+         ORDER BY {failure_order}
          LIMIT {max_rows}
          ) candidates",
         name = table.qualified_name(),
         filter = filter,
+        failure_order = received_failure_order_sql(),
         max_rows = max_rows,
     ))
 }
@@ -1171,7 +1191,9 @@ fn replay_received_filter_sql(replay: &Replay) -> Result<String> {
                 version: replay.version,
                 message: err.to_string(),
             })?;
-        filter.push_str(" AND occurred_at >= ");
+        filter.push_str(" AND ");
+        filter.push_str(latest_failure_time_sql());
+        filter.push_str(" >= ");
         filter.push_str(&sql_string_literal(&formatted));
         filter.push_str("::timestamptz");
     }
@@ -1181,24 +1203,36 @@ fn replay_received_filter_sql(replay: &Replay) -> Result<String> {
     Ok(filter)
 }
 
-/// The canonical serialized name for a [`ReceivedFailureKind`], matching the
-/// `kind` field serde writes into the stored `errors` JSONB and the discriminant
-/// used in redrive/inspect filters and replay checksums.
-fn received_failure_kind_str(kind: ReceivedFailureKind) -> &'static str {
-    match kind {
-        ReceivedFailureKind::MissingHandler => "MissingHandler",
-        ReceivedFailureKind::InvalidPayload => "InvalidPayload",
-        ReceivedFailureKind::Infrastructure => "Infrastructure",
-        ReceivedFailureKind::Handler => "Handler",
+fn reject_received_only_replay_options(replay: &Replay) -> Result<()> {
+    if replay.target == ReplayTarget::Outbox
+        && (replay.failure_kind.is_some() || replay.clear_history)
+    {
+        return Err(Error::InvalidReplay {
+            version: replay.version,
+            message: "failure_kind and clear_history are only valid for received replay".to_owned(),
+        });
     }
+    Ok(())
+}
+
+/// The canonical discriminant for a [`ReceivedFailureKind`], stored in the
+/// `last_failure_kind` column and used in redrive/inspect filters and replay
+/// checksums.
+///
+/// These strings are load-bearing for changeset checksums, so they must stay
+/// stable. They are intentionally *not* the RFC 9457 `type` URI written into the
+/// `errors` audit JSON; the two representations are decoupled precisely so the
+/// audit format can change without rewriting migration history.
+fn received_failure_kind_str(kind: ReceivedFailureKind) -> &'static str {
+    kind.discriminant()
 }
 
 /// SQL predicate fragment (` AND ...`) selecting received rows whose most recent
-/// stored error is of `kind`. The error array is appended newest-last, so its
-/// final element (`errors -> -1`) is the failure that currently parks the row.
+/// stored failure is of `kind`, read from the `last_failure_kind` column that
+/// failure accounting maintains alongside the `errors` audit trail.
 fn latest_failure_kind_clause(kind: ReceivedFailureKind) -> String {
     format!(
-        " AND (errors -> -1 ->> 'kind') = {}",
+        " AND last_failure_kind = {}",
         sql_string_literal(received_failure_kind_str(kind))
     )
 }
@@ -1630,6 +1664,7 @@ pub fn create_outbox_table_sql(table: &OutboxTable) -> String {
         "CREATE TABLE IF NOT EXISTS {name} (
     message_id UUID PRIMARY KEY,
     idempotency_key TEXT,
+    idempotency_source JSONB,
     status TEXT NOT NULL DEFAULT {pending},
     attempts INT NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1646,7 +1681,8 @@ pub fn create_outbox_table_sql(table: &OutboxTable) -> String {
     occurred_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     published_at TIMESTAMPTZ,
-    CHECK (status IN ({status_list}))
+    CHECK (status IN ({status_list})),
+    CHECK (idempotency_key IS NULL OR idempotency_key ~ '^[0-9a-f]{{64}}$')
 )",
         name = table.qualified_name(),
         pending = OutboxStatus::Pending.sql_literal(),
@@ -1669,11 +1705,28 @@ pub fn create_received_table_sql(table: &ReceivedTable) -> String {
     // that lack kafkaman correlation metadata. Keeping the columns nullable now
     // avoids a later migration when that path lands.
     format!(
-        "CREATE TABLE IF NOT EXISTS {name} (\n            message_id UUID PRIMARY KEY,\n            idempotency_key TEXT NOT NULL,\n            status TEXT NOT NULL DEFAULT {pending} CHECK (status IN ({statuses})),\n            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),\n            next_attempt_at TIMESTAMPTZ,\n            errors JSONB NOT NULL DEFAULT '[]'::jsonb,\n            source_topic TEXT NOT NULL,\n            source_partition INTEGER NOT NULL,\n            source_offset BIGINT NOT NULL,\n            key BYTEA,\n            message_type TEXT NOT NULL,\n            message_version INTEGER NOT NULL DEFAULT 1 CHECK (message_version >= 1),\n            headers JSONB NOT NULL DEFAULT '{{}}'::jsonb,\n            payload JSONB NOT NULL,\n            correlation_id UUID,\n            causation_id UUID,\n            occurred_at TIMESTAMPTZ NOT NULL,\n            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n            processed_at TIMESTAMPTZ\n        )",
+        "CREATE TABLE IF NOT EXISTS {name} (\n            message_id UUID PRIMARY KEY,\n            idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{{64}}$'),\n            idempotency_source JSONB,\n            status TEXT NOT NULL DEFAULT {pending} CHECK (status IN ({statuses})),\n            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),\n            next_attempt_at TIMESTAMPTZ,\n            errors JSONB NOT NULL DEFAULT '[]'::jsonb,\n            last_failed_at TIMESTAMPTZ,\n            last_failure_kind TEXT CHECK (last_failure_kind IN ({failure_kinds})),\n            source_topic TEXT NOT NULL,\n            source_partition INTEGER NOT NULL,\n            source_offset BIGINT NOT NULL,\n            key BYTEA,\n            message_type TEXT NOT NULL,\n            message_version INTEGER NOT NULL DEFAULT 1 CHECK (message_version >= 1),\n            headers JSONB NOT NULL DEFAULT '{{}}'::jsonb,\n            payload JSONB NOT NULL,\n            correlation_id UUID,\n            causation_id UUID,\n            occurred_at TIMESTAMPTZ NOT NULL,\n            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n            processed_at TIMESTAMPTZ\n        )",
         name = table.qualified_name(),
         pending = ReceiveStatus::Pending.sql_literal(),
         statuses = ReceiveStatus::sql_literal_list(),
+        failure_kinds = received_failure_kind_sql_literal_list(),
     )
+}
+
+/// The `last_failure_kind` CHECK list, generated from [`ReceivedFailureKind`] so
+/// the database and the Rust enum cannot drift. `NULL` satisfies the CHECK, so
+/// rows that have never failed are unconstrained.
+fn received_failure_kind_sql_literal_list() -> String {
+    [
+        ReceivedFailureKind::MissingHandler,
+        ReceivedFailureKind::InvalidPayload,
+        ReceivedFailureKind::Infrastructure,
+        ReceivedFailureKind::Handler,
+    ]
+    .into_iter()
+    .map(|kind| sql_string_literal(received_failure_kind_str(kind)))
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 pub fn create_received_idempotency_index_sql(table: &ReceivedTable) -> String {
@@ -1718,19 +1771,35 @@ where
     let headers = serde_json::to_value(&evt.headers)?;
     let payload = serde_json::to_value(&evt.payload)?;
     let partition_key = evt.payload.partition_key();
+    let identity = evt.idempotency_key.as_ref();
+    let idempotency_key = identity.map(|identity| identity.key.to_string());
+    let idempotency_source = identity
+        .and_then(|identity| identity.source.as_ref())
+        .map(|source| source.value().clone());
+    let status = if identity.is_some() {
+        OutboxStatus::Pending
+    } else {
+        OutboxStatus::Failed
+    };
+    let last_error = identity
+        .is_none()
+        .then(|| "missing idempotency identity".to_owned());
 
     let sql = format!(
         "INSERT INTO {name} (
-            message_id, idempotency_key, status, attempts, next_attempt_at, topic, partition_key,
-            correlation_id, causation_id, headers, payload, occurred_at
-        ) VALUES ($1, $2, {pending}, 0, now(), $3, $4, $5, $6, $7, $8, $9)",
+            message_id, idempotency_key, idempotency_source, status, attempts, next_attempt_at,
+            last_error, topic, partition_key, correlation_id, causation_id, headers, payload,
+            occurred_at
+        ) VALUES ($1, $2, $3, {status}, 0, now(), $4, $5, $6, $7, $8, $9, $10, $11)",
         name = table.qualified_name(),
-        pending = OutboxStatus::Pending.sql_literal(),
+        status = status.sql_literal(),
     );
 
     sqlx::query(&sql)
         .bind(evt.message_id)
-        .bind(evt.idempotency_key.as_deref())
+        .bind(idempotency_key.as_deref())
+        .bind(idempotency_source)
+        .bind(last_error.as_deref())
         .bind(table.descriptor.topic.clone())
         .bind(partition_key)
         .bind(evt.correlation_id)
@@ -1741,7 +1810,11 @@ where
         .execute(&mut *conn)
         .await?;
 
-    Ok(())
+    if identity.is_none() {
+        Err(Error::MissingIdempotencyKey)
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn insert_received<P>(
@@ -1778,20 +1851,25 @@ where
     }
     let idempotency_key = evt
         .idempotency_key
-        .as_deref()
+        .as_ref()
         .ok_or(Error::MissingIdempotencyKey)?;
+    let idempotency_key_hex = idempotency_key.key.to_string();
+    let idempotency_source = idempotency_key
+        .source
+        .as_ref()
+        .map(|source| source.value().clone());
     let headers = serde_json::to_value(&evt.headers)?;
     let payload = serde_json::to_value(&evt.payload)?;
 
     let sql = format!(
         "INSERT INTO {name} (
-            message_id, idempotency_key, status, attempts, next_attempt_at, errors,
+            message_id, idempotency_key, idempotency_source, status, attempts, next_attempt_at, errors,
             source_topic, source_partition, source_offset, key, message_type, message_version,
             headers, payload, correlation_id, causation_id, occurred_at
         ) VALUES (
-            $1, $2, {pending}, 0, NULL, '[]'::jsonb,
-            $3, $4, $5, $6, $7, 1,
-            $8, $9, $10, $11, $12
+            $1, $2, $3, {pending}, 0, NULL, '[]'::jsonb,
+            $4, $5, $6, $7, $8, 1,
+            $9, $10, $11, $12, $13
         ) ON CONFLICT DO NOTHING",
         name = table.qualified_name(),
         pending = ReceiveStatus::Pending.sql_literal(),
@@ -1799,7 +1877,8 @@ where
 
     let result = sqlx::query(&sql)
         .bind(evt.message_id)
-        .bind(idempotency_key)
+        .bind(idempotency_key_hex.as_str())
+        .bind(idempotency_source)
         .bind(table.descriptor.topic.clone())
         .bind(source_partition)
         .bind(source_offset)
@@ -1817,7 +1896,7 @@ where
         return Ok(ReceivedInsertOutcome::Inserted);
     }
 
-    received_insert_conflict_outcome(tx, &table, evt.message_id, idempotency_key).await
+    received_insert_conflict_outcome(tx, &table, evt.message_id, &idempotency_key_hex).await
 }
 
 async fn received_insert_conflict_outcome(
@@ -2158,7 +2237,7 @@ async fn run_before_failure_rollback_hook(
         hooks
             .run_before_failure_rollback(DispatchFailureHookContext {
                 message_id: row.message_id,
-                idempotency_key: row.idempotency_key.clone(),
+                idempotency_key: row.idempotency_key,
                 message_type: row.message_type.clone(),
                 kind,
                 message,
@@ -2179,7 +2258,7 @@ async fn run_before_record_failure_hook(
         hooks
             .run_before_record_failure(DispatchFailureHookContext {
                 message_id: row.message_id,
-                idempotency_key: row.idempotency_key.clone(),
+                idempotency_key: row.idempotency_key,
                 message_type: row.message_type.clone(),
                 kind,
                 message,
@@ -2285,6 +2364,8 @@ async fn record_received_failure(
         .bind(schedule.exhausted)
         .bind(schedule.next_attempt_at)
         .bind(schedule.errors_limit)
+        .bind(occurred_at)
+        .bind(received_failure_kind_str(kind))
         .execute(pool)
         .await?;
     if result.rows_affected() == 1 {
@@ -2312,6 +2393,8 @@ async fn record_received_failure_in_tx(
         .bind(schedule.exhausted)
         .bind(schedule.next_attempt_at)
         .bind(schedule.errors_limit)
+        .bind(occurred_at)
+        .bind(received_failure_kind_str(kind))
         .execute(&mut **tx)
         .await?;
     if result.rows_affected() == 1 {
@@ -2326,11 +2409,11 @@ fn received_failure_error(
     message: String,
     occurred_at: OffsetDateTime,
 ) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(ReceivedError {
+    Ok(serde_json::to_value(ReceivedError::new(
         kind,
         message,
         occurred_at,
-    })?)
+    ))?)
 }
 
 struct ReceivedFailureSchedule {
@@ -2398,7 +2481,9 @@ fn record_received_failure_sql(table: &ReceivedTable) -> String {
                      ORDER BY ord DESC
                      LIMIT $5
                  ) kept
-             ), '[]'::jsonb)
+             ), '[]'::jsonb),
+             last_failed_at = $6::timestamptz,
+             last_failure_kind = $7::text
          WHERE message_id = $1
            AND status IN ({pending}, {retryable})",
         name = table.qualified_name(),
@@ -2631,10 +2716,17 @@ fn row_from_pg(row: PgRow) -> Result<OutboxRow> {
     let status: String = row.try_get("status")?;
     let headers: serde_json::Value = row.try_get("headers")?;
     let headers: BTreeMap<String, String> = serde_json::from_value(headers)?;
+    let idempotency_key: Option<String> = row.try_get("idempotency_key")?;
+    let idempotency_key = idempotency_key
+        .as_deref()
+        .map(IdempotencyKey::from_hex)
+        .transpose()
+        .map_err(Error::Core)?;
 
     Ok(OutboxRow {
         message_id: row.try_get("message_id")?,
-        idempotency_key: row.try_get("idempotency_key")?,
+        idempotency_key,
+        idempotency_source: row.try_get("idempotency_source")?,
         status: status
             .parse()
             .map_err(|err: kafkaman_core::Error| Error::Core(err))?,
@@ -2675,14 +2767,14 @@ pub async fn received_row(
 pub async fn received_row_by_idempotency_key(
     pool: &PgPool,
     table: &ReceivedTable,
-    idempotency_key: &str,
+    idempotency_key: IdempotencyKey,
 ) -> Result<Option<ReceivedRow>> {
     let sql = format!(
         "SELECT * FROM {} WHERE idempotency_key = $1",
         table.qualified_name()
     );
     let row = sqlx::query(&sql)
-        .bind(idempotency_key)
+        .bind(idempotency_key.to_string())
         .fetch_optional(pool)
         .await?;
     row.map(received_row_from_pg).transpose()
@@ -2692,7 +2784,7 @@ pub async fn received_row_by_idempotency_key(
 /// `Failed` rows. An empty filter matches every terminal row.
 #[derive(Clone, Debug, Default)]
 pub struct ReceivedFailureFilter {
-    /// Only rows whose business `occurred_at` is at or after this instant.
+    /// Only rows whose latest recorded failure occurred at or after this instant.
     pub occurred_after: Option<OffsetDateTime>,
     /// Only rows whose most recent failure was of this kind.
     pub kind: Option<ReceivedFailureKind>,
@@ -2716,7 +2808,9 @@ fn received_failed_where_sql(filter: &ReceivedFailureFilter) -> Result<String> {
         let formatted = occurred_after
             .format(&Rfc3339)
             .map_err(|err| Error::InvalidReceivedFilter(err.to_string()))?;
-        sql.push_str(" AND occurred_at >= ");
+        sql.push_str(" AND ");
+        sql.push_str(latest_failure_time_sql());
+        sql.push_str(" >= ");
         sql.push_str(&sql_string_literal(&formatted));
         sql.push_str("::timestamptz");
     }
@@ -2741,10 +2835,11 @@ pub async fn received_failed_rows(
     let sql = format!(
         "SELECT * FROM {name}
          WHERE {where_sql}
-         ORDER BY created_at, message_id
+         ORDER BY {failure_order}
          LIMIT $1",
         name = table.qualified_name(),
         where_sql = received_failed_where_sql(filter)?,
+        failure_order = received_failure_order_sql(),
     );
     let rows = sqlx::query(&sql).bind(limit.max(0)).fetch_all(pool).await?;
     rows.into_iter().map(received_row_from_pg).collect()
@@ -2765,16 +2860,42 @@ pub async fn received_failed_count(
     Ok(sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await?)
 }
 
+/// The column carrying the time of the most recent recorded failure.
+///
+/// This is deliberately a real `timestamptz` column rather than a cast over the
+/// `errors` audit JSON. Casting bound DLQ triage to the JSON serialization
+/// format — an RFC 9557 annotated timestamp, or `time`'s default component
+/// array, cannot be cast at all — and could not be indexed without a functional
+/// index over a JSON traversal.
+fn latest_failure_time_sql() -> &'static str {
+    "last_failed_at"
+}
+
+/// Total ordering for DLQ inspection and bounded redrive: oldest failure first,
+/// ties broken by row age and finally by `message_id`.
+///
+/// `last_failed_at` alone is not a total order — a batch of rows failed by the
+/// same dispatch pass shares an instant — and `message_id` is a random UUID, so
+/// without `created_at` the tiebreak is arbitrary. That matters beyond
+/// presentation: a redrive bounded by `max_rows` would otherwise select an
+/// unpredictable subset of a tied group.
+fn received_failure_order_sql() -> &'static str {
+    "last_failed_at, created_at, message_id"
+}
+
 fn received_row_from_pg(row: PgRow) -> Result<ReceivedRow> {
     let status: String = row.try_get("status")?;
     let headers: serde_json::Value = row.try_get("headers")?;
     let headers: BTreeMap<String, String> = serde_json::from_value(headers)?;
     let errors: serde_json::Value = row.try_get("errors")?;
     let errors: Vec<ReceivedError> = serde_json::from_value(errors)?;
+    let idempotency_key: String = row.try_get("idempotency_key")?;
+    let idempotency_key = IdempotencyKey::from_hex(&idempotency_key).map_err(Error::Core)?;
 
     Ok(ReceivedRow {
         message_id: row.try_get("message_id")?,
-        idempotency_key: row.try_get("idempotency_key")?,
+        idempotency_key,
+        idempotency_source: row.try_get("idempotency_source")?,
         status: status
             .parse()
             .map_err(|err: kafkaman_core::Error| Error::Core(err))?,

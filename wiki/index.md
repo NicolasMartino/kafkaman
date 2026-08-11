@@ -1,8 +1,8 @@
 # Wiki Index
 
 Project: kafkaman
-Stage: M4 retry/backoff/DLQ active
-Updated: 2026-06-22
+Stage: M3/M4 pre-merge fixes active
+Updated: 2026-08-12
 
 One-line: A Rust library plus optional worker runtime for reliable Kafka-backed
 service messaging, using Postgres as the durable execution ledger.
@@ -79,6 +79,20 @@ service messaging, using Postgres as the durable execution ledger.
   message-id conflict outcome/quarantine, handler-domain SQL classification, and
   replay history preservation. Status: Sourced.
 
+- [reviews/m3-m4-pre-merge-branch-review.reference.md](reviews/m3-m4-pre-merge-branch-review.reference.md)
+  - Adversarial pre-merge review of branch `implementation/m3-durable-receive`
+    against local `main`. Finds two high-severity idempotency-contract gaps
+    (send-side optional idempotency vs receive-side required header, and accepted
+    empty idempotency keys), medium DLQ/redrive time-semantics mismatches, and a
+    low-severity outbox replay checksum no-op issue. Verification: workspace
+    all-features compile/tests and clippy passed; default durable-send package
+    test had one `PoolTimedOut` flake that passed in isolation. Carries a
+    2026-08-12 resolution section closing all five findings, and recording two
+    places the fix departed from the review's proposed remedy: the suggested
+    `errors -> -1 ->> 'occurred_at'` cast is not viable, and failure-time
+    ordering needed a `created_at` tiebreak to make bounded redrive
+    deterministic. Status: Sourced.
+
 ## Compatibility
 
 - [compatibility/m1-durable-send-schema-and-api-changes.compatibility.md](compatibility/m1-durable-send-schema-and-api-changes.compatibility.md)
@@ -106,6 +120,14 @@ service messaging, using Postgres as the durable execution ledger.
     `ResolvedConfig.retry`, `ReceivedTable.retry`, scheduled `next_attempt_at`,
     terminal `Failed` status, and configured error-history bounds. Status:
     Active.
+- [compatibility/typed-idempotency-identity-api.compat.md](compatibility/typed-idempotency-identity-api.compat.md)
+  - Compatibility note for typed SHA-256 idempotency identity,
+    `idempotency_source` JSON retention, digest Kafka headers, typed row fields,
+    and transactional invalid-send audit rows. Also records stored failure
+    records becoming RFC 9457 problem details with RFC 9557 timestamps, the new
+    `last_failed_at` / `last_failure_kind` columns that replace casting the audit
+    JSON, and the resulting changeset checksum changes. Verified against
+    Docker-backed PostgreSQL and Redpanda. Status: Active.
 
 ## Decisions
 
@@ -134,6 +156,24 @@ service messaging, using Postgres as the durable execution ledger.
   - M3 keeps the closure + `ReceivedMeta` handler surface and adds
     `enqueue_on_connection` for consume-then-produce atomicity; the larger Tower
     handler surface remains deferred. Status: Accepted.
+- [decisions/typed-idempotency-identity-and-error-row-symmetry.decision.md](decisions/typed-idempotency-identity-and-error-row-symmetry.decision.md)
+  - Idempotency is a typed SHA-256 digest plus retained caller-provided JSON
+    source, while send and receive share transactional error-row semantics:
+    record invalid/problem work, return an error, allow rollback, and have
+    workers claim only non-error rows. Bounds the rule to sends that are safe to
+    persist, so a reserved-header rejection deliberately leaves no audit row —
+    recording it would write the offending header into the ledger. Explains the
+    send/receive difference as transaction ownership rather than inconsistency,
+    and why rollback is recovered by redelivery rather than by the audit row.
+    Status: Accepted.
+
+- [decisions/entity-first-propagation-model.decision.md](decisions/entity-first-propagation-model.decision.md)
+  - Propagation is doctrine over the unchanged durable-execution mechanism.
+    Fixes three identity axes with a required `entity_version` (outbox sequence
+    by default, domain override), entity-only messages across an inbox plus a
+    guarded per-entity replica table, an outbox monotonicity constraint as
+    defense-in-depth, advisory origin intent, and soft-delete-first deletion.
+    Status: Accepted.
 
 - [decisions/messaging-scope-and-receive-model.decision.md](decisions/messaging-scope-and-receive-model.decision.md)
   - Durable-execution-first core; Kafka-only transport in v1; HTTP and synchronous
@@ -214,6 +254,32 @@ service messaging, using Postgres as the durable execution ledger.
   API gaps, suppressed stale-failure stats, ambiguous commit, identity conflicts,
   reserved status drift, received message-version drift, and timestamp
   test-oracle precision. Status: Proposed.
+- [proposals/06-typed-idempotency-identity-and-error-row-symmetry.proposal.md](proposals/06-typed-idempotency-identity-and-error-row-symmetry.proposal.md)
+  - Accepted proposal to replace raw string idempotency with a typed SHA-256
+    digest plus retained JSON source and to make send/receive invalid-work
+    recording symmetric and transactional. Status: Accepted.
+- [proposals/07-tombstone-and-deletion-semantics.proposal.md](proposals/07-tombstone-and-deletion-semantics.proposal.md)
+  - Revised 2026-08-12: the emission half is superseded by soft-delete-first in
+    proposal 09, because real tombstones are reclaimed after
+    `delete.retention.ms` and a long-offline replica can miss a delete. Residual
+    scope is per-message-type opt-in real-tombstone *ingestion*, still required
+    for foreign producers such as Debezium. Status: Proposed.
+- [proposals/08-listen-notify-scheduler-wakeup.proposal.md](proposals/08-listen-notify-scheduler-wakeup.proposal.md)
+  - Postgres LISTEN/NOTIFY as a best-effort accelerator for the relay and
+    dispatch schedulers, with the interval sweep retained as the correctness
+    path and as the bound on retry punctuality. Status: Proposed.
+- [proposals/09-entity-first-propagation.proposal.md](proposals/09-entity-first-propagation.proposal.md)
+  - Entity-first reference propagation as the headline use case: three identity
+    axes with a required `entity_version`, outbox-sequence default with domain
+    override, one message type across an inbox plus a guarded per-entity replica
+    table, advisory `#[non_exhaustive]` origin intent, soft-delete-first
+    deletion, and an outbox monotonicity constraint. Status: Accepted, promoted
+    to the entity-first propagation decision.
+- [proposals/10-replica-bootstrap-and-readiness.proposal.md](proposals/10-replica-bootstrap-and-readiness.proposal.md)
+  - Compacted-topic replay from offset 0 as the catch-up protocol, a bootstrap
+    consumer mode with per-instance groups reading all partitions, a
+    `replica_state` table, and a typestate readiness surface so hosts cannot
+    serve reads from a cold cache. Status: Proposed.
 
 ## Plans
 
@@ -243,6 +309,11 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
   table-backed terminal `Failed`/DLQ state, bounded error history, and
   redrive/admin surfaces. First slice landed retry scheduling and terminal
   failure tests. Status: Active.
+- [plans/typed-idempotency-identity-error-row-fix.plan.md](plans/typed-idempotency-identity-error-row-fix.plan.md)
+- Completed fix plan for typed idempotency identity, transactional send/receive
+  error-row symmetry, DLQ latest-failure-time semantics, and outbox replay
+  checksum cleanup before merging M3/M4. All five pre-merge review findings are
+  closed and every verification gate passes. Status: Completed.
 
 ## Checklists
 

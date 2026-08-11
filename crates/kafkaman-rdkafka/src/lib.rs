@@ -6,7 +6,8 @@ use std::{
 };
 
 use kafkaman_core::{
-    ClaimedOutboxRow, Envelope, KafkaMessage, PublishAck, ReceivedIngestFailureKind,
+    ClaimedOutboxRow, Envelope, IdempotencyIdentity, IdempotencyKey, KafkaMessage, PublishAck,
+    ReceivedIngestFailureKind,
 };
 use kafkaman_sqlx::{
     insert_received_ingest_failure, insert_received_with_outcome, ReceivedIngestFailure,
@@ -167,10 +168,12 @@ impl RdkafkaPublisher {
                 value: Some(correlation_id.as_str()),
             });
 
-        if let Some(idempotency_key) = row.row.idempotency_key.as_deref() {
+        let idempotency_key;
+        if let Some(key) = row.row.idempotency_key {
+            idempotency_key = key.to_string();
             headers = headers.insert(Header {
                 key: "kafkaman-idempotency-key",
-                value: Some(idempotency_key),
+                value: Some(idempotency_key.as_str()),
             });
         }
 
@@ -524,10 +527,14 @@ where
 
     let mut envelope = Envelope::new(payload);
     envelope.headers = user_headers(message.headers());
-    envelope.idempotency_key = Some(
-        header_value(message.headers(), "kafkaman-idempotency-key")?
-            .ok_or(Error::MissingIdempotencyKey)?,
-    );
+    let idempotency_key = header_value(message.headers(), "kafkaman-idempotency-key")?
+        .ok_or(Error::MissingIdempotencyKey)?;
+    let idempotency_key =
+        IdempotencyKey::from_hex(&idempotency_key).map_err(|err| Error::InvalidHeader {
+            name: "kafkaman-idempotency-key",
+            message: err.to_string(),
+        })?;
+    envelope.idempotency_key = Some(IdempotencyIdentity::from_key(idempotency_key));
     if let Some(message_id) = header_value(message.headers(), "kafkaman-message-id")? {
         envelope.message_id = parse_uuid_header("kafkaman-message-id", &message_id)?;
     }

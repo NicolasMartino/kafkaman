@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use kafkaman::sqlx::{enqueue, ResolvedConfig};
-use kafkaman::{Envelope, KafkaMessage};
+use kafkaman::{Envelope, IdempotencyIdentity, KafkaMessage};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -63,15 +63,27 @@ pub async fn ensure_business_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Namespace for order-created idempotency digests. Versioned so the derivation
+/// can change later without colliding with keys already stored.
+const ORDER_CREATED_IDEMPOTENCY_NAMESPACE: &str = "axum-outbox:order-created:v1";
+
 async fn create_order(
     State(state): State<AppState>,
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<Json<CreateOrderResponse>, String> {
     let order_id = request.order_id.unwrap_or_else(Uuid::new_v4);
+    // The order id is this work item's business identity, so a retried POST that
+    // carries the same order id derives the same key and is deduplicated rather
+    // than enqueued twice. The namespace scopes the digest to this message type,
+    // so an unrelated type deriving from the same uuid cannot collide with it.
+    let identity = IdempotencyIdentity::derive(ORDER_CREATED_IDEMPOTENCY_NAMESPACE, order_id)
+        .map_err(|err| format!("derive idempotency identity: {err}"))?;
     let event = Envelope::new(OrderCreated {
         order_id,
         description: request.description.clone(),
-    });
+    })
+    .try_with_idempotency_key(identity)
+    .map_err(|err| format!("attach idempotency identity: {err}"))?;
     let message_id = event.message_id;
 
     let mut tx = state

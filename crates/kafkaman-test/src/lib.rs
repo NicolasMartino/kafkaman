@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kafkaman_core::{
-    ClaimedOutboxRow, Envelope, KafkaMessage, OutboxRow, OutboxStatus, PublishAck, PublishedRecord,
-    ReceivedRow, RelayStats, SqlIdentifier,
+    ClaimedOutboxRow, Envelope, IntoIdempotencyIdentity, KafkaMessage, OutboxRow, OutboxStatus,
+    PublishAck, PublishedRecord, ReceivedRow, RelayStats, SqlIdentifier,
 };
 use kafkaman_sqlx::{
     enqueue, insert_received, migrate, outbox_row, received_row_by_idempotency_key,
@@ -43,8 +43,12 @@ pub enum Error {
     #[error("outbox row `{0}` was not found")]
     MissingRow(Uuid),
 
-    #[error("received row with idempotency key `{0}` was not found")]
-    MissingReceivedRow(String),
+    /// Reports the caller-supplied source alongside the derived digest. The
+    /// digest alone is unreadable, so a failed lookup would otherwise name a
+    /// 64-character hash instead of the key the test actually asked for.
+    // Field is not named `source`: thiserror would treat it as the error cause.
+    #[error("received row for idempotency source {key_source} (digest `{digest}`) was not found")]
+    MissingReceivedRow { key_source: String, digest: String },
 
     #[error("outbox row `{message_id}` expected status `{expected}` but found `{actual}`")]
     UnexpectedStatus {
@@ -306,16 +310,24 @@ impl Harness {
 
     pub async fn received_row_by_idempotency_key<P>(
         &self,
-        idempotency_key: &str,
+        idempotency_key: impl IntoIdempotencyIdentity,
     ) -> Result<ReceivedRow>
     where
         P: KafkaMessage,
     {
         let cfg = self.ensure_received_message::<P>().await?;
         let table = ReceivedTable::for_message::<P>(&cfg)?;
-        received_row_by_idempotency_key(&self.pool, &table, idempotency_key)
+        let identity = idempotency_key.into_idempotency_identity()?;
+        let key = identity.key;
+        received_row_by_idempotency_key(&self.pool, &table, key)
             .await?
-            .ok_or_else(|| Error::MissingReceivedRow(idempotency_key.to_owned()))
+            .ok_or_else(|| Error::MissingReceivedRow {
+                key_source: identity
+                    .source
+                    .as_ref()
+                    .map_or_else(|| "<none>".to_owned(), |source| source.value().to_string()),
+                digest: key.to_hex(),
+            })
     }
 
     async fn ensure_message<P>(&self) -> Result<ResolvedConfig>

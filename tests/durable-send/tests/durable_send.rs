@@ -2,10 +2,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kafkaman_core::{
-    ClaimedOutboxRow, Envelope, KafkaMessage, MarkOutcome, OutboxStatus, PublishAck, SqlIdentifier,
+    ClaimedOutboxRow, Envelope, IdempotencyIdentity, IdempotencyKey, KafkaMessage, MarkOutcome,
+    OutboxStatus, PublishAck, SqlIdentifier,
 };
 use kafkaman_sqlx::{
-    changelog, claim_batch, mark_publish_failed, mark_published, migrate, migrate_dry_run,
+    changelog, claim_batch, enqueue, mark_publish_failed, mark_published, migrate, migrate_dry_run,
     AddIdempotencyKey, Changeset, CreateOutboxTable, InitSchema, MigrationAction, MigrationContext,
     OutboxTable, Replay,
 };
@@ -19,6 +20,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+fn idem_key(value: &str) -> IdempotencyKey {
+    IdempotencyIdentity::derive_legacy_string(value)
+        .expect("test idempotency source is valid")
+        .key
+}
 
 #[derive(Clone, Debug, Serialize)]
 struct OrderCreated {
@@ -105,9 +112,12 @@ async fn worker_run_loop_relays_until_shutdown() -> TestResult {
 
     for index in 0..3 {
         harness
-            .enqueue(&Envelope::new(OrderCreated {
-                order_id: format!("order-run-{index}"),
-            }))
+            .enqueue(
+                &Envelope::new(OrderCreated {
+                    order_id: format!("order-run-{index}"),
+                })
+                .with_idempotency_key(format!("idem-order-run-{index}")),
+            )
             .await?;
     }
 
@@ -151,7 +161,11 @@ async fn durable_send_publishes_record_and_marks_row() -> TestResult {
 
     // The idempotency key the caller set must be persisted durably, not dropped.
     let stored = harness.outbox_row::<OrderCreated>(message_id).await?;
-    assert_eq!(stored.idempotency_key.as_deref(), Some("idem-order-1"));
+    assert_eq!(stored.idempotency_key, Some(idem_key("idem-order-1")));
+    assert_eq!(
+        stored.idempotency_source,
+        Some(serde_json::json!("idem-order-1"))
+    );
 
     let stats = harness.relay_once::<OrderCreated>().await?;
 
@@ -170,12 +184,168 @@ async fn durable_send_publishes_record_and_marks_row() -> TestResult {
 }
 
 #[tokio::test]
+async fn missing_idempotency_is_recorded_as_failed_outbox_row_when_committed() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+    let table = harness.outbox_table::<OrderCreated>().await?;
+    let cfg = harness.config();
+
+    sqlx::query("CREATE TABLE committed_orders (order_id TEXT PRIMARY KEY)")
+        .execute(harness.pool())
+        .await?;
+
+    let event = Envelope::new(OrderCreated {
+        order_id: "order-missing-idem-commit".to_owned(),
+    });
+    let message_id = event.message_id;
+
+    let mut tx = harness.pool().begin().await?;
+    // The caller's own write shares the transaction with the audit row. That is
+    // what makes the commit/rollback choice meaningful: kafkaman never decides
+    // the fate of business data it does not own.
+    sqlx::query("INSERT INTO committed_orders (order_id) VALUES ($1)")
+        .bind("order-missing-idem-commit")
+        .execute(&mut *tx)
+        .await?;
+    let error = enqueue(&mut tx, &cfg, &event)
+        .await
+        .expect_err("missing idempotency must return an error");
+    assert!(error.to_string().contains("idempotency"));
+    // Committing is the caller electing to keep the business row plus a durable
+    // record of why no event accompanies it.
+    tx.commit().await?;
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM committed_orders")
+            .fetch_one(harness.pool())
+            .await?,
+        1,
+        "committing must keep the caller's business row"
+    );
+
+    let row = harness.outbox_row::<OrderCreated>(message_id).await?;
+    assert_eq!(row.status, OutboxStatus::Failed);
+    assert_eq!(row.idempotency_key, None);
+    assert_eq!(row.idempotency_source, None);
+    assert!(row
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("missing idempotency")));
+
+    let stats = harness.relay_once::<OrderCreated>().await?;
+    assert_eq!(stats.claimed, 0);
+    let claimed = {
+        let mut tx = harness.pool().begin().await?;
+        let claimed = claim_batch(&mut tx, &table, "worker-a", Duration::from_secs(30), 10).await?;
+        tx.commit().await?;
+        claimed
+    };
+    assert!(claimed.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_idempotency_audit_row_rolls_back_with_caller_transaction() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+    let table = harness.outbox_table::<OrderCreated>().await?;
+    let cfg = harness.config();
+
+    sqlx::query("CREATE TABLE rolled_back_orders (order_id TEXT PRIMARY KEY)")
+        .execute(harness.pool())
+        .await?;
+
+    let event = Envelope::new(OrderCreated {
+        order_id: "order-missing-idem-rollback".to_owned(),
+    });
+    let message_id = event.message_id;
+
+    let mut tx = harness.pool().begin().await?;
+    sqlx::query("INSERT INTO rolled_back_orders (order_id) VALUES ($1)")
+        .bind("order-missing-idem-rollback")
+        .execute(&mut *tx)
+        .await?;
+    let error = enqueue(&mut tx, &cfg, &event)
+        .await
+        .expect_err("missing idempotency must return an error");
+    assert!(error.to_string().contains("idempotency"));
+    // Rolling back is the caller electing atomicity over forensics: no order may
+    // exist without its event. The audit row goes with it, and the work is
+    // recovered by retry rather than by the audit trail.
+    tx.rollback().await?;
+
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {} WHERE message_id = $1",
+        table.qualified_name()
+    ))
+    .bind(message_id)
+    .fetch_one(harness.pool())
+    .await?;
+    assert_eq!(count, 0);
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rolled_back_orders")
+            .fetch_one(harness.pool())
+            .await?,
+        0,
+        "rolling back must discard the caller's business row with the audit row"
+    );
+
+    Ok(())
+}
+
+/// Pins the current asymmetry in the error-row rule: a reserved-header rejection
+/// returns before the insert, so unlike a missing idempotency identity it leaves
+/// the caller nothing to commit. This records the behaviour rather than
+/// endorsing it — the two invalid-send paths arguably should agree.
+#[tokio::test]
+async fn reserved_header_rejection_leaves_no_audit_row_to_commit() -> TestResult {
+    let (_postgres, database_url) = start_postgres().await?;
+    let harness = Harness::connect(&database_url).await?;
+    let table = harness.outbox_table::<OrderCreated>().await?;
+    let cfg = harness.config();
+
+    let mut event = Envelope::new(OrderCreated {
+        order_id: "order-reserved-audit".to_owned(),
+    })
+    .with_idempotency_key("idem-order-reserved-audit");
+    event
+        .headers
+        .insert("kafkaman-message-id".to_owned(), "spoofed".to_owned());
+    let message_id = event.message_id;
+
+    let mut tx = harness.pool().begin().await?;
+    let error = enqueue(&mut tx, &cfg, &event)
+        .await
+        .expect_err("reserved header must return an error");
+    assert!(
+        error.to_string().contains("reserved"),
+        "unexpected error: {error}"
+    );
+    // Even electing to commit yields no record of the rejected send.
+    tx.commit().await?;
+
+    let count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {} WHERE message_id = $1",
+        table.qualified_name()
+    ))
+    .bind(message_id)
+    .fetch_one(harness.pool())
+    .await?;
+    assert_eq!(count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn publish_error_requeues_row_with_last_error() -> TestResult {
     let (_postgres, database_url) = start_postgres().await?;
     let harness = Harness::connect(&database_url).await?;
     let event = Envelope::new(OrderCreated {
         order_id: "order-error".to_owned(),
-    });
+    })
+    .with_idempotency_key("idem-order-error");
     let message_id = event.message_id;
     harness.enqueue(&event).await?;
 
@@ -207,7 +377,8 @@ async fn stale_claim_cannot_mark_row_published() -> TestResult {
     let harness = Harness::connect(&database_url).await?;
     let event = Envelope::new(OrderCreated {
         order_id: "order-stale".to_owned(),
-    });
+    })
+    .with_idempotency_key("idem-order-stale");
     let message_id = event.message_id;
     harness.enqueue(&event).await?;
 
@@ -238,7 +409,8 @@ async fn ack_before_mark_republishes_after_claim_lease_expiry() -> TestResult {
     let harness = Harness::connect(&database_url).await?;
     let event = Envelope::new(OrderCreated {
         order_id: "order-dup".to_owned(),
-    });
+    })
+    .with_idempotency_key("idem-order-dup");
     let message_id = event.message_id;
     harness.enqueue(&event).await?;
 
@@ -279,7 +451,8 @@ async fn mark_publish_failed_rejects_stale_claim() -> TestResult {
     let harness = Harness::connect(&database_url).await?;
     let event = Envelope::new(OrderCreated {
         order_id: "order-failed-stale".to_owned(),
-    });
+    })
+    .with_idempotency_key("idem-order-failed-stale");
     let message_id = event.message_id;
     harness.enqueue(&event).await?;
 
@@ -624,6 +797,7 @@ async fn replay_is_bounded_context_targeted_dry_runnable_and_republished() -> Te
             Envelope::new(OrderCreated {
                 order_id: order_id.to_owned(),
             })
+            .with_idempotency_key(format!("idem-{order_id}"))
         })
         .collect::<Vec<_>>();
     for event in &events {
@@ -771,7 +945,8 @@ async fn concurrent_registration_on_one_harness_is_safe() -> TestResult {
         handles.push(tokio::spawn(async move {
             let event = Envelope::new(InvoiceCreated {
                 invoice_id: format!("invoice-{index}"),
-            });
+            })
+            .with_idempotency_key(format!("idem-invoice-{index}"));
             harness.enqueue(&event).await?;
             harness.relay_once::<InvoiceCreated>().await?;
             Ok::<(), kafkaman_test::Error>(())

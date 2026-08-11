@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use kafkaman_core::{Envelope, KafkaMessage, ReceivedIngestFailureKind};
+use kafkaman_core::{Envelope, IdempotencyIdentity, KafkaMessage, ReceivedIngestFailureKind};
 use kafkaman_rdkafka::{Error as RdkafkaError, RdkafkaConsumer};
 use kafkaman_sqlx::{
     dispatch_once, enqueue_on_connection, received_ingest_failure_by_source, MessageRouter,
@@ -30,6 +30,25 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+fn idem_hex(value: &str) -> String {
+    IdempotencyIdentity::derive_legacy_string(value)
+        .expect("test idempotency source is valid")
+        .key
+        .to_string()
+}
+
+fn idempotency_headers(value: &str) -> OwnedHeaders {
+    with_idempotency_header(OwnedHeaders::new(), value)
+}
+
+fn with_idempotency_header(headers: OwnedHeaders, value: &str) -> OwnedHeaders {
+    let value = idem_hex(value);
+    headers.insert(Header {
+        key: "kafkaman-idempotency-key",
+        value: Some(value.as_str()),
+    })
+}
 
 // Fixed host port so Redpanda can advertise a broker address the host-side
 // client can actually dial. The full-loop test is single-instance, so a fixed
@@ -133,9 +152,10 @@ async fn full_loop_publishes_to_redpanda_and_consumer_reads_it_back() -> TestRes
         headers.get("kafkaman-message-id").map(String::as_str),
         Some(message_id.to_string().as_str())
     );
+    let idem_rp = idem_hex("idem-rp");
     assert_eq!(
         headers.get("kafkaman-idempotency-key").map(String::as_str),
-        Some("idem-rp")
+        Some(idem_rp.as_str())
     );
     assert_eq!(
         headers.get("x-user-header").map(String::as_str),
@@ -236,10 +256,7 @@ async fn full_loop_consume_then_produce_deduplicates_duplicate_input() -> TestRe
         OrderCreated::TOPIC,
         "phase4-key",
         "order-phase4",
-        OwnedHeaders::new().insert(Header {
-            key: "kafkaman-idempotency-key",
-            value: Some("idem-rp-phase4"),
-        }),
+        idempotency_headers("idem-rp-phase4"),
     )
     .await?;
 
@@ -283,7 +300,7 @@ async fn full_loop_consume_then_produce_deduplicates_duplicate_input() -> TestRe
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT count(*) FROM {outbox_name} WHERE idempotency_key = $1"
         ))
-        .bind("accepted-rp-phase4")
+        .bind(idem_hex("accepted-rp-phase4"))
         .fetch_one(harness.pool())
         .await?,
         1
@@ -316,10 +333,7 @@ async fn full_loop_consume_then_produce_deduplicates_duplicate_input() -> TestRe
         OrderCreated::TOPIC,
         "phase4-key-duplicate",
         "order-phase4-duplicate",
-        OwnedHeaders::new().insert(Header {
-            key: "kafkaman-idempotency-key",
-            value: Some("idem-rp-phase4"),
-        }),
+        idempotency_headers("idem-rp-phase4"),
     )
     .await?;
     let duplicate_ingest = tokio::time::timeout(
@@ -352,7 +366,7 @@ async fn full_loop_consume_then_produce_deduplicates_duplicate_input() -> TestRe
         sqlx::query_scalar::<_, i64>(&format!(
             "SELECT count(*) FROM {outbox_name} WHERE idempotency_key = $1"
         ))
-        .bind("accepted-rp-phase4")
+        .bind(idem_hex("accepted-rp-phase4"))
         .fetch_one(harness.pool())
         .await?,
         1
@@ -382,10 +396,7 @@ async fn ingest_deduplicates_redelivery_after_crash_before_offset_commit() -> Te
         OrderCreated::TOPIC,
         "crash-window-key",
         "order-crash-window",
-        OwnedHeaders::new().insert(Header {
-            key: "kafkaman-idempotency-key",
-            value: Some("idem-rp-crash-window"),
-        }),
+        idempotency_headers("idem-rp-crash-window"),
     )
     .await?;
 
@@ -468,10 +479,7 @@ async fn run_ingester_deduplicates_redelivery_after_offset_commit_uncertainty() 
         OrderCreated::TOPIC,
         "uncertain-commit-key",
         "order-uncertain-commit",
-        OwnedHeaders::new().insert(Header {
-            key: "kafkaman-idempotency-key",
-            value: Some("idem-rp-uncertain-commit"),
-        }),
+        idempotency_headers("idem-rp-uncertain-commit"),
     )
     .await?;
 
@@ -546,15 +554,10 @@ async fn ingest_skips_poison_record_then_deduplicates_redelivery() -> TestResult
         OrderCreated::TOPIC,
         "ingest-sequence",
         "poison-case-header",
-        OwnedHeaders::new()
-            .insert(Header {
-                key: "kafkaman-idempotency-key",
-                value: Some("idem-poison-case-header"),
-            })
-            .insert(Header {
-                key: "Kafkaman-Message-Id",
-                value: Some("not-a-uuid"),
-            }),
+        OwnedHeaders::new().insert(Header {
+            key: "kafkaman-idempotency-key",
+            value: Some(""),
+        }),
     )
     .await?;
 
@@ -565,15 +568,10 @@ async fn ingest_skips_poison_record_then_deduplicates_redelivery() -> TestResult
             OrderCreated::TOPIC,
             "ingest-sequence",
             "order-redpanda-redelivery",
-            OwnedHeaders::new()
-                .insert(Header {
-                    key: "kafkaman-idempotency-key",
-                    value: Some("idem-rp-redelivery"),
-                })
-                .insert(Header {
-                    key: "kafkaman-message-id",
-                    value: Some(message_id.as_str()),
-                }),
+            with_idempotency_header(OwnedHeaders::new(), "idem-rp-redelivery").insert(Header {
+                key: "kafkaman-message-id",
+                value: Some(message_id.as_str()),
+            }),
         )
         .await?;
     }
@@ -603,7 +601,7 @@ async fn ingest_skips_poison_record_then_deduplicates_redelivery() -> TestResult
     assert_eq!(failure.kind, ReceivedIngestFailureKind::InvalidHeader);
     assert_eq!(failure.expected_topic, OrderCreated::TOPIC);
     assert_eq!(failure.message_type, OrderCreated::MESSAGE_TYPE);
-    assert!(failure.error.contains("invalid Kafka header"));
+    assert!(failure.error.contains("kafkaman-idempotency-key"));
 
     let inserted = tokio::time::timeout(
         Duration::from_secs(30),
@@ -675,10 +673,7 @@ async fn ingest_circuit_breaker_stops_committing_repeated_schema_failures() -> T
             OrderCreated::TOPIC,
             &format!("schema-break-{idx}"),
             br#"{"order_id":42}"#,
-            OwnedHeaders::new().insert(Header {
-                key: "kafkaman-idempotency-key",
-                value: Some(idempotency_key.as_str()),
-            }),
+            idempotency_headers(&idempotency_key),
         )
         .await?;
     }
@@ -763,10 +758,7 @@ async fn run_ingester_processes_records_until_cancelled() -> TestResult {
         OrderCreated::TOPIC,
         "runner-key",
         "order-runner",
-        OwnedHeaders::new().insert(Header {
-            key: "kafkaman-idempotency-key",
-            value: Some("idem-rp-runner"),
-        }),
+        idempotency_headers("idem-rp-runner"),
     )
     .await?;
 
@@ -791,7 +783,7 @@ async fn run_ingester_processes_records_until_cancelled() -> TestResult {
                 .await
             {
                 Ok(row) => break Ok(row),
-                Err(HarnessError::MissingReceivedRow(_)) => {
+                Err(HarnessError::MissingReceivedRow { .. }) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(err) => break Err(err),
@@ -833,10 +825,7 @@ async fn run_ingester_stops_loudly_on_consecutive_schema_failures() -> TestResul
             OrderCreated::TOPIC,
             &format!("runner-schema-break-{idx}"),
             br#"{"order_id":42}"#,
-            OwnedHeaders::new().insert(Header {
-                key: "kafkaman-idempotency-key",
-                value: Some(idempotency_key.as_str()),
-            }),
+            idempotency_headers(&idempotency_key),
         )
         .await?;
     }
@@ -908,10 +897,7 @@ async fn ingest_skips_records_from_unexpected_source_topic() -> TestResult {
         "wrong-orders",
         "wrong-topic-key",
         "order-wrong-topic",
-        OwnedHeaders::new().insert(Header {
-            key: "kafkaman-idempotency-key",
-            value: Some("idem-wrong-topic"),
-        }),
+        idempotency_headers("idem-wrong-topic"),
     )
     .await?;
 
