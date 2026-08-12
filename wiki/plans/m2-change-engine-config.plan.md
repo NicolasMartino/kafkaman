@@ -90,7 +90,7 @@ Out of scope (later milestones, do not build):
   decision (point 10).
 - Layered config sources / `[profile]` sections / precedence merging — explicitly
   rejected by the config decision. M2 reads one already-rendered flat file.
-- `kafkaman-axum` admin routes, metrics, tracing layers — M5.
+- `kafkaman-axum` admin routes, metrics, tracing layers — M6.
 
 ## Crate Impact
 

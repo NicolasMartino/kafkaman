@@ -118,4 +118,4 @@ The tradeoff is a larger configuration surface. The config validator must fail f
 
 ## Promotion Target
 
-If accepted, promote this into an observability decision before or during M5, and update the V1 roadmap if observability policy needs earlier hooks in M2 or M3.
+If accepted, promote this into an observability decision before or during M6, and update the V1 roadmap if observability policy needs earlier hooks in M2 or M3.

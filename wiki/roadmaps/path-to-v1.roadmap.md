@@ -25,14 +25,23 @@
 The design surface is substantially decided: scope, schema/change-management,
 config/env, runtime/topology, send, consumption, and testing (x2) — seven
 foundation decisions plus accepted follow-up decisions for message identity,
-retry/DLQ, and roadmap execution. M1 code exists; later milestones remain
-unimplemented. Objectives open questions OQ1-OQ4 are resolved, and OQ5
-(host-context boundary) is ratified as opaque headers with a reserved
-`kafkaman-*` namespace.
+retry/DLQ, roadmap execution, and entity-first propagation. Objectives open
+questions OQ1-OQ4 are resolved, and OQ5 (host-context boundary) is ratified as
+opaque headers with a reserved `kafkaman-*` namespace.
 
-The previously open **retry / backoff / DLQ** taxonomy is now accepted as a
-separate decision. M4 implements that policy after M3 provides the receive
-seams; the decision itself no longer blocks planning.
+M1 through M4 are implemented, merged to `main` on 2026-08-13, and their
+behavior promoted to specs. All five pre-merge review findings are closed.
+
+The previously open **retry / backoff / DLQ** taxonomy is accepted as a separate
+decision and implemented in M4.
+
+**Updated 2026-08-13:** entity-first propagation is inserted as M5, ahead of
+observability. It was not in the original sequence because the propagation model
+was decided after this roadmap was written. It goes before observability because
+it adds per-type cache tables and a `Superseded` outbox status — building
+dashboards, metrics and DLQ views on the current table layout would mean
+rebuilding them a milestone later. Observability and hardening shift to M6 and
+M7.
 
 ## Milestones
 
@@ -97,7 +106,40 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
 - **Exit:** retryable failures back off and recover; terminal/poison land in the
   DLQ with history; the `Clock`-driven tests prove the timing without `sleep`.
 
-### M5 — Observability & operability
+### M5 — Entity-first propagation (the distributed cache)
+- **Status:** Active. Execution plan:
+  [entity-first-propagation.plan.md](../plans/entity-first-propagation.plan.md).
+- **Goal:** deliver the headline use case — services read another domain's
+  entities from a local store instead of calling that domain synchronously.
+- **Delivers:** the `EntityMessage` surface with defaulted universal
+  `entity_key`, declared retention class (`compact` / `delete`), advisory
+  `#[non_exhaustive]` origin intent, cache tables for `compact` types that
+  kafkaman owns and writes, boot-time topic validation, the offset-guarded
+  upsert, key-serialized per-entity `Superseded` supersede in the outbox,
+  state-sourced republish, topic-lifecycle invalidation with forced
+  re-bootstrap, and soft-delete-first deletion.
+- **Realizes:** entity-first-propagation-model, and the convergence half of
+  message-consumption-and-handler-model.
+- **Exit:** a cache converges to current state under every reordering kafkaman
+  itself produces — retry backoff, redrive, concurrent dispatch, redelivery,
+  bootstrap — with no operator intervention; outbound serialization is limited
+  to the affected `(message_type, entity_key)`.
+
+Deferred out of M5 and tracked separately: cache bootstrap and readiness
+typestate ([proposal 10](../proposals/10-cache-bootstrap-and-readiness.proposal.md)),
+and restore/retention/schema boundaries
+([proposal 11](../proposals/11-restore-retention-and-schema-boundaries.proposal.md)),
+whose schema split breaks M2's single-schema surface and needs its own
+compatibility note.
+
+**M5's shape is resolved by accepted
+[proposal 12](../proposals/12-entity-only-message-model.proposal.md).** Every
+type is an entity carrying a declared retention class. This changes the
+implementation shape — defaulted universal `entity_key`, retention-class
+declaration, and boot-time topic validation — without changing the milestone's
+position or its convergence exit criterion.
+
+### M6 — Observability & operability
 - **Goal:** make it operable.
 - **Delivers:** tracing spans + the `CorrelationLayer`, metrics, lag/age/stuck-job
   detection, DLQ inspection, the `kafkaman-axum` admin/health routes, the
@@ -106,7 +148,7 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
 - **Exit:** an operator can see queue depth/age, inspect/redrive the DLQ, and a
   stuck job is detectable.
 
-### M6 — V1 hardening
+### M7 — V1 hardening
 - **Goal:** ship-quality.
 - **Delivers:** the purge enforcer + retention runtime config, graceful-shutdown
   ordering, worker-role topology polish, the full `testcontainers` full-loop
@@ -117,7 +159,7 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
 
 ## Cross-Cutting Track: `kafkaman-test`
 
-Not a single milestone — **seeded in M1, matured in M3, completed in M6** (the
+Not a single milestone — **seeded in M1, matured in M3, completed in M7** (the
 `testcontainers` full-loop feature). Dogfooding-first makes the toolkit lead the
 code that uses it, so it threads every milestone rather than trailing at the end.
 
@@ -154,6 +196,6 @@ every later milestone does the same with the seam it adds.
 
 ## What Closes This Roadmap
 
-A tagged V1 that meets the M6 acceptance bar, at which point the settled envelope +
+A tagged V1 that meets the M7 acceptance bar, at which point the settled envelope +
 schemas + the `migrate()`/runtime/consume contracts are promoted to `*.spec.md`
 pages and this roadmap is archived.

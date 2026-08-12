@@ -8,7 +8,8 @@ use kafkaman_config::{Config, ConfigErrors, ConfigSchema, RetryConfig, RetryPoli
 use kafkaman_core::{
     ClaimedOutboxRow, Envelope, IdempotencyKey, KafkaMessage, MarkOutcome, MessageDescriptor,
     OutboxRow, OutboxStatus, ReceiveStatus, ReceivedError, ReceivedFailureKind,
-    ReceivedIngestFailureKind, ReceivedMeta, ReceivedRow, RelayConfig, SqlIdentifier,
+    ReceivedIngestFailureKind, ReceivedMeta, ReceivedRow, RelayConfig, RetentionClass,
+    SqlIdentifier,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -142,6 +143,9 @@ pub enum Error {
 
     #[error("received message must include an idempotency key")]
     MissingIdempotencyKey,
+
+    #[error("entity key for message type `{message_type}` is not valid UTF-8")]
+    InvalidEntityKey { message_type: String },
 
     #[error("no handler registered for message type `{0}`")]
     MissingHandler(String),
@@ -407,6 +411,32 @@ impl ReceivedTable {
 
     fn state_index_name(&self) -> SqlIdentifier {
         self.index_name("_state")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CacheTable {
+    pub schema: SqlIdentifier,
+    pub table: SqlIdentifier,
+    pub descriptor: MessageDescriptor,
+}
+
+impl CacheTable {
+    pub fn new(schema: SqlIdentifier, descriptor: MessageDescriptor) -> Result<Self> {
+        let table = SqlIdentifier::new(format!("cache_{}", descriptor.message_type.as_str()))?;
+        Ok(Self {
+            schema,
+            table,
+            descriptor,
+        })
+    }
+
+    pub fn for_message<P: KafkaMessage>(cfg: &ResolvedConfig) -> Result<Self> {
+        Self::new(cfg.schema.clone(), cfg.descriptor_for::<P>()?)
+    }
+
+    pub fn qualified_name(&self) -> String {
+        format!("{}.{}", self.schema.quoted(), self.table.quoted())
     }
 }
 
@@ -796,6 +826,51 @@ impl Changeset for CreateReceivedTable {
             self.name(),
             self.descriptor.message_type.as_str(),
             self.descriptor.topic
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateCacheTable {
+    pub version: i64,
+    pub descriptor: MessageDescriptor,
+}
+
+impl CreateCacheTable {
+    pub fn new(version: i64, descriptor: MessageDescriptor) -> Self {
+        Self {
+            version,
+            descriptor,
+        }
+    }
+}
+
+impl Changeset for CreateCacheTable {
+    fn version(&self) -> i64 {
+        self.version
+    }
+
+    fn name(&self) -> &str {
+        "create_cache_table"
+    }
+
+    fn build(&self, cfg: &ResolvedConfig, builder: &mut ChangeBuilder) -> Result<()> {
+        if self.descriptor.retention_class != RetentionClass::Compact {
+            return Ok(());
+        }
+        let table = CacheTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+        builder.push(create_cache_table_sql(&table));
+        Ok(())
+    }
+
+    fn checksum_material(&self) -> String {
+        format!(
+            "version={};name={};message_type={};topic={};retention_class={}",
+            self.version(),
+            self.name(),
+            self.descriptor.message_type.as_str(),
+            self.descriptor.topic,
+            self.descriptor.retention_class.as_str()
         )
     }
 }
@@ -1713,6 +1788,21 @@ pub fn create_received_table_sql(table: &ReceivedTable) -> String {
     )
 }
 
+pub fn create_cache_table_sql(table: &CacheTable) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {name} (
+            entity_key TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            applied_topic TEXT NOT NULL,
+            applied_partition INTEGER NOT NULL,
+            applied_offset BIGINT NOT NULL,
+            deleted BOOLEAN NOT NULL DEFAULT false,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )",
+        name = table.qualified_name(),
+    )
+}
+
 /// The `last_failure_kind` CHECK list, generated from [`ReceivedFailureKind`] so
 /// the database and the Rust enum cannot drift. `NULL` satisfies the CHECK, so
 /// rows that have never failed are unconstrained.
@@ -2098,7 +2188,7 @@ async fn dispatch_once_inner(
     let meta = ReceivedMeta::from(&row);
     let handler_result = handler.handle(&mut tx, meta, row.payload.clone()).await;
     match handler_result {
-        Ok(()) => match mark_received_processed(&mut tx, table, row.message_id, due_at).await {
+        Ok(()) => match apply_successful_dispatch(&mut tx, table, &row, due_at).await {
             Ok(MarkOutcome::Updated) => {
                 tx.commit().await?;
                 Ok(DispatchStats {
@@ -2161,6 +2251,69 @@ async fn dispatch_once_inner(
             Ok(dispatch_failure_stats(outcome))
         }
     }
+}
+
+async fn apply_successful_dispatch(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &ReceivedTable,
+    row: &ReceivedRow,
+    processed_at: OffsetDateTime,
+) -> Result<MarkOutcome> {
+    upsert_cache_from_received(tx, table, row).await?;
+    mark_received_processed(tx, table, row.message_id, processed_at).await
+}
+
+async fn upsert_cache_from_received(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &ReceivedTable,
+    row: &ReceivedRow,
+) -> Result<()> {
+    if table.descriptor.retention_class != RetentionClass::Compact {
+        return Ok(());
+    }
+
+    let cache = CacheTable::new(table.schema.clone(), table.descriptor.clone())?;
+    let entity_key = received_entity_key(row)?;
+    let sql = format!(
+        "INSERT INTO {name} (
+            entity_key, payload, applied_topic, applied_partition, applied_offset, deleted,
+            updated_at
+        ) VALUES ($1, $2, $3, $4, $5, false, now())
+        ON CONFLICT (entity_key) DO UPDATE
+        SET payload = EXCLUDED.payload,
+            applied_topic = EXCLUDED.applied_topic,
+            applied_partition = EXCLUDED.applied_partition,
+            applied_offset = EXCLUDED.applied_offset,
+            updated_at = now()
+        WHERE {name}.applied_topic = EXCLUDED.applied_topic
+          AND {name}.applied_partition = EXCLUDED.applied_partition
+          AND EXCLUDED.applied_offset > {name}.applied_offset",
+        name = cache.qualified_name()
+    );
+
+    sqlx::query(&sql)
+        .bind(entity_key)
+        .bind(row.payload.clone())
+        .bind(row.source_topic.as_str())
+        .bind(row.source_partition)
+        .bind(row.source_offset)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn received_entity_key(row: &ReceivedRow) -> Result<String> {
+    if let Some(entity_key) = row.headers.get("kafkaman-entity-key") {
+        return Ok(entity_key.clone());
+    }
+
+    if let Some(key) = &row.key {
+        return String::from_utf8(key.clone()).map_err(|_| Error::InvalidEntityKey {
+            message_type: row.message_type.clone(),
+        });
+    }
+
+    Ok(row.message_id.to_string())
 }
 
 async fn create_dispatch_handler_savepoint(tx: &mut Transaction<'_, Postgres>) -> Result<()> {

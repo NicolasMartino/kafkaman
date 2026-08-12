@@ -129,6 +129,7 @@ const RESERVED_WORDS: &[&str] = &[
 pub struct MessageDescriptor {
     pub message_type: SqlIdentifier,
     pub topic: String,
+    pub retention_class: RetentionClass,
 }
 
 impl MessageDescriptor {
@@ -143,7 +144,33 @@ impl MessageDescriptor {
         Ok(Self {
             message_type: SqlIdentifier::new(message_type)?,
             topic,
+            retention_class: RetentionClass::Delete,
         })
+    }
+
+    pub fn with_retention_class(mut self, retention_class: RetentionClass) -> Self {
+        self.retention_class = retention_class;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RetentionClass {
+    Compact,
+    #[default]
+    Delete,
+}
+
+impl RetentionClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Delete => "delete",
+        }
+    }
+
+    pub const fn is_compact(self) -> bool {
+        matches!(self, Self::Compact)
     }
 }
 
@@ -174,8 +201,17 @@ pub trait KafkaMessage: Serialize {
         None
     }
 
+    fn entity_key(&self, message_id: Uuid) -> String {
+        message_id.to_string()
+    }
+
+    fn retention_class() -> RetentionClass {
+        RetentionClass::Delete
+    }
+
     fn descriptor() -> Result<MessageDescriptor> {
-        MessageDescriptor::new(Self::MESSAGE_TYPE, Self::TOPIC)
+        Ok(MessageDescriptor::new(Self::MESSAGE_TYPE, Self::TOPIC)?
+            .with_retention_class(Self::retention_class()))
     }
 }
 

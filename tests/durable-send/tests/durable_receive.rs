@@ -1287,21 +1287,22 @@ async fn handler_enqueue_failure_is_rolled_back_and_the_message_redelivered() ->
     // And it is delivered again. A handler that supplies an identity completes
     // the same message on its next attempt, past the retry backoff.
     let cfg = harness.config();
-    let recovering_router = MessageRouter::new().handler::<OrderCreated>(move |conn, _meta, msg| {
-        let cfg = cfg.clone();
-        Box::pin(async move {
-            sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
-                .bind(msg.order_id.as_str())
-                .execute(&mut *conn)
-                .await?;
-            let accepted = Envelope::new(OrderAccepted {
-                order_id: msg.order_id,
+    let recovering_router =
+        MessageRouter::new().handler::<OrderCreated>(move |conn, _meta, msg| {
+            let cfg = cfg.clone();
+            Box::pin(async move {
+                sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
+                    .bind(msg.order_id.as_str())
+                    .execute(&mut *conn)
+                    .await?;
+                let accepted = Envelope::new(OrderAccepted {
+                    order_id: msg.order_id,
+                })
+                .with_idempotency_key("accepted-order-redelivered");
+                enqueue_on_connection(conn, &cfg, &accepted).await?;
+                Ok(())
             })
-            .with_idempotency_key("accepted-order-redelivered");
-            enqueue_on_connection(conn, &cfg, &accepted).await?;
-            Ok(())
-        })
-    });
+        });
 
     let second = dispatch_once(
         harness.pool(),

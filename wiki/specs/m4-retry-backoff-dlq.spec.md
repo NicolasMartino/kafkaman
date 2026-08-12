@@ -108,4 +108,4 @@ together retry in lockstep against a recovering downstream. Jitter is later work
 
 Kafka DLQ topics, retention/purge of terminal rows, richer admin/redrive APIs,
 and operator dashboards are out of scope for M4. Send-side retry policy is not
-unified with receive retry. These remain later milestones (M5+).
+unified with receive retry. These remain later milestones (M6+).

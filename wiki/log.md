@@ -1,5 +1,419 @@
 # Wiki Log
 
+## [2026-08-13] implementation | M5 concurrent cache convergence gate
+
+Added `concurrent_dispatch_of_two_states_converges_to_newer` to the entity-first
+propagation integration tests. The gate starts one dispatcher on an older entity
+row and holds its transaction open, then lets a second dispatcher claim the
+newer row through `FOR UPDATE SKIP LOCKED`. The newer row updates the compact
+cache first; when the older row finishes last, the offset guard prevents cache
+regression.
+
+Verification:
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test entity_first_propagation -- --test-threads=1`
+- `rtk cargo test --workspace --all-features`
+
+Pages affected:
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/index.md
+- wiki/log.md
+
+Code affected:
+- tests/durable-send/tests/entity_first_propagation.rs
+
+## [2026-08-13] implementation | M5 cache-upsert first slice
+
+Started M5 on branch `implementation/m5-entity-first-propagation`. Added the
+defaulted entity/retention public surface: `RetentionClass`,
+`KafkaMessage::entity_key`, `KafkaMessage::retention_class`, and
+`MessageDescriptor.retention_class`. Existing message implementations remain
+source-compatible through default methods and constructor defaults, but direct
+`MessageDescriptor` struct literals must provide the new field.
+
+Added `CacheTable`, `CreateCacheTable`, and compact-type cache table DDL. Receive
+dispatch now applies a guarded cache upsert for `Compact` message types before
+marking the row `Processed`; older retry/redrive rows still process but do not
+regress cache state. The harness creates cache tables for compact received types.
+
+Implemented and verified the first two M5 convergence gates:
+`retry_after_newer_applied_does_not_regress_cache` and
+`redrive_after_newer_applied_does_not_regress_cache`.
+
+Verification:
+- `rtk cargo check --workspace --all-features`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test entity_first_propagation -- --test-threads=1`
+- `rtk cargo test --workspace --all-features`
+
+Pages affected:
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/compatibility/m5-entity-first-cache-api.compat.md
+- wiki/index.md
+- wiki/log.md
+
+Code affected:
+- crates/kafkaman-core/src/lib.rs
+- crates/kafkaman-sqlx/src/lib.rs
+- crates/kafkaman-test/src/lib.rs
+- tests/durable-send/tests/entity_first_propagation.rs
+
+## [2026-08-13] update | M3/M4 merged and proposal 12 accepted for M5
+
+Merged `implementation/m3-durable-receive` into `main` as the prerequisite for
+M5, then resolved the pre-M5 proposal 12 decision. Proposal 12 is now Accepted:
+every type is an entity, `entity_key` is universal but defaults to `message_id`,
+and each type declares a retention class (`compact` / `delete`). `compact`
+drives compacted topic configuration, cache-table generation, bootstrap
+eligibility, and a meaningful convergence guard; `delete` keeps existing M1-M4
+work-item behavior with no cache table and no bootstrap offer.
+
+The entity-first decision is amended accordingly: the implicit entity/non-entity
+split is replaced by a declared retention class, without removing the durable
+execution surface or reversing the messaging-scope decision. The roadmap now
+marks M5 Active and no longer treats its shape as contested. The M5 plan now
+includes retention-class declaration, `delete` defaults for compatibility,
+`compact`-only cache generation, and boot-time topic validation when broker
+metadata is available.
+
+Pages affected:
+- wiki/proposals/12-entity-only-message-model.proposal.md
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/proposals/09-entity-first-propagation.proposal.md
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] update | outbound entity enqueue serialization tightened
+
+Replaced the previous "lock latest outbox row" multi-writer mechanism with
+key-level serialization on `(message_type, entity_key)`.
+
+The latest-row lock is insufficient because first concurrent writes may have no
+row to lock, and a writer that waited behind another writer can decide from
+stale latest state unless it re-reads under the same key-level lock. The
+accepted design now requires a transaction-scoped PostgreSQL advisory lock or a
+dedicated entity enqueue lock/control row, followed by a re-read of latest
+outbox state and the supersede-or-insert decision in the same transaction.
+
+This serializes horizontally scaled instances sharing one database. It does not
+coordinate two services or two databases writing the same entity type, which
+remains forbidden by entity ownership. The M5 plan now carries explicit gates for
+the no-existing-row race and the waiting-writer re-read race, and the roadmap's
+M5 exit now states that outbound serialization is limited to the affected entity
+key rather than absent. Proposal 12 also notes that direct-mode `compact` types
+cannot rely on the outbox lock and must be rejected unless they provide
+equivalent key-level outbound serialization.
+
+Pages affected:
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/proposals/09-entity-first-propagation.proposal.md
+- wiki/proposals/12-entity-only-message-model.proposal.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] update | entity-only reselected as declared retention class
+
+External review of proposal 12, plus a counter-review, converged on changing the
+selected option. Four claims were checked against the files; two held.
+
+**The real defect was an incomplete option set.** Proposal 12 listed three
+options, all of which kept work items served by kafkaman, so "entity-only" was
+selected against a field containing no strict reading of it. Added option 4
+(entity-only by exclusion) and option 5 (uniform entity model with a declared
+retention class), and reselected 5.
+
+**The decisive argument against the original selection.** Entity types and
+work-item types need different topic retention under *every* option — that split
+already exists under entity-first, where proposal 11 states "entity topics use
+compaction alone." The earlier claim that entity-only *relocated* the duality
+into broker configuration overstated it. What entity-only-by-redefinition
+actually does is delete the type-level declaration that proposal 11's proposed
+boot-time topic validation needs as its input, leaving the same two
+configurations with misconfiguration made undetectable and both failure modes
+silent. That is strictly worse than entity-first on this axis and better on none.
+
+**Hard exclusion is recorded and costed, not selected.** It argues against the
+evidence the messaging-scope decision rests on — RepForge dropped the command
+transport and kept `mutation_jobs` — exports the branching into the adopter's
+architecture, and strands most of M4, which is work-item machinery.
+
+**The selected option is non-breaking**, by defaulting `entity_key` to
+`message_id` and the retention class to `delete`. Existing M1-M4 types compile
+and behave unchanged. This closed the migration-story and required-`entity_key`
+open questions, and means the proposal promotes as an amendment rather than a
+revision: nothing is removed, so the entity-first decision's point 1 still holds.
+
+**Two conflicts surfaced in proposal 11.** Its `kafkaman_cache` "rebuild —
+replay is authoritative" directive is compaction-conditional, not universal; and
+the resync sweep it describes under business-data restore is what the
+self-healing collapse depends on entirely, so its scope must cover non-terminal
+work items.
+
+Two review findings were declined as framework noise: a Proposed page has not
+superseded an Accepted one, and Accepted pages must not be rewritten to match an
+unaccepted proposal. The legitimate residue was backlinking, now added — proposal
+09's open question 3, proposal 11's per-type restore bullet, the entity-first
+decision's Revisit When, and the roadmap's M5 section all point forward to
+proposal 12 as contested, with no Accepted content rewritten.
+
+**Second review pass, same day — two corrections, both accepted.** The revision
+above reintroduced the very failure it removed: a summary bullet claiming "one
+table shape, one guard, one upsert" contradicted the proposal's own
+retention-class table, which generates a cache table for `compact` types and none
+for `delete` types. The "What collapses" section is now an explicit accounting —
+three of six forks removed, one conditionally — and records that two survivors
+(cache-table generation, bootstrap eligibility) are structural rather than
+policy, so "the remainder is only configuration" is not available as a defense.
+
+The second correction qualifies the restore claim. The resync sweep is generic
+only for entity types, where kafkaman owns the cache table and can enumerate it;
+for work-item types "non-terminal" is a predicate over the application's own
+status machine, so the sweep becomes a per-type adopter hook. The unification is
+therefore **policy-level, not mechanism-level** — the same exported-complexity
+cost charged against option 4, at much smaller scale. Named in both proposals for
+consistency; it does not change the selection.
+
+Pages affected:
+- wiki/proposals/12-entity-only-message-model.proposal.md
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
+- wiki/proposals/09-entity-first-propagation.proposal.md
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] ingest | multi-writer and erasure resolved; entity-only proposed
+
+Three outcomes from the design review of the summary-of-decisions.
+
+**Multi-writer is resolved and moves into the decision.** Enqueue takes a row
+lock on the entity's most recent outbox row before checking send status, so a
+concurrent writer blocks through the supersede-or-insert commit. This serializes
+every instance of the owning service — the case that actually occurs, since
+horizontal scaling shares one database. The previous entry claiming this had "no
+proposed answer" was wrong: it conflated intra-database scaling with
+cross-database writers. The latter remains unsafe and is now forbidden by entity
+ownership rather than left open, and proposal 09's open question 6 is closed.
+
+**GDPR erasure is resolved** without a topic rebuild and without real tombstones:
+publish the entity with every field but the ID stripped and a deleted status, so
+compaction reclaims the earlier PII-bearing records and every cache converges to
+the redacted version. Two conditions recorded — the ID must be an opaque
+surrogate, since it survives forever by design, and compaction timing becomes a
+compliance parameter in direct tension with proposal 11's own suggestion to raise
+`min.compaction.lag.ms` to retain recent history. Storage growth from unreclaimed
+keys remains unresolved.
+
+**Filed proposal 12, entity-only.** Every message type becomes an entity; work
+items are entities with a key unique per item, where the convergence guard is a
+harmless no-op, compaction collapses nothing meaningful, and execute-once stays
+`idempotency_key`'s job. This removes per-type branching from restore policy,
+audit, self-healing, and opt-out config.
+
+Recorded against it rather than glossed: it reverses the messaging-scope
+decision's refutation of propagation-only scope, it breaks the general
+send/receive surface shipped in M1-M4, and — the finding that emerged while
+drafting — it **relocates the duality rather than eliminating it**. Compaction
+retains one record per key forever, entity key cardinality is bounded but work
+item cardinality is not, so work-item topics need `cleanup.policy=delete`, which
+is exactly what proposal 11's retention invariant forbids for entity topics. Two
+broker configurations, chosen per type, each with a silent failure mode if
+misapplied.
+
+Also fixed index ordering: proposal 11's entry preceded proposal 10's.
+
+Pages affected:
+- wiki/proposals/12-entity-only-message-model.proposal.md (new)
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/proposals/09-entity-first-propagation.proposal.md
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] update | entity-first slotted as M5; milestones renumbered
+
+Gave entity-first propagation a milestone slot. It had an Accepted decision, a
+revised proposal and an execution plan but no place in the delivery sequence,
+because the propagation model was decided after the roadmap was written.
+
+Inserted as **M5, ahead of observability**, on the argument that it adds per-type
+cache tables and a `Superseded` outbox status — building dashboards, metrics and
+DLQ views on the current table layout would mean rebuilding them one milestone
+later. Observability moved to M6 and V1 hardening to M7.
+
+Renumbering rather than an out-of-order insert, because four pages outside the
+roadmap referenced "M5" meaning observability and would otherwise have drifted:
+the M2 plan's deferred admin routes, the M4 spec's "later milestones", the
+roadmap-execution-policy decision's ratification note, and proposal 04's
+promotion target. All four updated.
+
+Also refreshed the roadmap's stale "Where We Are", which still claimed only M1
+code existed, and recorded that the M1-M4 work sits unmerged on
+`implementation/m3-durable-receive` with all five pre-merge findings closed —
+making the merge the stated prerequisite for M5.
+
+Cache bootstrap/readiness (proposal 10) and restore/retention/schema boundaries
+(proposal 11) are explicitly deferred out of M5 and noted as separately tracked,
+since proposal 11's schema split breaks M2's single-schema surface.
+
+Pages affected:
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/plans/m2-change-engine-config.plan.md
+- wiki/specs/m4-retry-backoff-dlq.spec.md
+- wiki/decisions/v1-roadmap-execution-policy.decision.md
+- wiki/proposals/04-observability-logging-policy.proposal.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] update | replica renamed to cache
+
+Renamed the entity-store concept from "replica" to "cache" across the wiki, on
+the user's call. Two reasons: the project already calls itself "a distributed
+cache library rather than a message library to build a cache on", and "replica"
+collides badly with Postgres replication in a codebase whose restore policy,
+PITR behavior, and physical replication are all under active discussion —
+"restore the replica" was becoming ambiguous.
+
+Schema named `kafkaman_cache` rather than `kafkaman_distributed_cache`: from any
+single service the schema holds that service's local shard, so distribution is a
+system property rather than a schema property.
+
+Renamed `wiki/proposals/10-replica-bootstrap-and-readiness.proposal.md` to
+`10-cache-bootstrap-and-readiness.proposal.md` via `git mv`, and updated the five
+pages linking to it. `ReplicaTable` became `CacheTable`, `replica_state` became
+`cache_state`, and proposal 10's typestate is now `Cache<Bootstrapping>` →
+`Cache<Ready>`.
+
+Deliberately **not** renamed: "replica" in the deployment sense — worker
+replicas, concurrent replicas in a rolling deploy, application/replica boots —
+which appears in the M1 spec and review, the library-test-strategy and
+schema-and-change-management decisions, proposal 01, and proposal 08. Verb forms
+(replicating, replicated, replication) were preserved everywhere. `raw/` was left
+untouched per the immutable-provenance rule, and prior log entries were left
+as-written per append-only.
+
+Corrected an assertion made during the discussion: it is not true that the cache
+has no origin to fall back to. The compacted topic *is* the origin — that is what
+makes bootstrap-from-zero work at all. What it lacks is a per-key fallback, since
+Kafka has no key-based random read, so refill is necessarily bulk replay. That
+asymmetry is now recorded in proposal 10 as the reason readiness must be a
+typestate rather than lazy-loading.
+
+Also repaired stale content in proposal 10 exposed by the rename: its drift-repair
+option still described the outbox-sequence versioning caveat and claimed republish
+"is only safe for types using a domain version". Both are obsolete; it now carries
+the state-sourced republish rule.
+
+Pages affected:
+- wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md (renamed from 10-replica-*)
+- wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md
+- wiki/proposals/09-entity-first-propagation.proposal.md
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] create | restore, retention, and schema boundaries proposal
+
+Promoted the material the same-day ordinal ingest deliberately left in `raw/`
+into proposal 11, on the user's call to file it separately rather than fold it
+into the entity-first pages.
+
+Records which of the 2026-08-12 discussion's invariants survived the offset
+ordinal and which died with it: the immutable-version-source and
+producer-state-restore invariants are gone, and the never-restore-the-outbox rule
+survives with its rationale *replaced* — republished rows now win on offset
+rather than colliding with a rewound sequence.
+
+Departures from the source discussion, each argued in the proposal rather than
+asserted: the schema cut is three-way by reconstructibility (drop / protect /
+rebuild) rather than inbound/outbound, because the inbound/outbound cut groups
+the irreplaceable received table with the fully rebuildable replica table; the
+split is justified as backup-set composition and grants rather than independent
+restore policy, because PITR and physical replication are cluster-wide; and
+`enqueue_on_connection` commits received-row updates and outbox inserts in one
+transaction, so restoring the two schemas to different points would tear
+committed transactions apart.
+
+Also carried forward the boundary that soft-delete-first makes GDPR erasure a
+topic-rebuild operation, and left proposal 08's polling-cost question explicitly
+unanswered and assigned.
+
+Pages affected:
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md (new)
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-13] ingest | offset as convergence ordinal
+
+Ingested two design sources: the 2026-08-12 restore-policy/schema-separation
+discussion and the 2026-08-13 conversation that reviewed it. The review of the
+first source dismantled and rebuilt the entity-first version model, so the second
+source supersedes parts of the first.
+
+The change: **there is no producer-side entity version.** The convergence ordinal
+is the Kafka offset, already persisted as `source_topic` / `source_partition` /
+`source_offset` on every received row in shipped M3 code. It is trustworthy only
+because of a new send-side rule — per-entity supersede of pending outbox rows —
+which makes log order equal truth order and thereby answers proposal 09's
+original reason for rejecting offsets.
+
+Removed from the accepted design: the per-entity high-water table, the outbox
+monotonicity constraint, the `kafkaman-entity-version` reserved header, the
+per-type version-source declaration and its boot-time fail-fast, and the
+domain-version override. Added: state-sourced republish (re-emitting a stored
+outbox row is unsafe because it receives a new higher offset, which constrains
+M2's `Replay::outbox` for entity types), and topic-lifecycle invalidation with
+detection that must not key off observing offset 0.
+
+Contradictions resolved with the user rather than silently overwritten: seven
+claims in the Accepted entity-first decision, plus the newly surfaced send-side
+replay hazard, which inverted an earlier claim made during the conversation that
+replay is harmless under a version guard — true for a producer-stamped version,
+false for an offset.
+
+**Deliberately not promoted this pass** (user scoped it to the ordinal change):
+the restore-policy and schema-separation material from the 2026-08-12 source —
+inbound-ledger protection, layered idempotency, and the inbound/outbound schema
+split. It remains staged in `raw/design/` as provenance and is referenced from
+the new plan's Out of Scope, but has no proposal or decision page. Note that
+offset-as-ordinal dissolved that source's invariant 4 and the version-rewind
+rationale behind invariants 5 and 6; invariant 5 survives for a different reason
+(republished rows win on offset), which is now recorded as state-sourced
+republish.
+
+Also corrected stale index bookkeeping: the M4 plan was listed Active while the
+page itself reads Completed, and the stage line still said "M3/M4 pre-merge fixes
+active". The M3 durable-receive plan is still marked Active while the roadmap
+records M3 as Completed — left alone pending a lint pass rather than changed
+here.
+
+Two cross-page contradictions were also resolved. Proposal 07 required a foreign
+tombstone's version to come from the `kafkaman-entity-version` header; its open
+question 2 is now answered, because a Debezium tombstone has a Kafka offset by
+virtue of arriving on the topic, so it orders against kafkaman-produced records
+with no header and no per-type rule. Proposal 10 referenced proposal 09's
+version-source check as a contrast case for compile-time enforcement; that check
+no longer exists, and proposal 10 instead gains a second caller — forced
+re-bootstrap on topic-lifecycle invalidation is the `Ready` → `Bootstrapping`
+transition it already defines.
+
+Pages affected:
+- raw/design/2026-08-12-restore-policy-and-schema-separation-discussion.md (new)
+- raw/design/2026-08-13-offset-as-convergence-ordinal-discussion.md (new)
+- wiki/proposals/09-entity-first-propagation.proposal.md
+- wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md
+- wiki/proposals/10-replica-bootstrap-and-readiness.proposal.md
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/plans/entity-first-propagation.plan.md (new)
+- wiki/index.md
+- wiki/log.md
+
 ## [2026-08-12] ingest | error-row rule scope and ownership recorded
 
 Promoted the reserved-header question from an open asymmetry to a decided

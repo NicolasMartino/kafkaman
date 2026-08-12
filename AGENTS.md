@@ -9,9 +9,22 @@ Humans curate `raw/` and make judgment calls. You handle the bookkeeping.
 
 ## How To Orient
 
+When the host exposes the LLM Wiki MCP server, it is your primary surface for
+wiki operations — prefer it over shell-family file reads and search:
+
+- Read `wiki/` and `raw/` pages with the `llm_wiki_read` MCP tool (not `cat`,
+  `sed`, or a shell read on those paths).
+- Find pages with the `llm_wiki_search` MCP tool, and `llm_wiki_search_all` for
+  cross-project search, instead of grepping the filesystem.
+
+(On a developer test instance these tools carry a `_test` suffix, e.g.
+`llm_wiki_search_test`.) If the MCP server is not configured, fall back to the
+index-and-read steps below.
+
 1. Read `project_guidelines.md` for the documentation model and rules.
 2. Read `wiki/index.md` for the catalog of all project knowledge.
-3. Read specific wiki pages identified from the index.
+3. Read specific wiki pages identified from the index (via `llm_wiki_read` when
+   the MCP server is available).
 4. Read `raw/` sources only when wiki content is insufficient.
 
 Never browse the filesystem to find information. `wiki/index.md` is your
@@ -34,8 +47,11 @@ When new material appears in `raw/`:
 
 When answering questions:
 
-1. Read `wiki/index.md` to find relevant pages.
-2. Read those pages.
+1. Search with the `llm_wiki_search` MCP tool first — it ranks across the whole
+   project. Read `wiki/index.md` for orientation when the MCP server is
+   unavailable.
+2. Read the matching pages with `llm_wiki_read` (or directly when no MCP server
+   is configured).
 3. Synthesize an answer with citations.
 4. If the answer is durable new knowledge, file it as a wiki page.
 
@@ -80,3 +96,4 @@ Periodically or on request:
 - Keep automated tests under `tests/`.
 - Keep project utilities and automation under `scripts/`.
 - Keep infrastructure definitions under `infra/`.
+

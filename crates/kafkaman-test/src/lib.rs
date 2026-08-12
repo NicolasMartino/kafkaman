@@ -7,8 +7,8 @@ use kafkaman_core::{
 };
 use kafkaman_sqlx::{
     enqueue, insert_received, migrate, outbox_row, received_row_by_idempotency_key,
-    CreateOutboxTable, CreateReceivedTable, InitSchema, MigrationContext, MigrationReport,
-    OutboxTable, ReceivedTable, ResolvedConfig,
+    CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema, MigrationContext,
+    MigrationReport, OutboxTable, ReceivedTable, ResolvedConfig,
 };
 use kafkaman_worker::{BoxError, Publisher};
 use serde::Serialize;
@@ -409,8 +409,14 @@ fn received_changesets_for(cfg: &ResolvedConfig) -> Vec<Box<dyn kafkaman_sqlx::C
     for (idx, descriptor) in cfg.messages().iter().cloned().enumerate() {
         changesets.push(Box::new(CreateReceivedTable::new(
             10_000 + idx as i64,
-            descriptor,
+            descriptor.clone(),
         )));
+        if descriptor.retention_class.is_compact() {
+            changesets.push(Box::new(CreateCacheTable::new(
+                20_000 + idx as i64,
+                descriptor,
+            )));
+        }
     }
     changesets
 }

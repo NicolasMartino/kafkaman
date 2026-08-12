@@ -1,8 +1,8 @@
 # Wiki Index
 
 Project: kafkaman
-Stage: M3/M4 pre-merge fixes active
-Updated: 2026-08-12
+Stage: M3/M4 merged; entity-first propagation active
+Updated: 2026-08-13
 
 One-line: A Rust library plus optional worker runtime for reliable Kafka-backed
 service messaging, using Postgres as the durable execution ledger.
@@ -128,6 +128,12 @@ service messaging, using Postgres as the durable execution ledger.
     `last_failed_at` / `last_failure_kind` columns that replace casting the audit
     JSON, and the resulting changeset checksum changes. Verified against
     Docker-backed PostgreSQL and Redpanda. Status: Active.
+- [compatibility/m5-entity-first-cache-api.compat.md](compatibility/m5-entity-first-cache-api.compat.md)
+  - M5 first-slice API and behavior changes: `RetentionClass`, defaulted
+    `KafkaMessage::entity_key`, defaulted `KafkaMessage::retention_class`,
+    `MessageDescriptor.retention_class`, `CacheTable`, `CreateCacheTable`, and
+    compact receive dispatch cache upsert guarded by Kafka offset. Verified by
+    the new entity-first propagation integration tests. Status: Active.
 
 ## Decisions
 
@@ -169,11 +175,14 @@ service messaging, using Postgres as the durable execution ledger.
 
 - [decisions/entity-first-propagation-model.decision.md](decisions/entity-first-propagation-model.decision.md)
   - Propagation is doctrine over the unchanged durable-execution mechanism.
-    Fixes three identity axes with a required `entity_version` (outbox sequence
-    by default, domain override), entity-only messages across an inbox plus a
-    guarded per-entity replica table, an outbox monotonicity constraint as
-    defense-in-depth, advisory origin intent, and soft-delete-first deletion.
-    Status: Accepted.
+    Fixes three identity axes, every type as an entity with a declared retention
+    class, an inbox plus guarded cache table for `compact` types, advisory origin
+    intent, and soft-delete-first deletion. **Amended 2026-08-13:** the
+    convergence ordinal is the Kafka offset already stored on received rows,
+    made trustworthy by key-serialized per-entity outbox supersede. Removes the
+    producer-side version, the high-water table, the monotonicity constraint, the
+    `kafkaman-entity-version` header, and the domain-version override; adds
+    state-sourced republish and topic-lifecycle invalidation. Status: Accepted.
 
 - [decisions/messaging-scope-and-receive-model.decision.md](decisions/messaging-scope-and-receive-model.decision.md)
   - Durable-execution-first core; Kafka-only transport in v1; HTTP and synchronous
@@ -218,11 +227,12 @@ service messaging, using Postgres as the durable execution ledger.
 
 ## Roadmaps
 
-- [roadmaps/path-to-v1.roadmap.md](roadmaps/path-to-v1.roadmap.md) - Six
-  milestones to V1: M1 durable send completed, M2 change-engine/config
-  complete, M3 durable receive spec active, M4 retry/DLQ active, then
-  observability and hardening. Retry/DLQ and parallel-worktree execution
-  policies are accepted. Status: Draft.
+- [roadmaps/path-to-v1.roadmap.md](roadmaps/path-to-v1.roadmap.md) - Seven
+  milestones to V1. M1 durable send, M2 change-engine/config, M3 durable
+  receive and M4 retry/DLQ are all Completed, merged, and promoted to specs.
+  **Updated 2026-08-13:** entity-first propagation is Active as M5 ahead of
+  observability, because it changes the table layout dashboards would otherwise
+  be built on; observability and hardening shift to M6 and M7. Status: Draft.
 
 ## References
 
@@ -261,7 +271,7 @@ service messaging, using Postgres as the durable execution ledger.
 - [proposals/07-tombstone-and-deletion-semantics.proposal.md](proposals/07-tombstone-and-deletion-semantics.proposal.md)
   - Revised 2026-08-12: the emission half is superseded by soft-delete-first in
     proposal 09, because real tombstones are reclaimed after
-    `delete.retention.ms` and a long-offline replica can miss a delete. Residual
+    `delete.retention.ms` and a long-offline cache can miss a delete. Residual
     scope is per-message-type opt-in real-tombstone *ingestion*, still required
     for foreign producers such as Debezium. Status: Proposed.
 - [proposals/08-listen-notify-scheduler-wakeup.proposal.md](proposals/08-listen-notify-scheduler-wakeup.proposal.md)
@@ -270,16 +280,45 @@ service messaging, using Postgres as the durable execution ledger.
     path and as the bound on retry punctuality. Status: Proposed.
 - [proposals/09-entity-first-propagation.proposal.md](proposals/09-entity-first-propagation.proposal.md)
   - Entity-first reference propagation as the headline use case: three identity
-    axes with a required `entity_version`, outbox-sequence default with domain
-    override, one message type across an inbox plus a guarded per-entity replica
-    table, advisory `#[non_exhaustive]` origin intent, soft-delete-first
-    deletion, and an outbox monotonicity constraint. Status: Accepted, promoted
-    to the entity-first propagation decision.
-- [proposals/10-replica-bootstrap-and-readiness.proposal.md](proposals/10-replica-bootstrap-and-readiness.proposal.md)
+    axes, one message type across an inbox plus a guarded per-entity cache
+    table, advisory `#[non_exhaustive]` origin intent, and soft-delete-first
+    deletion. **Revised 2026-08-13:** selects Kafka offset as the convergence
+    ordinal paired with key-serialized per-entity outbox supersede, replacing the
+    outbox sequence and domain override; adds ordinal validity boundaries and
+    state-sourced republish. Status: Accepted, promoted to the entity-first
+    propagation decision.
+- [proposals/10-cache-bootstrap-and-readiness.proposal.md](proposals/10-cache-bootstrap-and-readiness.proposal.md)
   - Compacted-topic replay from offset 0 as the catch-up protocol, a bootstrap
     consumer mode with per-instance groups reading all partitions, a
-    `replica_state` table, and a typestate readiness surface so hosts cannot
-    serve reads from a cold cache. Status: Proposed.
+    `cache_state` table, and a typestate readiness surface so hosts cannot
+    serve reads from a cold cache. Records that the topic *is* the origin but
+    offers no per-key fallback, which is why readiness must be a typestate
+    rather than lazy-loading. Status: Proposed.
+- [proposals/11-restore-retention-and-schema-boundaries.proposal.md](proposals/11-restore-retention-and-schema-boundaries.proposal.md)
+  - Names the operational invariants durability silently depends on: entity
+    topics use compaction alone (never with delete-by-age), the outbox is
+    excluded from backups and starts empty, the inbound ledger is never rewound
+    past its processed-markers, a business restore needs a resync sweep, and
+    irreversible actions carry their own idempotency record in an independent
+    restore domain. Splits kafkaman's tables three ways by reconstructibility —
+    drop / protect / rebuild — while recording that PITR is cluster-wide, so the
+    split buys backup-set composition rather than independent restore. GDPR
+    erasure is resolved by publishing a redacted entity; storage growth is not.
+    Status: Proposed.
+- [proposals/12-entity-only-message-model.proposal.md](proposals/12-entity-only-message-model.proposal.md)
+  - Collapses the message model so every type is an entity, with work items as
+    entities whose key is unique per item and whose convergence guard is a
+    harmless no-op. **Revised 2026-08-13 after review:** selects a uniform entity
+    model with a **declared retention class** (`compact` / `delete`) driving topic
+    config, cache-table generation, and bootstrap eligibility, over
+    entity-only-by-redefinition — because the latter keeps the two broker
+    configurations that already exist while deleting the type-level signal that
+    makes misconfiguration boot-detectable. Records hard exclusion as a costed
+    option 4, rejected because it strands the `mutation_jobs` evidence and most of
+    M4. Non-breaking: `entity_key` defaults to `message_id`, class defaults to
+    `delete`. Surfaces two conflicts in proposal 11 (the `rebuild` directive is
+    compaction-conditional; the resync sweep is load-bearing). Status: Accepted,
+    promoted as an amendment to the entity-first propagation decision.
 
 ## Plans
 
@@ -305,10 +344,20 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
   Status: Completed.
 
 - [plans/m4-retry-backoff-dlq.plan.md](plans/m4-retry-backoff-dlq.plan.md)
-- Active M4 reliability plan for policy-driven receive retry scheduling,
-  table-backed terminal `Failed`/DLQ state, bounded error history, and
-  redrive/admin surfaces. First slice landed retry scheduling and terminal
-  failure tests. Status: Active.
+- M4 reliability plan for policy-driven receive retry scheduling, table-backed
+  terminal `Failed`/DLQ state, bounded error history, and redrive/admin
+  surfaces. Completed by
+  [specs/m4-retry-backoff-dlq.spec.md](specs/m4-retry-backoff-dlq.spec.md).
+  Status: Completed.
+
+- [plans/entity-first-propagation.plan.md](plans/entity-first-propagation.plan.md)
+- Active execution plan for entity-first propagation: gap-revealing convergence
+  tests, defaulted universal `entity_key`, declared retention class, `compact`
+  cache tables, boot-time topic validation, the offset-guarded upsert,
+  per-entity outbox supersede with entity-key enqueue serialization,
+  state-sourced republish, topic-lifecycle invalidation, and soft-delete-first.
+  First cache-upsert slice landed 2026-08-13 with retry, concurrent-dispatch,
+  and redrive convergence tests passing. Status: Active.
 - [plans/typed-idempotency-identity-error-row-fix.plan.md](plans/typed-idempotency-identity-error-row-fix.plan.md)
 - Completed fix plan for typed idempotency identity, transactional send/receive
   error-row symmetry, DLQ latest-failure-time semantics, and outbox replay

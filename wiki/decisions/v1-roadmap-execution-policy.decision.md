@@ -24,7 +24,7 @@
    them.
 3. **Accept only the subset that has been decided or validated.**
    For example, M1 can ratify send-side runtime composition; M3 can ratify
-   durable receive after it passes its exit gates; M6 can ratify full test
+   durable receive after it passes its exit gates; M7 can ratify full test
    pyramid/tooling claims.
 4. **Use dependency-aware parallel worktrees.**
    Work may run in parallel when it has clear boundaries and does not require

@@ -27,7 +27,7 @@ adopts **soft-delete-first**: the entity flows in full with a deleted status
 and/or delete intent, and rows are reclaimed by a later batch.
 
 The reversal turns on a correctness hazard this proposal did not weigh. Real
-tombstones are reclaimed after `delete.retention.ms`, so a replica offline longer
+tombstones are reclaimed after `delete.retention.ms`, so a cache offline longer
 than that window misses the delete and holds a ghost entity forever. A
 soft-delete record is a normal record with a value, is therefore always the last
 record for its key, and is retained by compaction indefinitely — so bootstrap
@@ -52,7 +52,7 @@ context and should not be implemented as written.
 In Kafka, deletion on a log-compacted topic is expressed as a record with a
 non-null key and a null value. Compaction retains the tombstone long enough for
 consumers to observe it, then reclaims the key. Any consumer maintaining a local
-replica of a compacted reference topic must interpret that record as "remove this
+cache of a compacted reference topic must interpret that record as "remove this
 key", not as a corrupt message.
 
 kafkaman today has no representation for this on either side.
@@ -61,7 +61,7 @@ On the receive path, `ReceivedIngestFailureKind::MissingPayload`
 (`crates/kafkaman-core/src/lib.rs:587`) classifies a null payload as an ingest
 failure, so ingest writes a quarantine row into `received_ingest_failures` and
 commits past the record. A deletion therefore never reaches a handler and the
-replica silently retains a row that the producer intended to delete.
+cache silently retains a row that the producer intended to delete.
 
 Prior art confirms this is load-bearing rather than theoretical. The
 `cqrs-fullstack` snapshot emits deletions on its compacted `user.sync` topic as
@@ -71,8 +71,8 @@ real tombstones: `user_delete_event` constructs an event with
 stands, every one of those deletions would land in quarantine.
 
 This matters most under the reference-replication use case, where a downstream
-domain maintains a cached projection of another domain's entities. A replica that
-cannot represent deletion is not a correct replica.
+domain maintains a cached projection of another domain's entities. A cache that
+cannot represent deletion is not a correct cache.
 
 ## Options
 
@@ -85,7 +85,7 @@ cannot represent deletion is not a correct replica.
 2. **Always reinterpret a null payload as a deletion.**
    Removes `MissingPayload` and treats every null value as a delete. Simple, but
    it silently reinterprets genuinely truncated or corrupt records as destructive
-   operations against the replica, which is the opposite of the quarantine policy
+   operations against the cache, which is the opposite of the quarantine policy
    kafkaman applies everywhere else.
 3. **Per-message-type opt-in tombstone support.**
    A message type declares whether it is tombstone-bearing. For such a type, a
@@ -121,12 +121,16 @@ retry, and DLQ behavior are unchanged — a deletion is ordinary durable work.
 A null value with a null key remains a `MissingPayload` quarantine for every
 type, including tombstone-bearing ones.
 
-Under proposal 09 the ingested tombstone must resolve to the same replica
-operation as a soft delete, so that a replica fed by a foreign producer and a
-replica fed by kafkaman converge to the same state. A tombstone carries no
-payload, so the entity version cannot come from the body; the version must be
-taken from the `kafkaman-entity-version` header when present, and otherwise
-falls under the identity question below.
+Under proposal 09 the ingested tombstone must resolve to the same cache
+operation as a soft delete, so that a cache fed by a foreign producer and a
+cache fed by kafkaman converge to the same state. A tombstone carries no
+payload, so its ordinal cannot come from the body.
+
+**Resolved by the 2026-08-13 revision of proposal 09.** The convergence ordinal
+is the Kafka offset, which a foreign tombstone has by virtue of arriving on the
+topic at all. No header is required and no per-type derivation rule is needed —
+a Debezium tombstone orders against kafkaman-produced records identically,
+because both are ordered by the same partition offsets.
 
 ### Handler surface
 
@@ -174,15 +178,16 @@ The costs:
   unknown key, a tombstone redelivered after the delete already applied, and a
   tombstone racing a later non-null record for the same key.
 - Two deletion representations now coexist — kafkaman's own soft delete and a
-  foreign real tombstone — and both must converge to the same replica state.
+  foreign real tombstone — and both must converge to the same cache state.
   That equivalence needs an explicit test.
 
 ## Open Questions
 
 1. How is the idempotency key derived for tombstones from external producers, and
    should that derivation be declared per message type?
-2. Where does `entity_version` come from for a foreign tombstone that carries no
-   kafkaman headers — record offset, a declared per-type rule, or refusal?
+2. ~~Where does `entity_version` come from for a foreign tombstone that carries
+   no kafkaman headers?~~ **Resolved 2026-08-13**: the ordinal is the record's
+   Kafka offset, which every ingested record has regardless of producer.
 3. Does a deletion need a distinct terminal status, or is the existing
    `Processed` status plus a deletion flag sufficient for operator triage?
 4. Should kafkaman assert or warn when a tombstone-bearing type is bound to a
