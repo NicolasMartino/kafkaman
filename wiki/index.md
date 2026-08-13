@@ -2,7 +2,7 @@
 
 Project: kafkaman
 Stage: M3/M4 merged; entity-first propagation active
-Updated: 2026-08-13
+Updated: 2026-08-14
 
 One-line: A Rust library plus optional worker runtime for reliable Kafka-backed
 service messaging, using Postgres as the durable execution ledger.
@@ -134,6 +134,12 @@ service messaging, using Postgres as the durable execution ledger.
     `MessageDescriptor.retention_class`, `CacheTable`, `CreateCacheTable`, and
     compact receive dispatch cache upsert guarded by Kafka offset. Verified by
     the new entity-first propagation integration tests. Status: Active.
+- [compatibility/m5-entity-first-outbox-supersede.compat.md](compatibility/m5-entity-first-outbox-supersede.compat.md)
+  - M5 outbound schema/API and relay behavior changes: `OutboxStatus::Superseded`,
+    `OutboxRow.entity_key`, nullable outbox `entity_key`, `AddOutboxEntityKey`,
+    compact-type advisory enqueue serialization, pending-row supersede, and
+    same-entity `Publishing` rows blocking newer pending relay claims. Status:
+    Active.
 
 ## Decisions
 
@@ -357,7 +363,9 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
   per-entity outbox supersede with entity-key enqueue serialization,
   state-sourced republish, topic-lifecycle invalidation, and soft-delete-first.
   First cache-upsert slice landed 2026-08-13 with retry, concurrent-dispatch,
-  and redrive convergence tests passing. Status: Active.
+  and redrive convergence tests passing. Outbound supersede slice landed
+  2026-08-14 with key-level enqueue serialization and relay claim blocking
+  verified. Status: Active.
 - [plans/typed-idempotency-identity-error-row-fix.plan.md](plans/typed-idempotency-identity-error-row-fix.plan.md)
 - Completed fix plan for typed idempotency identity, transactional send/receive
   error-row symmetry, DLQ latest-failure-time semantics, and outbox replay

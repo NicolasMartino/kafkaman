@@ -144,6 +144,17 @@ choice. Locking only the latest existing outbox row is insufficient: the first
 concurrent writes have no row to lock, and a waiting writer must re-read latest
 state under the entity-key lock before deciding.
 
+Progress 2026-08-14: `Superseded`, nullable outbox `entity_key`,
+`AddOutboxEntityKey`, compact-type key-level advisory enqueue locking, pending
+row supersede, and relay claim blocking behind same-entity `Publishing` rows are
+implemented. Verified gates:
+`first_concurrent_enqueues_for_entity_serialize`,
+`supersede_collapses_queued_updates`, and
+`publishing_entity_blocks_newer_pending_claim_until_published`. The first gate
+also covers the waiting-writer re-read case because the second writer waits
+behind the first writer's uncommitted insert, then supersedes it only after the
+first transaction commits.
+
 ## Phase 4 — State-sourced republish
 
 - `Replay::outbox` rejects propagating entity types at construction, with an

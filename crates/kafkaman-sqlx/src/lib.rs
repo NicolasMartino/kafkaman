@@ -336,8 +336,16 @@ impl OutboxTable {
     }
 
     fn state_index_name(&self) -> SqlIdentifier {
+        self.index_name("_state")
+    }
+
+    fn entity_state_index_name(&self) -> SqlIdentifier {
+        self.index_name("_entity_state")
+    }
+
+    fn index_name(&self, suffix: &str) -> SqlIdentifier {
         let base = self.table.as_str();
-        let middle_limit = SqlIdentifier::MAX_LEN - "idx_".len() - "_state".len();
+        let middle_limit = SqlIdentifier::MAX_LEN - "idx_".len() - suffix.len();
         let middle = if base.len() <= middle_limit {
             base.to_owned()
         } else {
@@ -349,7 +357,7 @@ impl OutboxTable {
             let keep = middle_limit - hash.len() - 1;
             format!("{}_{}", &base[..keep], hash)
         };
-        SqlIdentifier::new(format!("idx_{middle}_state")).expect("index name is generated valid")
+        SqlIdentifier::new(format!("idx_{middle}{suffix}")).expect("index name is generated valid")
     }
 }
 
@@ -773,6 +781,7 @@ impl Changeset for CreateOutboxTable {
         let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
         builder.push(create_outbox_table_sql(&table));
         builder.push(create_outbox_state_index_sql(&table));
+        builder.push(create_outbox_entity_state_index_sql(&table));
         Ok(())
     }
 
@@ -875,6 +884,54 @@ impl Changeset for CreateCacheTable {
     }
 }
 
+/// Additive changeset that brings an outbox table created before entity-first
+/// outbound supersede up to the current shape. Fresh tables already include the
+/// column and index via [`create_outbox_table_sql`] and
+/// [`create_outbox_entity_state_index_sql`], so this is a no-op there; include it
+/// in a changelog only to upgrade pre-existing tables.
+#[derive(Clone, Debug)]
+pub struct AddOutboxEntityKey {
+    pub version: i64,
+    pub descriptor: MessageDescriptor,
+}
+
+impl AddOutboxEntityKey {
+    pub fn new(version: i64, descriptor: MessageDescriptor) -> Self {
+        Self {
+            version,
+            descriptor,
+        }
+    }
+}
+
+impl Changeset for AddOutboxEntityKey {
+    fn version(&self) -> i64 {
+        self.version
+    }
+
+    fn name(&self) -> &str {
+        "add_outbox_entity_key"
+    }
+
+    fn build(&self, cfg: &ResolvedConfig, builder: &mut ChangeBuilder) -> Result<()> {
+        let table = OutboxTable::new(cfg.schema.clone(), self.descriptor.clone())?;
+        builder.push(add_outbox_entity_key_sql(&table));
+        builder.push(create_outbox_entity_state_index_sql(&table));
+        Ok(())
+    }
+
+    fn checksum_material(&self) -> String {
+        format!(
+            "version={};name={};message_type={};topic={};retention_class={}",
+            self.version(),
+            self.name(),
+            self.descriptor.message_type.as_str(),
+            self.descriptor.topic,
+            self.descriptor.retention_class.as_str()
+        )
+    }
+}
+
 /// Additive changeset that brings an outbox table created before idempotency
 /// support up to the current shape. Fresh tables already include the column via
 /// [`create_outbox_table_sql`], so this `ALTER ... ADD COLUMN IF NOT EXISTS` is a
@@ -931,6 +988,13 @@ pub fn add_idempotency_key_sql(table: &OutboxTable) -> String {
 pub fn add_idempotency_source_sql(table: &OutboxTable) -> String {
     format!(
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS idempotency_source JSONB",
+        table.qualified_name()
+    )
+}
+
+pub fn add_outbox_entity_key_sql(table: &OutboxTable) -> String {
+    format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS entity_key TEXT",
         table.qualified_name()
     )
 }
@@ -1546,6 +1610,24 @@ fn advisory_lock_key(schema: &str) -> i64 {
     hash as i64
 }
 
+fn outbox_entity_lock_key(table: &OutboxTable, entity_key: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [
+        "outbox_entity",
+        table.schema.as_str(),
+        table.descriptor.message_type.as_str(),
+        entity_key,
+    ] {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as i64
+}
+
 /// Stable SHA-256 (hex) checksum of a changeset's source-declared material,
 /// stored as `sha256:<64 hex chars>`. The `changeset:` domain prefix keeps these
 /// digests from ever colliding with hashes computed for another purpose.
@@ -1749,6 +1831,7 @@ pub fn create_outbox_table_sql(table: &OutboxTable) -> String {
     claim_expires_at TIMESTAMPTZ,
     topic TEXT NOT NULL,
     partition_key TEXT,
+    entity_key TEXT,
     correlation_id UUID NOT NULL,
     causation_id UUID,
     headers JSONB NOT NULL DEFAULT '{{}}',
@@ -1769,6 +1852,14 @@ pub fn create_outbox_state_index_sql(table: &OutboxTable) -> String {
     format!(
         "CREATE INDEX IF NOT EXISTS {} ON {} (status, next_attempt_at, claim_expires_at, created_at)",
         table.state_index_name().quoted(),
+        table.qualified_name()
+    )
+}
+
+pub fn create_outbox_entity_state_index_sql(table: &OutboxTable) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} (entity_key, status, created_at) WHERE entity_key IS NOT NULL",
+        table.entity_state_index_name().quoted(),
         table.qualified_name()
     )
 }
@@ -1858,9 +1949,16 @@ where
     if let Some(reserved) = kafkaman_core::reserved_header(&evt.headers) {
         return Err(Error::ReservedHeader(reserved.to_owned()));
     }
-    let headers = serde_json::to_value(&evt.headers)?;
-    let payload = serde_json::to_value(&evt.payload)?;
     let partition_key = evt.payload.partition_key();
+    let entity_key = evt.payload.entity_key(evt.message_id);
+    let mut headers = evt.headers.clone();
+    if table.descriptor.retention_class.is_compact()
+        && partition_key.as_deref() != Some(entity_key.as_str())
+    {
+        headers.insert("kafkaman-entity-key".to_owned(), entity_key.clone());
+    }
+    let headers = serde_json::to_value(&headers)?;
+    let payload = serde_json::to_value(&evt.payload)?;
     let identity = evt.idempotency_key.as_ref();
     let idempotency_key = identity.map(|identity| identity.key.to_string());
     let idempotency_source = identity
@@ -1875,12 +1973,17 @@ where
         .is_none()
         .then(|| "missing idempotency identity".to_owned());
 
+    if table.descriptor.retention_class.is_compact() && identity.is_some() {
+        lock_outbox_entity(conn, &table, &entity_key).await?;
+        supersede_pending_outbox_rows(conn, &table, &entity_key).await?;
+    }
+
     let sql = format!(
         "INSERT INTO {name} (
             message_id, idempotency_key, idempotency_source, status, attempts, next_attempt_at,
-            last_error, topic, partition_key, correlation_id, causation_id, headers, payload,
+            last_error, topic, partition_key, entity_key, correlation_id, causation_id, headers, payload,
             occurred_at
-        ) VALUES ($1, $2, $3, {status}, 0, now(), $4, $5, $6, $7, $8, $9, $10, $11)",
+        ) VALUES ($1, $2, $3, {status}, 0, now(), $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         name = table.qualified_name(),
         status = status.sql_literal(),
     );
@@ -1892,6 +1995,7 @@ where
         .bind(last_error.as_deref())
         .bind(table.descriptor.topic.clone())
         .bind(partition_key)
+        .bind(entity_key)
         .bind(evt.correlation_id)
         .bind(evt.causation_id)
         .bind(headers)
@@ -1905,6 +2009,42 @@ where
     } else {
         Ok(())
     }
+}
+
+async fn lock_outbox_entity(
+    conn: &mut PgConnection,
+    table: &OutboxTable,
+    entity_key: &str,
+) -> Result<()> {
+    let key = outbox_entity_lock_key(table, entity_key);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn supersede_pending_outbox_rows(
+    conn: &mut PgConnection,
+    table: &OutboxTable,
+    entity_key: &str,
+) -> Result<()> {
+    let sql = format!(
+        "UPDATE {name}
+         SET status = {superseded},
+             claim_id = NULL,
+             claimed_by = NULL,
+             claim_expires_at = NULL
+         WHERE entity_key = $1 AND status = {pending}",
+        name = table.qualified_name(),
+        superseded = OutboxStatus::Superseded.sql_literal(),
+        pending = OutboxStatus::Pending.sql_literal(),
+    );
+    sqlx::query(&sql)
+        .bind(entity_key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 pub async fn insert_received<P>(
@@ -2696,10 +2836,21 @@ pub async fn claim_batch(
     limit: i64,
 ) -> Result<Vec<ClaimedOutboxRow>> {
     let select_sql = format!(
-        "SELECT * FROM {name}
-         WHERE (status = {pending} AND next_attempt_at <= now())
-            OR (status = {publishing} AND claim_expires_at <= now())
-         ORDER BY created_at
+        "SELECT * FROM {name} candidate
+         WHERE (
+                candidate.status = {pending}
+                AND candidate.next_attempt_at <= now()
+                AND (
+                    candidate.entity_key IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM {name} inflight
+                        WHERE inflight.entity_key = candidate.entity_key
+                          AND inflight.status = {publishing}
+                    )
+                )
+             )
+            OR (candidate.status = {publishing} AND candidate.claim_expires_at <= now())
+         ORDER BY candidate.created_at
          FOR UPDATE SKIP LOCKED
          LIMIT $1",
         name = table.qualified_name(),
@@ -2891,6 +3042,7 @@ fn row_from_pg(row: PgRow) -> Result<OutboxRow> {
         claim_expires_at: row.try_get("claim_expires_at")?,
         topic: row.try_get("topic")?,
         partition_key: row.try_get("partition_key")?,
+        entity_key: row.try_get("entity_key")?,
         correlation_id: row.try_get("correlation_id")?,
         causation_id: row.try_get("causation_id")?,
         headers,

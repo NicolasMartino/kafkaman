@@ -51,4 +51,5 @@
 - Boot-time broker topic validation from retention class to `cleanup.policy`.
 - Topic/partition mismatch invalidation path.
 - State-sourced `Replay::outbox` rejection for compact entity types.
-- Key-serialized outbound supersede and `Superseded` outbox status.
+- Key-serialized outbound supersede and `Superseded` outbox status are covered
+  by [m5-entity-first-outbox-supersede.compat.md](m5-entity-first-outbox-supersede.compat.md).

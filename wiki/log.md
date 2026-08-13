@@ -1,5 +1,44 @@
 # Wiki Log
 
+## [2026-08-14] implementation | M5 outbox supersede first slice
+
+Implemented Phase 3's outbound entity ordering foundation. Outbox rows now carry
+`entity_key`; `OutboxStatus` includes `Superseded`; fresh outbox tables include
+the nullable `entity_key` column plus an entity-state index; and
+`AddOutboxEntityKey` upgrades existing outbox tables idempotently.
+
+For compact message types with a valid idempotency identity, enqueue now takes a
+transaction-scoped advisory lock keyed by schema, message type, and entity key
+before updating same-entity pending rows to `Superseded` and inserting the new
+row. Relay claiming also blocks a newer pending row while another row for the
+same entity is still `Publishing`, preserving the one-in-flight ordering
+contract that makes Kafka offsets usable as the convergence ordinal.
+
+Verified gates:
+- `first_concurrent_enqueues_for_entity_serialize`
+- `supersede_collapses_queued_updates`
+- `publishing_entity_blocks_newer_pending_claim_until_published`
+- `add_outbox_entity_key_upgrades_legacy_outbox_table`
+
+Verification:
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test entity_first_outbox_supersede -- --test-threads=1`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test entity_first_propagation -- --test-threads=1`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_send -- --test-threads=1`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests -- --test-threads=1`
+- `rtk cargo test --workspace --all-features`
+
+Pages affected:
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/compatibility/m5-entity-first-cache-api.compat.md
+- wiki/compatibility/m5-entity-first-outbox-supersede.compat.md
+- wiki/index.md
+- wiki/log.md
+
+Code affected:
+- crates/kafkaman-core/src/lib.rs
+- crates/kafkaman-sqlx/src/lib.rs
+- tests/durable-send/tests/entity_first_outbox_supersede.rs
+
 ## [2026-08-13] implementation | M5 concurrent cache convergence gate
 
 Added `concurrent_dispatch_of_two_states_converges_to_newer` to the entity-first

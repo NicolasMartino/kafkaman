@@ -484,6 +484,7 @@ pub enum OutboxStatus {
     Pending,
     Publishing,
     Published,
+    Superseded,
     Failed,
 }
 
@@ -491,10 +492,11 @@ impl OutboxStatus {
     /// Every status value, in declaration order. SQL generators build CHECK
     /// constraints and `IN (...)` lists from this so the database can never
     /// drift from the Rust enum.
-    pub const ALL: [OutboxStatus; 4] = [
+    pub const ALL: [OutboxStatus; 5] = [
         Self::Pending,
         Self::Publishing,
         Self::Published,
+        Self::Superseded,
         Self::Failed,
     ];
 
@@ -503,6 +505,7 @@ impl OutboxStatus {
             Self::Pending => "Pending",
             Self::Publishing => "Publishing",
             Self::Published => "Published",
+            Self::Superseded => "Superseded",
             Self::Failed => "Failed",
         }
     }
@@ -539,6 +542,7 @@ impl FromStr for OutboxStatus {
             "Pending" => Ok(Self::Pending),
             "Publishing" => Ok(Self::Publishing),
             "Published" => Ok(Self::Published),
+            "Superseded" => Ok(Self::Superseded),
             "Failed" => Ok(Self::Failed),
             other => Err(Error::InvalidOutboxStatus(other.to_owned())),
         }
@@ -881,6 +885,7 @@ pub struct OutboxRow {
     pub claim_expires_at: Option<OffsetDateTime>,
     pub topic: String,
     pub partition_key: Option<String>,
+    pub entity_key: Option<String>,
     pub correlation_id: Uuid,
     pub causation_id: Option<Uuid>,
     pub headers: BTreeMap<String, String>,
@@ -1172,7 +1177,7 @@ mod tests {
         }
         assert_eq!(
             OutboxStatus::sql_literal_list(),
-            "'Pending', 'Publishing', 'Published', 'Failed'"
+            "'Pending', 'Publishing', 'Published', 'Superseded', 'Failed'"
         );
     }
 }
