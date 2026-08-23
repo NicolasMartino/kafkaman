@@ -3,8 +3,12 @@
 - Document Class: Decision
 - Status: Accepted
 - Date: 2026-06-20
+- Amended: 2026-08-14
 - Category: Architecture scope
-- Scope: Fixes kafkaman's v1 scope (transport, command vs event, receive/outcome model) and what is deliberately deferred.
+- Scope: Originally fixed kafkaman's v1 scope around durable async execution.
+  Amended 2026-08-14: kafkaman's product purview is compact entity-cache
+  propagation only; non-entity work items, commands, generic jobs, emails,
+  payments, analytics events, and direct transport are outside scope.
 - Sources:
   - wiki/proposals/02-messaging-scope-kafka-command-vs-durable-execution.proposal.md
   - wiki/proposals/01-kafkaman-objectives.proposal.md
@@ -13,15 +17,19 @@
   - raw/design/2026-06-20-kafkaman-architecture-discussion.md (the design discussion this decision records)
 - Related:
   - wiki/proposals/01-kafkaman-objectives.proposal.md
+  - wiki/proposals/12-entity-only-message-model.proposal.md
+  - wiki/decisions/entity-first-propagation-model.decision.md
   - wiki/references/rust-kafka-outbox-ecosystem.reference.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
 
 ## Decision
 
-1. **Durable-execution-first, transport-neutral core.** kafkaman's core is a
-   durable execution engine — ledger, status state machine, `FOR UPDATE SKIP
-   LOCKED` claiming, retry/backoff, idempotent receive. Transport is a backend
-   under that core.
+1. **Compact entity-cache propagation is the v1 product scope.** The
+   2026-08-14 entity-only purview amendment supersedes the original
+   durable-execution-first scope. kafkaman's durable ledger, status state
+   machine, `FOR UPDATE SKIP LOCKED` claiming, retry/backoff, and idempotent
+   receive remain only as infrastructure for reliable entity propagation and
+   cache coherence. kafkaman is not a general durable job queue.
 2. **Kafka is the only transport in v1.** Implement `kafkaman-rdkafka`
    concretely. Do **not** build a transport-trait abstraction or a second
    transport until one is actually needed — avoid over-abstraction. The core
@@ -31,23 +39,23 @@
    make non-Kafka inter-service messaging unnecessary — realizing the original
    "Kafka instead of REST" goal through *reliability*, not through synchronous
    request/response over Kafka.
-4. **Commands-over-Kafka (synchronous request/response) is out of v1 scope.**
-   v1 = durable **async**: outbox→Kafka send, idempotent consumer, handler
-   execution, retry/DLQ.
-5. **Receive/outcome model:** v1 is **fire-and-forget with durable status**. The
-   envelope carries `correlation_id` and `causation_id` as first-class fields so
-   the outcome story can be built later **without changing the existing envelope
-   fields** (the durable waiter store it needs will still add its own tables). The
-   wait-for-outcome mechanism is **deferred**; when built, kafkaman provides only
-   **primitives** — (a) emit a correlated outcome message, (b) durably
-   await/subscribe by `correlation_id` — and leaves **policy** (timeouts, batch
-   completion, synchronous client responses; i.e. the BFF `outcome_waiters` role)
-   to the host application.
+4. **Commands-over-Kafka and non-entity work are out of v1 scope.** v1 =
+   durable **async entity propagation**: outbox-to-Kafka publish of compact
+   entity snapshots, idempotent consume, guarded cache write, and retry/DLQ for
+   that pipeline. Messages such as "send welcome email", payments, commands,
+   analytics events, and generic durable jobs belong outside kafkaman.
+5. **Receive/outcome model for entity propagation:** v1 is **fire-and-forget
+   with durable status** for entity-cache processing. The envelope carries
+   `correlation_id` and `causation_id` as first-class fields so an adjacent
+   outcome story can be built later **without changing the existing envelope
+   fields**. The wait-for-outcome mechanism is **deferred**; under the
+   2026-08-14 purview amendment, it remains speculative adjacent infrastructure
+   rather than v1 scope.
 
 ## Why
 
-The reference architecture (RepForge / cqrs-fullstack) already ran this
-experiment:
+The reference architecture (RepForge / cqrs-fullstack) already ran the original
+durable-execution experiment:
 
 - It built **commands over Kafka** (`commands_inbox`, `processed_commands`),
   then cut over and **dropped** them — `exercise-api` migration
@@ -62,9 +70,11 @@ experiment:
   (await-by-`correlation_id`) and `processed_mutations` (idempotent receive via
   `Idempotency-Key`).
 
-That `mutation_jobs` engine is the same durable-execution machinery as a Kafka
-outbox with a different dispatch verb (HTTP POST vs Kafka produce). So the
-**durable-execution model is the validated need; the transport is incidental.**
+The original 2026-06 conclusion was that the `mutation_jobs` engine validated
+durable execution as kafkaman's core. The 2026-08-14 amendment narrows that
+interpretation: `mutation_jobs` proves applications may need durable work
+queues, but kafkaman should not own them as product scope. Its public promise is
+distributed cache coherence for compact entity snapshots.
 
 Outcome-awaiting is a **transport capability**, not a core concern: intrinsic
 over HTTP (the response *is* the outcome), but opt-in and fragile over Kafka
@@ -75,8 +85,8 @@ painful). It therefore belongs *above* the durable core, delivered as primitives
 
 - **Kafka-command-first (Option A):** refuted by RepForge's own production
   cutover away from `commands_inbox`.
-- **Propagation-only (Option B):** too narrow — leaves the handler/retry/durable
-  engine (the most valuable, currently hand-rolled part) outside the library.
+- **Propagation-only (Option B):** originally rejected as too narrow. Superseded
+  2026-08-14; this is now accepted as the clearer kafkaman purview.
 - **Await-outcome baked into the core:** couples the core to a request/response
   shape, heavy, and awkward precisely over Kafka.
 
@@ -88,6 +98,11 @@ painful). It therefore belongs *above* the durable core, delivered as primitives
 - We deliberately delay the transport-trait abstraction until a real second
   transport exists, accepting a future refactor in exchange for not
   over-generalizing now.
+- v1 now ships less than the original durable-execution scope too: generic
+  durable jobs and non-entity messages are excluded even if existing M1-M4 code
+  still contains reusable machinery.
+- M4 retry/backoff/DLQ is retained as entity-cache pipeline support, not as a
+  durable job queue product promise.
 
 ## Revisit When
 
@@ -97,3 +112,5 @@ painful). It therefore belongs *above* the durable core, delivered as primitives
   inter-service HTTP (reconsider an HTTP transport).
 - The envelope's correlation/causation fields prove inadequate for the outcome
   story (schema revision).
+- A concrete v1 adopter need justifies reopening generic durable jobs as a
+  kafkaman product scope rather than adjacent application infrastructure.

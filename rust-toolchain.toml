@@ -1,0 +1,14 @@
+# Track stable rather than a fixed version.
+#
+# rust-analyzer's VS Code extension ships a proc-macro server built against
+# current stable. Pinning the project to an older release makes the proc-macro
+# `.dylib`s in target/ ABI-incompatible with it, and every `#[derive]` in the
+# workspace fails to expand in the editor while `cargo` still builds fine.
+# Following stable keeps the two in lockstep by construction.
+#
+# Reproducibility comes from Cargo.lock for dependencies and from CI running the
+# same `just check` gate; a new stable that introduces clippy lints surfaces
+# there rather than silently.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

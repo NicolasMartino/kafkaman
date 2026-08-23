@@ -4,13 +4,14 @@ Document Class: Spec
 Status: Active
 Date: 2026-06-22
 Category: Reliability
-Scope: Validated M4 behavior for receive-side retry scheduling, exponential
-  backoff, terminal table-backed DLQ state, the DLQ inspect surface, and guarded
-  redrive of terminal failures.
+Scope: Validated M4 behavior for receive-side retry scheduling, jittered
+  exponential backoff, terminal table-backed DLQ state, the DLQ inspect surface,
+  and guarded redrive of terminal failures.
 Sources:
 - wiki/plans/m4-retry-backoff-dlq.plan.md
 - wiki/decisions/retry-backoff-dlq-policy.decision.md
 - wiki/compatibility/m4-retry-backoff-runtime-api.compat.md
+- wiki/compatibility/m5-code-audit-remediation.compat.md
 - crates/kafkaman-config/src/lib.rs
 - crates/kafkaman-sqlx/src/lib.rs
 - tests/durable-send/tests/durable_receive.rs
@@ -38,13 +39,14 @@ resolved for its message type, so failure accounting is per-type.
 
 ### Backoff scheduling and due-gating
 
-Receive dispatch failure accounting computes the next attempt time from the
-injected dispatch time and an exponential schedule:
-`next_attempt_at = dispatch_time + initial_backoff * multiplier^attempts`, capped
-at `max_backoff` (the first retry uses `initial_backoff`). A failed-but-not-yet-
-exhausted row is recorded as `Retryable` with that scheduled `next_attempt_at`.
-The dispatcher claim query gates on the schedule: `Retryable` rows are claimed
-only when `next_attempt_at <= now`, and `Pending` rows are claimed when
+Receive dispatch failure accounting computes a capped exponential base delay
+from the injected dispatch time:
+`initial_backoff * multiplier^attempts`, capped at `max_backoff` (the first
+retry uses `initial_backoff`). M5 adds equal jitter to that base delay, so the
+actual retry delay lands in `[base / 2, base]`. A failed-but-not-yet-exhausted
+row is recorded as `Retryable` with that scheduled `next_attempt_at`. The
+dispatcher claim query gates on the schedule: `Retryable` rows are claimed only
+when `next_attempt_at <= now`, and `Pending` rows are claimed when
 `next_attempt_at` is null or due, so a parked retry is not redispatched before it
 is due.
 
@@ -90,6 +92,7 @@ Postgres integration coverage includes:
 - `received_failed_rows_inspect_surface_lists_terminal_dlq_rows`
 - `received_failed_filter_narrows_by_kind_and_since`
 - `replay_received_redrive_filters_by_kind_and_clears_history_on_request`
+- `jitter_stays_within_half_of_the_base_delay`
 
 Recorded verification commands:
 
@@ -103,9 +106,11 @@ Retry/backoff/DLQ is entirely Postgres-side. Broker behavior cannot change retry
 outcomes, so M4 adds no new Redpanda full-loop coverage; the M3 ingest/dispatch
 full-loop gates remain the broker-level proof.
 
-The backoff schedule is deterministic with no jitter, so many rows that fail
-together retry in lockstep against a recovering downstream. Jitter is later work.
+Backoff jitter is tested for bounds, not for fleet-level distribution under a
+real outage.
 
-Kafka DLQ topics, retention/purge of terminal rows, richer admin/redrive APIs,
-and operator dashboards are out of scope for M4. Send-side retry policy is not
-unified with receive retry. These remain later milestones (M6+).
+Kafka DLQ topics, richer admin/redrive APIs, and operator dashboards are out of
+scope for M4. Outbox retention landed in M5, but received-table and quarantine
+retention remain deliberately unimplemented because those tables carry dedupe
+and audit semantics. Send-side retry policy is not unified with receive retry.
+These remain later milestones (M6+).

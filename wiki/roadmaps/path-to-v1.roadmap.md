@@ -29,8 +29,8 @@ retry/DLQ, roadmap execution, and entity-first propagation. Objectives open
 questions OQ1-OQ4 are resolved, and OQ5 (host-context boundary) is ratified as
 opaque headers with a reserved `kafkaman-*` namespace.
 
-M1 through M4 are implemented, merged to `main` on 2026-08-13, and their
-behavior promoted to specs. All five pre-merge review findings are closed.
+M1 through M5 are implemented on `main` and their validated behavior is promoted
+to specs. All five M3/M4 pre-merge review findings are closed.
 
 The previously open **retry / backoff / DLQ** taxonomy is accepted as a separate
 decision and implemented in M4.
@@ -42,6 +42,17 @@ it adds per-type cache tables and a `Superseded` outbox status — building
 dashboards, metrics and DLQ views on the current table layout would mean
 rebuilding them a milestone later. Observability and hardening shift to M6 and
 M7.
+
+**Updated 2026-08-14:** proposal 12 narrowed kafkaman's purview to compact
+entity-cache propagation only. Non-entity work items and delete-retention job
+topics are outside the v1 product scope; the already-landed delete-retention API
+surface is removed in the same-day follow-up.
+
+**Updated 2026-08-24:** M5 is completed and promoted to
+[entity-first-propagation.spec.md](../specs/entity-first-propagation.spec.md).
+The two-service distributed-cache example remains active as a parallel wiring
+proof, while M6 observability/operability can proceed against the post-M5 table
+shape.
 
 ## Milestones
 
@@ -107,39 +118,43 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
   DLQ with history; the `Clock`-driven tests prove the timing without `sleep`.
 
 ### M5 — Entity-first propagation (the distributed cache)
-- **Status:** Active. Execution plan:
+- **Status:** Completed 2026-08-24. Validated behavior is promoted to
+  [entity-first-propagation.spec.md](../specs/entity-first-propagation.spec.md).
+  Execution record:
   [entity-first-propagation.plan.md](../plans/entity-first-propagation.plan.md).
 - **Goal:** deliver the headline use case — services read another domain's
   entities from a local store instead of calling that domain synchronously.
-- **Delivers:** the `EntityMessage` surface with defaulted universal
-  `entity_key`, declared retention class (`compact` / `delete`), advisory
-  `#[non_exhaustive]` origin intent, cache tables for `compact` types that
-  kafkaman owns and writes, boot-time topic validation, the offset-guarded
-  upsert, key-serialized per-entity `Superseded` supersede in the outbox,
-  state-sourced republish, topic-lifecycle invalidation with forced
-  re-bootstrap, and soft-delete-first deletion.
+- **Delivers:** the required entity-key message surface, per-type cache tables
+  that kafkaman owns and writes, offset-guarded cache upsert, received-row
+  entity-key persistence, per-entity `Superseded` outbox supersede, claim-time
+  collapse of stale same-entity pending rows, rejection of unsafe row-sourced
+  outbox replay, wire-carried producer occurrence time/idempotency source,
+  jittered receive retry backoff, and opt-in outbox retention.
 - **Realizes:** entity-first-propagation-model, and the convergence half of
   message-consumption-and-handler-model.
-- **Exit:** a cache converges to current state under every reordering kafkaman
-  itself produces — retry backoff, redrive, concurrent dispatch, redelivery,
-  bootstrap — with no operator intervention; outbound serialization is limited
-  to the affected `(message_type, entity_key)`.
+- **Exit:** a cache converges to current state under the validated reorderings
+  kafkaman itself produces today — retry backoff, receive redrive, concurrent
+  dispatch, broker redelivery, and same-entity outbound retry/supersede — while
+  outbound serialization is limited to the affected `(message_type, entity_key)`.
 
 Deferred out of M5 and tracked separately: cache bootstrap and readiness
 typestate ([proposal 10](../proposals/10-cache-bootstrap-and-readiness.proposal.md)),
-and restore/retention/schema boundaries
-([proposal 11](../proposals/11-restore-retention-and-schema-boundaries.proposal.md)),
-whose schema split breaks M2's single-schema surface and needs its own
-compatibility note.
+boot-time broker topic validation, advisory origin intent, a positive
+state-sourced republish API, proactive topic-lifecycle re-bootstrap hooks,
+soft-delete workflow/reclamation, the two-service distributed-cache example
+([plan](../plans/two-service-distributed-cache-example.plan.md)), and the
+remaining restore/schema boundaries
+([proposal 11](../proposals/11-restore-retention-and-schema-boundaries.proposal.md)).
 
 **M5's shape is resolved by accepted
 [proposal 12](../proposals/12-entity-only-message-model.proposal.md).** Every
-type is an entity carrying a declared retention class. This changes the
-implementation shape — defaulted universal `entity_key`, retention-class
-declaration, and boot-time topic validation — without changing the milestone's
-position or its convergence exit criterion.
+in-purview kafkaman type is a compact entity-cache message. This changes the
+implementation shape — entity keys, cache tables, compact-topic validation, and
+state-sourced republish — without changing the milestone's position or its
+convergence exit criterion.
 
 ### M6 — Observability & operability
+- **Status:** Active. Safe to run in parallel with the two-service example.
 - **Goal:** make it operable.
 - **Delivers:** tracing spans + the `CorrelationLayer`, metrics, lag/age/stuck-job
   detection, DLQ inspection, the `kafkaman-axum` admin/health routes, the
@@ -150,10 +165,10 @@ position or its convergence exit criterion.
 
 ### M7 — V1 hardening
 - **Goal:** ship-quality.
-- **Delivers:** the purge enforcer + retention runtime config, graceful-shutdown
-  ordering, worker-role topology polish, the full `testcontainers` full-loop
-  suite, docs/examples, and **ratifying OQ5** (the opaque-headers host-context
-  boundary) at envelope finalization.
+- **Delivers:** remaining storage-growth policy outside outbox retention,
+  graceful-shutdown ordering, worker-role topology polish, the full
+  `testcontainers` full-loop suite, docs/examples, and **ratifying OQ5** (the
+  opaque-headers host-context boundary) at envelope finalization.
 - **Exit:** the V1 acceptance bar — durable send + durable receive + reliability +
   observability, documented, with the full test pyramid green.
 

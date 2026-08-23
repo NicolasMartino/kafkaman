@@ -1,80 +1,8 @@
-use kafkaman_config::Config;
-use kafkaman_core::{Envelope, KafkaMessage, ReceiveStatus, RetentionClass};
-use kafkaman_sqlx::{
-    changelog, dispatch_once, migrate, CacheTable, CreateReceivedTable, InitSchema, MessageRouter,
-    MigrationContext, Replay,
-};
-use kafkaman_test::Harness;
-use kafkaman_worker::BoxError;
-use serde::{Deserialize, Serialize};
-use sqlx::Row;
-use std::sync::Arc;
-use testcontainers::core::{ContainerPort, IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::sync::Notify;
-
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-fn entity_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
-
-fn retry_test_config(schema: &str, max_attempts: u32) -> Config {
-    Config::from_str(&format!(
-        r#"
-        [database]
-        schema = "{schema}"
-
-        [relay]
-        worker_id = "worker-entity-test"
-        batch_limit = 10
-        lease_for = "30s"
-        retry_after = "1s"
-        poll_interval = "50ms"
-
-        [retry.defaults]
-        max_attempts = {max_attempts}
-        initial_backoff = "2s"
-        max_backoff = "5s"
-        multiplier = 2.0
-        errors_limit = 20
-        dlq = "table"
-        "#
-    ))
-    .expect("retry test config is valid")
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ProductSnapshot {
-    product_id: String,
-    name: String,
-}
-
-impl KafkaMessage for ProductSnapshot {
-    const MESSAGE_TYPE: &'static str = "product_snapshot";
-    const TOPIC: &'static str = "products";
-
-    fn partition_key(&self) -> Option<String> {
-        Some(self.product_id.clone())
-    }
-
-    fn entity_key(&self, _message_id: uuid::Uuid) -> String {
-        self.product_id.clone()
-    }
-
-    fn retention_class() -> RetentionClass {
-        RetentionClass::Compact
-    }
-}
+use super::*;
 
 #[tokio::test]
 async fn retry_after_newer_applied_does_not_regress_cache() -> TestResult {
-    let _test_guard = entity_test_lock().lock().await;
-    let (_postgres, database_url) = start_postgres().await?;
-    let harness = Harness::connect(&database_url).await?;
+    let (_postgres, harness) = start_harness().await?;
     let table = harness.received_table::<ProductSnapshot>().await?;
 
     let old = product("p-1", "old").with_idempotency_key("idem-p1-old");
@@ -117,11 +45,8 @@ async fn retry_after_newer_applied_does_not_regress_cache() -> TestResult {
 
 #[tokio::test]
 async fn redrive_after_newer_applied_does_not_regress_cache() -> TestResult {
-    let _test_guard = entity_test_lock().lock().await;
-    let (_postgres, database_url) = start_postgres().await?;
-    let schema = format!("kafkaman_entity_{}", uuid::Uuid::new_v4().simple());
-    let harness =
-        Harness::connect_with_config(&database_url, retry_test_config(&schema, 1)).await?;
+    let schema = unique_schema("kafkaman_entity");
+    let (_postgres, harness) = start_harness_with_config(retry_test_config(&schema, 1, 20)).await?;
     let table = harness.received_table::<ProductSnapshot>().await?;
 
     let old = product("p-2", "old").with_idempotency_key("idem-p2-old");
@@ -174,9 +99,7 @@ async fn redrive_after_newer_applied_does_not_regress_cache() -> TestResult {
 
 #[tokio::test]
 async fn concurrent_dispatch_of_two_states_converges_to_newer() -> TestResult {
-    let _test_guard = entity_test_lock().lock().await;
-    let (_postgres, database_url) = start_postgres().await?;
-    let harness = Harness::connect(&database_url).await?;
+    let (_postgres, harness) = start_harness().await?;
     let table = harness.received_table::<ProductSnapshot>().await?;
 
     let old = product("p-3", "old").with_idempotency_key("idem-p3-old");
@@ -233,49 +156,119 @@ async fn concurrent_dispatch_of_two_states_converges_to_newer() -> TestResult {
     Ok(())
 }
 
-fn product(product_id: &str, name: &str) -> Envelope<ProductSnapshot> {
-    Envelope::new(ProductSnapshot {
-        product_id: product_id.to_owned(),
-        name: name.to_owned(),
-    })
-}
+#[tokio::test]
+async fn received_redrive_is_context_targeted_dry_runnable_and_applied_once() -> TestResult {
+    // The replay change-engine machinery (context gating, counted dry-run
+    // preview, checksum-guarded single application) is exercised here on
+    // `Replay::received`, which is the only supported replay target: outbox
+    // replay is rejected outright as unsafe for entity snapshots.
+    let schema = unique_schema("kafkaman_entity");
+    let (_postgres, harness) = start_harness_with_config(retry_test_config(&schema, 1, 20)).await?;
+    let table = harness.received_table::<ProductSnapshot>().await?;
 
-async fn assert_cache_state(
-    harness: &Harness,
-    entity_key: &str,
-    name: &str,
-    applied_offset: i64,
-) -> TestResult {
-    let cache = CacheTable::for_message::<ProductSnapshot>(&harness.config())?;
-    let sql = format!(
-        "SELECT payload, applied_offset FROM {} WHERE entity_key = $1",
-        cache.qualified_name()
+    let doomed = product("p-4", "doomed").with_idempotency_key("idem-p4-doomed");
+    assert!(
+        harness
+            .insert_received(&doomed, 0, 40, Some(b"p-4"))
+            .await?
     );
-    let row = sqlx::query(&sql)
-        .bind(entity_key)
-        .fetch_one(harness.pool())
-        .await?;
-    let payload: serde_json::Value = row.try_get("payload")?;
-    let offset: i64 = row.try_get("applied_offset")?;
-    assert_eq!(payload["name"], name);
-    assert_eq!(offset, applied_offset);
+
+    let router = MessageRouter::new().handler::<ProductSnapshot>(|_conn, meta, _msg| {
+        Box::pin(async move {
+            if meta.attempts == 0 {
+                Err(kafkaman_sqlx::Error::Handler("terminal".to_owned()))
+            } else {
+                Ok(())
+            }
+        })
+    });
+
+    let now = OffsetDateTime::now_utc();
+    assert_eq!(
+        dispatch_once(harness.pool(), &table, &router, now)
+            .await?
+            .failed,
+        1
+    );
+    assert_eq!(
+        harness
+            .received_row_by_idempotency_key::<ProductSnapshot>("idem-p4-doomed")
+            .await?
+            .status,
+        ReceiveStatus::Failed
+    );
+
+    let cfg = harness.config();
+    let redrive =
+        || -> Result<Vec<Box<dyn Changeset>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(changelog![
+                InitSchema,
+                CreateReceivedTable::new(10_000, ProductSnapshot::descriptor()?),
+                Replay::received::<ProductSnapshot>(30_000)?
+                    .since(OffsetDateTime::UNIX_EPOCH)
+                    .max_rows(10)
+                    .contexts(&["prod"]),
+            ])
+        };
+
+    // 1. A non-matching context skips the replay entirely.
+    let skipped = migrate(
+        harness.pool(),
+        &cfg,
+        &MigrationContext::default().with_context("staging"),
+        &redrive()?,
+    )
+    .await?;
+    assert_eq!(skipped.steps()[2].action, MigrationAction::SkippedContext);
+    assert_eq!(
+        harness
+            .received_row_by_idempotency_key::<ProductSnapshot>("idem-p4-doomed")
+            .await?
+            .status,
+        ReceiveStatus::Failed,
+        "a context-skipped replay must not touch rows"
+    );
+
+    // 2. A dry run reports the real candidate count and mutates nothing.
+    let ctx = MigrationContext::default().with_context("prod");
+    let dry_run = migrate_dry_run(harness.pool(), &cfg, &ctx, &redrive()?).await?;
+    let preview = dry_run.steps()[2]
+        .preview
+        .as_deref()
+        .expect("replay dry-run should include a preview");
+    assert!(preview.contains("~1"), "{preview}");
+    assert_eq!(
+        harness
+            .received_row_by_idempotency_key::<ProductSnapshot>("idem-p4-doomed")
+            .await?
+            .status,
+        ReceiveStatus::Failed,
+        "a dry run must not requeue"
+    );
+
+    // 3. Applying requeues the row exactly once; re-running is a no-op.
+    let applied = migrate(harness.pool(), &cfg, &ctx, &redrive()?).await?;
+    assert_eq!(applied.steps()[2].action, MigrationAction::Applied);
+    assert_eq!(
+        harness
+            .received_row_by_idempotency_key::<ProductSnapshot>("idem-p4-doomed")
+            .await?
+            .status,
+        ReceiveStatus::Pending
+    );
+
+    let rerun = migrate(harness.pool(), &cfg, &ctx, &redrive()?).await?;
+    assert_eq!(
+        rerun.steps()[2].action,
+        MigrationAction::SkippedAlreadyApplied
+    );
+
+    // 4. The redriven row now processes, and its original source_offset is
+    //    preserved — that is why received redrive is safe where outbox replay
+    //    is not.
+    let redriven = dispatch_once(harness.pool(), &table, &router, now).await?;
+    assert_eq!(redriven.processed, 1);
+    assert_cache_state(&harness, "p-4", "doomed", 40).await?;
+
     Ok(())
-}
-
-async fn start_postgres() -> Result<(ContainerAsync<GenericImage>, String), BoxError> {
-    let port: ContainerPort = 5432.tcp();
-    let container = GenericImage::new("postgres", "16-alpine")
-        .with_exposed_port(port)
-        .with_wait_for(WaitFor::message_on_stderr(
-            "database system is ready to accept connections",
-        ))
-        .with_env_var("POSTGRES_PASSWORD", "postgres")
-        .with_env_var("POSTGRES_DB", "postgres")
-        .start()
-        .await?;
-    let host = container.get_host().await?;
-    let host_port = container.get_host_port_ipv4(port).await?;
-    let database_url = format!("postgres://postgres:postgres@{host}:{host_port}/postgres");
-
-    Ok((container, database_url))
 }

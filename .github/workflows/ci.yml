@@ -1,0 +1,61 @@
+# Runs exactly what `just check` runs locally, so a green local run means a green
+# CI run. The absence of this workflow is how a `clippy -D warnings` failure and
+# a semantically broken test reached the branch.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast gate: no Docker, so it fails in seconds on formatting or lint problems
+  # rather than after the container-backed suite has finished.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Broken intra-doc links are invisible to fmt and clippy, and the module
+      # split is exactly the kind of change that breaks them.
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
+      - uses: Swatinem/rust-cache@v2
+      # Integration tests start PostgreSQL and Redpanda through testcontainers,
+      # which uses the Docker daemon preinstalled on GitHub's Ubuntu runners.
+      - run: cargo test --workspace --all-features
+
+  coverage:
+    name: coverage floor
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --all-features --fail-under-lines 80

@@ -21,8 +21,30 @@ test arg="all":
 cov-html:
     cargo llvm-cov --workspace --all-features --html --open
 
-# Format, lint, and run the full test suite.
-check:
-    cargo fmt --check
+# Fast gate: everything that does not need Docker. Run this first.
+#
+# `cargo doc` is a gate, not a build step. Splitting the crate roots into
+# modules broke seven `[`item`]` doc links that resolved while everything shared
+# one namespace, and neither fmt nor clippy has anything to say about them.
+lint:
+    cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+    cargo test --workspace --lib
+
+# Format, lint, and run the full test suite. Mirrors .github/workflows/ci.yml.
+check:
+    just lint
     just test all
+
+# Remove kafkaman testcontainers left behind by interrupted test runs.
+#
+# Normal successful tests rely on Testcontainers' Drop cleanup. This fallback is
+# intentionally label-scoped so it cannot remove unrelated Postgres or Redpanda
+# containers that happen to use the same images.
+clean-containers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ids=$(docker ps -aq --filter label=com.kafkaman.project=kafkaman \
+                       --filter label=com.kafkaman.managed-by=testcontainers)
+    if [ -n "$ids" ]; then docker rm -f $ids; else echo "nothing to clean"; fi

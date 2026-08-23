@@ -34,16 +34,16 @@
 ## Runtime Behavior Changes
 
 - Enqueue persists `entity_key` for every outbox row.
-- Compact message types with a valid idempotency identity acquire a
+- Registered entity message types with a valid idempotency identity acquire a
   transaction-scoped advisory lock keyed by schema, message type, and entity key
   before supersede decisions.
-- Under that lock, enqueue marks existing `Pending` rows for the same compact
+- Under that lock, enqueue marks existing `Pending` rows for the same
   entity as `Superseded` before inserting the new pending row.
 - Enqueue does not supersede rows that are already `Publishing`; those rows
   remain in flight.
 - Relay claiming excludes `Superseded` rows by status and also blocks a newer
   `Pending` row while another row for the same entity is still `Publishing`.
-- When a compact outbox row's Kafka partition key is not the entity key, kafkaman
+- When an outbox row's Kafka partition key is not the entity key, kafkaman
   stores the internal `kafkaman-entity-key` header in the outbox row. User-supplied
   reserved `kafkaman-*` headers remain rejected.
 
@@ -57,6 +57,10 @@
 
 ## Deferred
 
-- State-sourced `Replay::outbox` rejection for compact entity types.
-- Topic/partition mismatch invalidation path.
-- Boot-time broker topic validation from retention class to `cleanup.policy`.
+- Boot-time broker topic validation that entity topics use
+  `cleanup.policy=compact` alone.
+- A positive state-sourced republish API. `Replay::outbox` is now rejected for
+  all message types; the replacement resync surface is not implemented.
+- Broker topic-lifecycle invalidation and forced re-bootstrap hooks. A received
+  row whose cache origin differs now fails as `CacheOriginMismatch`, but kafkaman
+  does not yet detect topic recreation or repartitioning proactively.

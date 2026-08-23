@@ -14,15 +14,16 @@ JSON data but does not require table DDL changes.
 
 ## Public API Changes
 
-- `kafkaman-rdkafka` now has a `test-hooks` feature for integration tests.
-  When enabled, it exposes `IngestCommitContext`,
-  `RdkafkaConsumer::with_post_durable_write_hook`, and
-  `Error::TestHook` so tests can inject a failure after the durable receive
-  write commits but before Kafka offset commit.
-- `kafkaman-sqlx` now has a `test-hooks` feature for integration tests. When
-  enabled, it exposes `DispatchTestHooks`, `DispatchFailureHookContext`, and
-  `dispatch_once_with_hooks` so tests can pause before handler-failure savepoint
-  rollback fallback and before locked-row failure accounting is recorded.
+- This slice originally exposed `test-hooks` features from `kafkaman-rdkafka`
+  and `kafkaman-sqlx` for integration-test failure injection. As of the
+  2026-08-24 module/test separation, those production-crate feature gates are
+  renamed `internal-hooks` and the preferred test surface lives in
+  `kafkaman-test`.
+- `kafkaman-test` exposes `DispatchTestHooks`, `DispatchFailureHookContext`,
+  `dispatch_once_with_hooks`, and, behind its `redpanda` feature,
+  `RdkafkaConsumerTestExt::with_post_durable_write_hook`. Internally these wrap
+  hidden production observer APIs used to inject failures after durable receive
+  writes or around dispatch failure accounting.
 - `kafkaman_rdkafka::IngestLoopStats` is new. It aggregates completed ingest
   loop cycles, consumed/inserted/duplicate/skipped/committed counts, and
   transient retryable loop errors.

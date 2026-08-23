@@ -10,6 +10,8 @@
   - wiki/decisions/message-consumption-and-handler-model.decision.md
   - wiki/decisions/runtime-composition-and-topology.decision.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
+  - tests/durable-send/src/lib.rs
+  - justfile
 - Related:
   - wiki/decisions/consumer-test-tooling.decision.md
   - wiki/decisions/schema-and-change-management.decision.md
@@ -57,10 +59,17 @@ dev-dependency does not form an awkward cycle with `kafkaman-test` →
      and the end-to-end path — send → relay publish → topic; consume → ingest row
      → offset commit → dispatch → handler.
 
-2. **Infrastructure: `testcontainers`-rs**, with **containers started once per test
-   binary** (not per test) and **per-test logical isolation** — a unique schema +
-   a unique topic prefix — so `cargo test` parallelism is safe without N container
-   boots. The unit tier requires no Docker; integration and full-loop tiers do.
+2. **Infrastructure: `testcontainers`-rs**, with **one owned PostgreSQL container
+   per durable-send test/harness** and **per-test logical isolation** — a unique
+   schema + a unique topic prefix — so `cargo test` parallelism remains data-safe.
+   This deliberately favors correct lifecycle ownership over the faster
+   one-container-per-binary shortcut: Testcontainers stops containers through
+   `ContainerAsync`'s `Drop`, and a static `OnceCell<ContainerAsync<_>>` prevents
+   that drop from running at process exit, leaking a Postgres container per test
+   binary per run. Full-loop Redpanda tests also keep owned container handles in
+   test scope; kafkaman-specific Docker labels exist only as a manual cleanup
+   fallback for interrupted runs. The unit tier requires no Docker; integration
+   and full-loop tiers do.
 
 3. **Crash-injection gates are first-class** (carried from the PoC plan):
    crash-between-commit-and-publish (no loss), crash-after-Kafka-ack-before-mark
@@ -96,8 +105,10 @@ dev-dependency does not form an awkward cycle with `kafkaman-test` →
 - The product *is* the durability/idempotency guarantees, so the test strategy is
   organized around **proving those invariants** (crash gates + property tests),
   not around line coverage.
-- **Containers-per-session + logical isolation** is the difference between a suite
-  people run and one they disable; per-test container boots are too slow.
+- **Owned Postgres testcontainers** are slower than per-binary sharing, but they
+  preserve the lifecycle guarantee Testcontainers actually provides. A leaked
+  shared container is worse than a slower run because it accumulates across
+  sessions and eventually makes unrelated Docker-backed tests fail.
 - **Dogfooding-first** is the cheapest way to keep the public test surface honest:
   making our own suite the toolkit's primary consumer means its gaps are *our*
   problem first, not a consumer's. It also pins `kafkaman-test` as an early
@@ -108,13 +119,18 @@ dev-dependency does not form an awkward cycle with `kafkaman-test` →
 - Integration and full-loop tiers require Docker, so a subset of CI/dev
   environments can run only the unit tier; that is acceptable because the unit
   tier is Docker-free and the heavier tiers run in CI.
-- Container-per-session sharing means tests must be disciplined about isolation
-  (schema/topic prefixes) rather than assuming a pristine broker each test.
+- Per-test Postgres ownership increases suite wall clock and Docker churn versus
+  one shared container per test binary; this is accepted to keep cleanup
+  `Drop`-based and local to each test.
+- Tests still must be disciplined about logical isolation (schema/topic prefixes)
+  rather than assuming a pristine broker or database namespace.
 
 ## Revisit When
 
 - A second transport or backend appears (the full-loop tier multiplies per
   backend).
 - The retry/DLQ follow-up lands — add its terminal→DLQ and backoff-timing gates.
-- Suite wall-clock becomes a problem → consider an in-memory transport for a fast
-  full-loop tier (cross-reference the consumer-tooling transport stance and OQ2).
+- Suite wall-clock becomes a problem -> consider an explicitly owned fixture
+  pool, an in-memory transport for a fast full-loop tier, or another design that
+  preserves `ContainerAsync` drop instead of putting containers in statics
+  (cross-reference the consumer-tooling transport stance and OQ2).

@@ -3,9 +3,13 @@
 - Document Class: Proposal
 - Status: Accepted
 - Date: 2026-08-13
-- Revised: 2026-08-13 (post-review; selected option changed; accepted)
+- Revised: 2026-08-13 (post-review; selected option changed; accepted); 2026-08-14 (purview narrowed to compact entity cache only)
 - Category: Messaging model
-- Scope: Accepts collapsing kafkaman's message model so every type is an entity, using a uniform entity model with a **declared retention class** rather than entity-only-by-redefinition, because the latter removes the type-level signal that makes topic misconfiguration detectable.
+- Scope: Accepts collapsing kafkaman's message model to compact entity-cache
+  propagation only. The 2026-08-14 amendment supersedes the earlier
+  `compact`/`delete` retention-class product model: non-entity work items,
+  commands, generic jobs, emails, payments, and direct transport are outside
+  kafkaman's purview.
 - Sources:
   - raw/design/2026-08-13-offset-as-convergence-ordinal-discussion.md
 - Related:
@@ -15,7 +19,8 @@
   - wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md
   - wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
   - wiki/proposals/03-direct-transport-mode.proposal.md
-- Promotion Target: promoted as an amendment to the entity-first propagation decision. Under the selected option this is an **extension, not a revision** — see *What this does and does not reverse*.
+- Promotion Target: promoted as an amendment to the entity-first propagation
+  decision and a scope revision to the messaging-scope decision.
 
 ## Context
 
@@ -51,19 +56,50 @@ whether removing the second class removes the branching or merely hides it.
 4. **Entity-only by exclusion.** kafkaman refuses non-entity types outright:
    emails, payments, commands, analytics, and generic durable jobs are out of
    scope, and direct transport mode goes with them. The strict reading of
-   "entity-only". Rejected — see below.
+   "entity-only". **Selected by the 2026-08-14 purview amendment.**
 5. **Uniform entity model with a declared retention class.** Every type is an
    entity and shares one code path; a type additionally declares whether its key
    space is bounded (`compact`) or unbounded (`delete`), which drives topic
-   configuration, cache-table generation, and bootstrap eligibility. **Selected.**
+   configuration, cache-table generation, and bootstrap eligibility. **Selected
+   2026-08-13; superseded 2026-08-14 as a product-scope model.**
 
-Selected option: **5**. Accepted 2026-08-13 as the M5 model.
+Selected option: **4, narrowed to compact entity-cache propagation**. Accepted
+2026-08-14 as the product purview. The same-day follow-up removes the public
+`delete` compatibility surface rather than carrying it forward: kafkaman no
+longer presents delete-retention work items as a first-class message type.
 
 Options 4 and 5 did not exist in the original version of this proposal, which is
 the defect review found first: option 3 was selected against a field that
 contained no strict interpretation of the idea it claimed to implement.
 
-## Why work items fit as entities
+## 2026-08-14 Purview Amendment
+
+kafkaman's purview is now the distributed cache for domain entities:
+full-snapshot entity propagation, compacted topics, guarded cache upsert,
+per-entity outbound supersede, state-sourced republish, bootstrap/readiness, and
+soft-delete-first deletion.
+
+Messages such as "send welcome email to user 123", payment execution, commands,
+analytics events, generic jobs, and `mutation_jobs`-style durable queues are
+outside kafkaman's product surface. They may still need durable execution in an
+application, but that does not make them part of this library's scope.
+
+This deliberately reverses the 2026-08-13 option 5 selection. The earlier
+`compact` / `delete` distinction remains useful as implementation history and a
+superseded design record because M5 briefly introduced `RetentionClass::Delete`
+as a default for existing M1-M4 APIs. The same-day follow-up removes that public
+surface instead of treating it as long-term compatibility.
+
+M4's retry/backoff/DLQ machinery is not promoted as a general durable job queue
+promise under this amendment. It remains relevant only where the entity-cache
+pipeline needs failure accounting, redrive, poison handling, and operator
+visibility for entity propagation.
+
+## Historical 2026-08-13 Argument: Why Work Items Fit As Entities
+
+The following section records the superseded 2026-08-13 argument for option 5.
+It explains why work items could fit the same mechanics, but no longer controls
+kafkaman's product purview.
 
 The objection that reaches for option 1 is that a command — "send the welcome
 email" — is not an entity. Under durable execution it already is: the row *is*
@@ -82,10 +118,9 @@ unique per item, the properties fall out benignly rather than awkwardly:
   bootstrap, so a consumer that needed every transition was already outside the
   supported model.
 
-This reasoning survives review and is why options 3 and 5 both remain live where
-option 4 does not. It is a claim about *mechanism* fit, and it holds. What it
-does not establish is that no *policy* distinction remains, which is where
-option 3 fails.
+This reasoning survived review as a claim about *mechanism* fit. The 2026-08-14
+amendment accepts a different product boundary: mechanism fit is not enough to
+keep work items inside kafkaman's purview.
 
 ## Why option 3 fails: it removes the signal, not the duality
 
@@ -125,40 +160,29 @@ The result is the same two configurations with the misconfiguration made
 Option 3 is therefore strictly worse than entity-first on this axis while being
 no better on any other. It is the weakest position in the set.
 
-## Why option 4 is not selected
+## Why Option 4 Is Now Selected
 
-Hard exclusion is product-clean and internally consistent, and it is the honest
-strict reading of "entity-only". It is rejected because it argues against the
-evidence base the project's scope decision rests on, not merely against the
-decision.
+Hard exclusion is the clean reading of "entity-only" and is now accepted. The
+library identity is not "a durable execution engine that happens to support
+entity propagation"; it is "a distributed cache for compacted domain entities."
 
-`messaging-scope-and-receive-model.decision.md` rejected propagation-only as
-Option B: *"too narrow — leaves the handler/retry/durable engine (the most
-valuable, currently hand-rolled part) outside the library."* That was not a
-preference. It rests on the reference project's production history: what
-RepForge **dropped** was the Kafka command transport (`commands_inbox`), and what
-it **kept and built out** was `mutation_jobs` — a durable job queue with a status
-machine, `attempt_count`, `next_attempt_at`, and `FOR UPDATE SKIP LOCKED`
-claiming. Hard exclusion puts the one artifact the evidence proved was needed
-back outside kafkaman.
+The cost is real and accepted. The reference project's `mutation_jobs` evidence
+still shows that applications may need durable work queues. The revised judgment
+is that those queues are adjacent application infrastructure, not kafkaman's
+public product surface. kafkaman should avoid becoming the general answer for
+"run this work later with retries" because that expands the library away from
+cache coherence.
 
-Two further costs, which should be priced rather than left implicit:
+This also means the earlier M4 value argument changes. Retry, backoff, DLQ,
+poison classification, and error history remain useful to operate the
+entity-cache pipeline, but they no longer justify exposing non-entity message
+types, commands, jobs, or direct transport as first-class kafkaman features.
 
-- **It exports the branching rather than eliminating it.** The adopter runs
-  kafkaman for entities plus a second, hand-rolled durable job mechanism — which
-  is the thing kafkaman exists to stop. The complexity moves into the adopter's
-  architecture, where it is larger and less visible than a declared field.
-- **It guts M4.** Retry, backoff, DLQ, poison classification, and bounded error
-  history are work-item machinery. A pure cache barely needs them: proposal 09
-  already notes a stale entity message simply loses the guard and parks in the
-  DLQ without freezing its entity. M4 is a shipped milestone; excluding work
-  items strands most of its value.
+## Historical 2026-08-13 Model: The Declared Retention Class
 
-Option 4 should only be selected as a deliberate rejection of the `mutation_jobs`
-evidence, with M4's scope reconsidered in the same breath. It is recorded here so
-that choice is available and costed, not so it is quietly unavailable.
-
-## The declared retention class
+This section records the superseded option 5 model. It is not the current
+product-scope decision, but it explains why `RetentionClass` briefly existed
+before the 2026-08-14 removal pass.
 
 A type declares one field: whether its entity key space is **bounded** or
 **unbounded**. Everything policy-level follows from it.
@@ -170,9 +194,9 @@ A type declares one field: whether its entity key space is **bounded** or
 | Bootstrap by replay | supported (proposal 10) | not offered |
 | Convergence guard | meaningful | present, no-op by construction |
 
-This is what closes proposal 09's open question 3. A non-propagating type does
-not opt out of a class; it declares `delete` and is charged for nothing it does
-not use.
+In the superseded 2026-08-13 model, this closed proposal 09's open question 3.
+A non-propagating type did not opt out of a class; it declared `delete` and was
+charged for nothing it did not use.
 
 ### It restores the boot check proposal 11 already wants
 
@@ -191,7 +215,8 @@ localized, not eliminated.
 
 ### The default makes this non-breaking
 
-Default `entity_key` to `message_id` and the retention class to `delete`.
+The superseded option defaulted `entity_key` to `message_id` and the retention
+class to `delete`.
 
 A work item's "unique key per item" is then not something adopters invent — it is
 the physical record identity every message already carries. Every M1-M4 type
@@ -199,157 +224,114 @@ compiles and behaves exactly as it does today: no cache table, no compaction, a
 convergence guard that is structurally incapable of rejecting anything. Declaring
 a real entity key and `compact` is what opts a type *into* cache semantics.
 
-This is the sharpest practical difference from options 3 and 4, both of which
-require `entity_key` on every type and therefore break the general send/receive
-surface shipped in M1-M4. It closes open questions 3 and 4 of the original
-version of this proposal.
+This was the sharpest practical difference from options 3 and 4, both of which
+would have required `entity_key` on every type and therefore broken the general
+send/receive surface shipped in M1-M4. It closed open questions 3 and 4 of the
+original version of this proposal.
 
-## What collapses
+## What Collapses After The Purview Amendment
 
-Stated as an accounting rather than a claim, because earlier versions of this
-proposal overstated it twice.
+The current model removes the work-item branch instead of reclassifying it.
+Within kafkaman's purview there is one kind of message: a compact entity
+snapshot that feeds a cache.
 
-**Unified** — forked under entity-first, not forked here:
+Collapsed:
 
-- **`entity_key` presence.** Universal and defaulted, so one envelope and one
-  wire shape rather than two.
-- **The convergence guard.** Universal code, a no-op by construction for `delete`
-  types, so the dispatch path carries no class branch.
-- **Restore policy.** Every type has a successor state to republish, so
-  proposal 11's "non-snapshot message types make this a per-type property" and
-  its dropped-row audit requirement both disappear — **contingent on the resync
-  sweep**, which is load-bearing and qualified below.
+- **No public `delete` class.** Delete-by-age work-item topics are outside the
+  library purview, so topic validation has one in-scope target:
+  `cleanup.policy=compact` alone for entity topics.
+- **No cache eligibility fork.** In-scope types have cache tables and bootstrap
+  semantics; out-of-scope work queues do not.
+- **No work-item restore story.** kafkaman's state-sourced republish and resync
+  sweep are about current entity state only. Durable job recovery remains an
+  application concern.
+- **No direct transport exception.** Direct transport has no outbox and therefore
+  cannot provide the key-level outbound serialization required for compact
+  entity cache correctness. It stays outside purview.
 
-**Still forked**, now driven by one declared field rather than an implicit class:
+The earlier 2026-08-13 claim was a halved, declared, and boot-validatable
+duality. The 2026-08-14 amendment is stricter: kafkaman does not carry that
+duality as a product model.
 
-- **Topic `cleanup.policy`.** Genuinely a policy consequence.
-- **Cache-table generation.** *Structural* — a changeset and per-type DDL, or
-  none.
-- **Bootstrap eligibility.** *Structural* — a runtime mode offered or withheld.
+## Conflicts This Resolves Or Moves Out
 
-Three of six forks are removed, one of those conditionally. An earlier bullet
-here claimed "one table shape, one guard, one upsert"; that **contradicted this
-proposal's own retention-class table two sections above** and is withdrawn.
-`compact` and `delete` types do not share a storage shape.
+Proposal 11's `kafkaman_cache` rebuild directive becomes clean again:
+`kafkaman_cache` exists only for compact entity topics, and replay is
+authoritative for that class.
 
-The honest claim is a **halved, declared, and boot-validatable** duality. Two of
-the three survivors change generated storage and runtime behavior, not merely
-configuration, so "the remainder is only policy" is not available as a defense.
+The resync sweep dependency also narrows. kafkaman still needs a state-sourced
+resync surface for compact entities, but it no longer needs a generic
+"non-terminal work item" sweep. That work-item recovery problem is real, but it
+belongs to whichever application-specific durable job queue owns the status
+machine.
 
-Proposal 09 open question 3 is answered rather than dissolved: a type declares
-`delete` instead of opting out of a class.
+This amendment creates one documentation debt instead of the old policy fork:
+older M1-M4 pages and current compatibility notes describe durable execution
+surfaces that existed before the purview was narrowed. Those pages need either
+compatibility framing or later spec consolidation so they do not read as a v1
+product promise for non-entity work.
 
-The test matrix loses the snapshot-versus-event axis of the regression gates,
-though it gains retention-class validation cases.
+## What This Reverses
 
-## Conflicts this surfaces in proposal 11
+This amendment **does** reverse the messaging-scope decision's rejection of
+propagation-only scope. The earlier statement that "nothing is removed" is no
+longer true.
 
-Two, neither currently recorded there, both live under any option that keeps
-work items:
+What remains inside kafkaman:
 
-1. **`kafkaman_cache`'s directive stops being universally true.** Proposal 11's
-   schema table marks the cache schema *"rebuild — restore for speed only;
-   replay is authoritative."* Replay is authoritative only for a compacted topic.
-   For a `delete`-retention type the log has holes by design, so a cache rebuilt
-   by replay is not equivalent to a restored one. The selected option makes this
-   expressible rather than silently false: a `delete` type has no cache table and
-   no bootstrap offer, so the directive holds for every type that has a cache at
-   all. Proposal 11 should say so explicitly.
-2. **Self-healing depends on a resync sweep that is not yet load-bearing.**
-   "The outbox is dropped and the next write supersedes it" recovers a lost row
-   only if something re-reads current state and re-enqueues it. Proposal 11
-   describes that sweep under business-data restore, but the collapse claimed
-   above depends on it existing and on its being able to identify **non-terminal
-   work items**, not just current entity state. Without it, a dropped work-item
-   outbox row is still permanently lost — exactly the case the collapse claims to
-   remove. The sweep is a prerequisite of this proposal, not an adjacent concern.
+- compact entity snapshot propagation;
+- durable outbox/inbox mechanics needed to publish and consume those entity
+  snapshots reliably;
+- retry/backoff/DLQ as operational support for that entity-cache pipeline;
+- state-sourced republish, bootstrap/readiness, topic-lifecycle invalidation,
+  and soft-delete-first deletion.
 
-   **And the sweep cannot be generic for work items.** For a `compact` entity
-   type kafkaman owns the cache table and can enumerate it, so the sweep is
-   library code. For a `delete` work-item type, "non-terminal" is a predicate over
-   the application's own status machine in the application's own table, which
-   kafkaman cannot know. The best available shape is a per-type hook the adopter
-   implements.
+What moves outside kafkaman:
 
-   That makes the unification **policy-level, not mechanism-level**: kafkaman no
-   longer branches, but an adopter who wants work-item recovery writes per-type
-   sweep code. This is the same kind of cost charged against option 4 above —
-   exported complexity — and consistency requires naming it here rather than only
-   there. It is much smaller (a sweep hook, not a hand-rolled durable job queue),
-   and it does not change the selection, but it is not zero and it should not be
-   discovered during a restore.
+- commands-over-Kafka and direct transport;
+- emails, payments, analytics events, generic jobs, and durable work queues;
+- `mutation_jobs`-style application mutation dispatch.
 
-   The retention class still predicts which shape applies, so the declaration
-   remains the single control point even where the work is the adopter's.
-
-## What this does and does not reverse
-
-Under the selected option, **nothing is removed**, so
-`entity-first-propagation-model.decision.md` point 1 — *"this does not reopen the
-messaging-scope decision's refutation of propagation-only as a library scope;
-nothing is removed"* — still stands. The general durable-execution surface is
-intact, work items remain first-class, and M4 keeps its purpose. This promotes as
-an **amendment** to the entity-first decision.
-
-That is a substantive difference from options 3 and 4, both of which do reverse
-it and would need an explicit revision of the messaging-scope decision. It is
-also why the selected option can land without a breaking-change compatibility
-note, where the others cannot.
-
-Direct transport mode (proposal 03) still needs re-examination: it has no outbox,
-so the `(message_type, entity_key)` enqueue lock cannot serialize it. Under the
-selected option this is narrower than it was - a direct-mode type defaults to
-`delete` with a no-op guard, so only a direct-mode type declaring `compact` is
-affected. A direct-mode `compact` type should be rejected unless it supplies an
-equivalent key-level outbound serialization mechanism.
+This is a breaking product-scope and pre-v1 API revision; the same-day
+implementation removes the public retention-class compatibility surface.
 
 ## Consequences
 
 Positive:
 
-- Per-type branching disappears from the envelope, the wire shape, the dispatch
-  path, and restore policy, and every fork that survives is driven by one
-  declared field rather than an implicit class.
-- Topic misconfiguration becomes **boot-detectable**, feeding validation
-  proposal 11 already proposed but could not supply an input for.
-- Non-breaking against M1-M4 by defaulting `entity_key` to `message_id` and the
-  retention class to `delete`.
-- The library's identity sharpens toward a distributed cache library without
-  discarding the durable-execution engine that the scope evidence validates.
+- The library's identity is clear: distributed cache coherence for compact
+  domain entities.
+- Topic validation becomes simpler for the public model: in-scope entity topics
+  must be compacted and must not use delete-by-age.
+- Bootstrap/readiness, state-sourced republish, and cache-table generation all
+  target the same bounded-key entity model.
+- The implementation can shed or hide general durable-job promises rather than
+  carrying them as a second product.
 
 Costs and risks:
 
-- The retention class is an unverifiable claim about key cardinality; a wrong
-  declaration still produces unbounded growth, now visibly rather than silently.
-- A declared field is still a duality. This proposal reduces and localizes it; it
-  does not deliver the single-class model its title suggests. **Two of the three
-  surviving forks — cache-table generation and bootstrap eligibility — are
-  structural, changing generated DDL and runtime behavior rather than only
-  configuration.**
-- The self-healing collapse is contingent on a resync sweep that does not exist
-  yet, must identify non-terminal work items, and **cannot be generic for
-  work-item types**, so it becomes a per-type adopter obligation. The unification
-  is policy-level, not mechanism-level.
-- Universal `entity_key`, even defaulted, means every type carries convergence
-  columns it may never use.
+- Applications that need durable jobs still need another mechanism. That is an
+  explicit scope tradeoff, not a hidden non-goal.
+- Older M1-M4 documentation still exposes broader durable-execution surface than
+  the new purview. Spec consolidation remains follow-up documentation work.
+- M4 is narrower than originally framed: failure handling remains important, but
+  only as cache-pipeline support.
+- Removing `RetentionClass` and the default `entity_key = message_id` is a
+  breaking pre-v1 API change, but it matches the entity-only model.
 
 ## Implementation Open Questions
 
-1. Is the retention class declared on the message type in Rust, in
-   `kafkaman.toml`, or both? The type is where it is visible in review; the
-   config is where the M2 fail-fast idiom already lives. Both has precedent in
-   the per-message retry policy.
-2. Does a `delete`-retention type ever need a cache table? The selected option
-   says no. If a use case appears that wants local storage of unbounded-key work
-   items, that is Postgres growth with no compaction backstop and should be
-   refused rather than accommodated.
-3. Should the boot check hard-fail or warn when the broker does not expose topic
-   configuration? Proposal 11 notes the check degrades to documentation under
-   restrictive ACLs; failing closed there would make kafkaman unbootable on
-   locked-down clusters.
-4. ~~What is the migration story for a deployed non-entity type?~~ **Resolved
-   2026-08-13.** Defaulting `entity_key` to `message_id` and the class to
-   `delete` makes existing types compile and behave unchanged.
-5. ~~Does `entity_key` become a required part of `KafkaMessage` itself?~~
-   **Resolved 2026-08-13.** It becomes universal but defaulted, so no type is
-   forced to supply one.
+1. ~~Should `RetentionClass::Delete` be removed from public API, kept only as a
+   deprecated compatibility path, or hidden behind an internal/legacy feature?~~
+   **Resolved 2026-08-14.** Remove `RetentionClass`,
+   `KafkaMessage::retention_class`, and `MessageDescriptor.retention_class`
+   entirely.
+2. Which M1-M4 APIs and specs remain valid as entity-cache plumbing, and which
+   ones need deprecation because they advertise generic durable jobs?
+3. Should boot validation now reject every in-purview topic that is not
+   `cleanup.policy=compact` alone, and how should it behave when broker topic
+   configuration is unavailable?
+4. Should `Replay::outbox` be rejected for all in-purview kafkaman message types,
+   with only state-sourced republish exposed?
+5. What migration guidance do adopters get if they were using kafkaman as a
+   generic durable job queue before v1 scope narrowed?

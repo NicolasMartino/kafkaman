@@ -14,6 +14,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nicolasmartino/kafkaman"
 
@@ -21,9 +22,11 @@ repository = "https://github.com/nicolasmartino/kafkaman"
 async-trait = "0.1"
 axum = "0.8"
 rdkafka = { version = "0.36", features = ["tokio"] }
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+testcontainers = "0.27.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "json"] }
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
@@ -31,4 +34,28 @@ toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+# Enforced by `just check` and CI. These are the lints that catch the classes of
+# bug this codebase actually hit: silently discarded Results, panics on a library
+# path, and undocumented public surface on a crate that maintains compatibility
+# notes.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Panicking paths: a library must return errors, not abort the caller's process.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+# Correctness and clarity.
+todo = "deny"
+dbg_macro = "deny"
+await_holding_lock = "deny"
+inefficient_to_string = "warn"
+redundant_clone = "warn"

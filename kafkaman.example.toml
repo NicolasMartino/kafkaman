@@ -3,11 +3,16 @@
 # Copy to kafkaman.toml at deploy time after CI/CD has rendered environment
 # specific secrets. The running process reads one already-resolved file; there
 # are no profiles, overlays, or environment-name sections.
+#
+# Every knob kafkaman reads is listed here. Sections are marked REQUIRED or
+# OPTIONAL; an unknown key inside a kafkaman-owned section is a hard error, not a
+# warning, so a typo fails at boot rather than silently taking a default.
+#
+# Durations are `<integer><unit>` with unit one of: ms, s, m, h, d.
 
+# REQUIRED.
 [database]
-# `schema` is the only key in this section that kafkaman's M2 config contract
-# reads; it owns the migration/table namespace.
-schema = "kafkaman"
+schema = "kafkaman"                 # Postgres schema owning kafkaman's tables, migration history, and advisory lock. Must be a valid lowercase SQL identifier.
 #
 # `url` is host-owned sample context, NOT consumed by kafkaman. The example app
 # (apps/axum-outbox) reads its Postgres connection string from the DATABASE_URL
@@ -16,29 +21,52 @@ schema = "kafkaman"
 
 # `[kafka].brokers` is likewise host-owned: the example app reads KAFKA_BROKERS
 # from the environment. Kept here only to document the expected shape; it is not
-# part of kafkaman's M2 config contract and is ignored if set.
+# part of kafkaman's config contract and is ignored if set.
 # [kafka]
 # brokers = "localhost:9092"
 
+# REQUIRED. Drives the outbox relay: how it claims rows, how long it owns them,
+# and how fast it polls. Every key below is mandatory — there are no defaults.
 [relay]
-worker_id = "orders-relay-1"
-batch_limit = 100
-lease_for = "30s"
-retry_after = "1s"
-poll_interval = "250ms"
+worker_id = "orders-relay-1"        # Identity written to `claimed_by`. Make it unique per process so an operator can tell which worker holds a lease.
+batch_limit = 100                   # Rows claimed per cycle. Must be > 0. Bounds how much one relay cycle publishes before marking results.
+lease_for = "30s"                   # How long a claim is owned before another worker may steal it. Must be > 0. Set above your worst-case publish latency, or a slow publish gets its row reclaimed and published twice.
+retry_after = "1s"                  # Delay before retrying a row whose publish failed. May be 0, meaning retry on the next cycle.
+poll_interval = "250ms"             # Sleep between cycles when there is nothing to claim. Must be > 0; zero would spin against the database.
 
+# OPTIONAL. Governs *receive-side* dispatch retries and the DLQ. Omit the whole
+# section to accept the defaults shown in each comment.
 [retry.defaults]
-max_attempts = 5
-initial_backoff = "500ms"
-max_backoff = "30s"
-multiplier = 2.0
-errors_limit = 16
-dlq = "table"
+max_attempts = 5                    # Dispatch attempts before a row goes terminal `Failed`. Must be >= 1. Default 10.
+initial_backoff = "500ms"           # Delay before the first retry. Must be > 0 — a zero backoff makes a permanently failing row spin against the database. Default 1s.
+max_backoff = "30s"                 # Ceiling on the exponential delay. Must be >= initial_backoff. Default 300s.
+multiplier = 2.0                    # Growth factor per attempt. Must be finite and >= 1.0. Actual delays carry equal jitter, landing in [delay/2, delay], so a shared outage does not retry the whole backlog in lockstep. Default 2.0.
+errors_limit = 16                   # Failures retained per row in the `errors` audit trail. Oldest are dropped past this. Must be >= 1. Default 20.
+dlq = "table"                       # Where exhausted rows land. Only "table" is supported: the row stays put with status `Failed`, inspectable via `received_failed_rows`. Default "table".
 
+# OPTIONAL, repeatable. Per-message-type overrides, merged over `[retry.defaults]`.
+# Every key is optional — omit one to inherit. The message type must be registered
+# with `ResolvedConfig`, or boot fails; this catches a renamed type whose retry
+# policy would otherwise be silently ignored.
 [retry.messages.order_created]
-max_attempts = 8
-initial_backoff = "250ms"
-max_backoff = "60s"
-multiplier = 1.5
-errors_limit = 32
-dlq = "table"
+max_attempts = 8                    # Overrides retry.defaults.max_attempts for this type only.
+initial_backoff = "250ms"           # Overrides retry.defaults.initial_backoff for this type only.
+max_backoff = "60s"                 # Overrides retry.defaults.max_backoff for this type only.
+multiplier = 1.5                    # Overrides retry.defaults.multiplier for this type only.
+errors_limit = 32                   # Overrides retry.defaults.errors_limit for this type only.
+dlq = "table"                       # Overrides retry.defaults.dlq for this type only.
+
+# OPTIONAL. Reclaims terminal outbox rows. Omit the section and nothing is ever
+# deleted — the outbox grows for the life of the application, which is the
+# historical behaviour. Present config alone does nothing either: you must also
+# run `kafkaman_worker::run_purger`.
+#
+# Scope is the outbox alone, and deliberately so. Received tables are the only
+# durable record of what was done, and their dedupe window *is* their retention
+# window — purging a processed row lets a Kafka redelivery re-run the handler.
+# Cache tables are the state. See wiki/decisions/outbox-retention-policy.decision.md.
+[retention]
+outbox_after = "7d"                 # Age past which a terminal outbox row is reclaimable, measured from `created_at` against the database clock. Must be > 0; zero would delete rows the instant they publish, destroying the record while an incident is still being diagnosed. Default 7d.
+batch_size = 1000                   # Rows deleted per batch. Must be > 0. Bounds how long one delete holds locks and how much write-ahead log it generates; unbounded deletes over a large outbox are the outage retention exists to prevent. Default 1000.
+poll_interval = "60s"               # Sleep between sweeps once a batch comes back empty. Must be > 0. Sweeps run back-to-back while batches are full, so a backlog drains at full speed. Default 60s.
+include_failed = false              # Whether to reclaim `Failed` rows too. Default false: they are the invalid-send audit trail, and unlike every other terminal row nothing else records that the work was rejected.

@@ -13,12 +13,16 @@ redpanda = ["dep:kafkaman-rdkafka"]
 async-trait.workspace = true
 kafkaman-config = { path = "../kafkaman-config" }
 kafkaman-core = { path = "../kafkaman-core" }
-kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true }
-kafkaman-sqlx = { path = "../kafkaman-sqlx" }
+kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true, features = ["internal-hooks"] }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", features = ["internal-hooks"] }
 kafkaman-worker = { path = "../kafkaman-worker" }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
+
+[lints]
+workspace = true

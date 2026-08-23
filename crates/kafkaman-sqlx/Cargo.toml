@@ -6,15 +6,25 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-test-hooks = []
+internal-hooks = []
 
 [dependencies]
 kafkaman-config = { path = "../kafkaman-config" }
 kafkaman-core = { path = "../kafkaman-core" }
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 time.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# The pool-size guard in `migrate` is checked before anything connects, so it is
+# a unit test rather than an integration one — but `migrate` is still async.
+tokio = { workspace = true }
+
+[lints]
+workspace = true

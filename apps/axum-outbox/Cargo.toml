@@ -7,16 +7,22 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
-kafkaman = { path = "../../crates/kafkaman" }
-kafkaman-rdkafka = { path = "../../crates/kafkaman-rdkafka" }
+# One kafkaman dependency, not two: the transport comes through the facade.
+kafkaman = { path = "../../crates/kafkaman", features = ["rdkafka"] }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-testcontainers = "0.27.3"
+# The PostgreSQL testcontainer helper, shared rather than copied: this file
+# used to restate it, labels and all.
+durable-send-tests = { path = "../../tests/durable-send" }
 tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

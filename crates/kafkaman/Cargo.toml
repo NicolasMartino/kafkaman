@@ -5,8 +5,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Links librdkafka; opt in when the application publishes or consumes.
+rdkafka = ["dep:kafkaman-rdkafka"]
+
 [dependencies]
 kafkaman-config = { path = "../kafkaman-config" }
 kafkaman-core = { path = "../kafkaman-core" }
+kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true }
 kafkaman-sqlx = { path = "../kafkaman-sqlx" }
 kafkaman-worker = { path = "../kafkaman-worker" }
+
+[lints]
+workspace = true

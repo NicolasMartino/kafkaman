@@ -10,3 +10,6 @@ kafkaman-core = { path = "../kafkaman-core" }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+
+[lints]
+workspace = true

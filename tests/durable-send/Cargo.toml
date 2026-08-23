@@ -11,14 +11,13 @@ repository.workspace = true
 redpanda = [
     "kafkaman-test/redpanda",
     "dep:kafkaman-rdkafka",
-    "kafkaman-rdkafka/test-hooks",
     "dep:rdkafka",
 ]
 
 [dependencies]
 kafkaman-config = { path = "../../crates/kafkaman-config" }
 kafkaman-core = { path = "../../crates/kafkaman-core" }
-kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx", features = ["test-hooks"] }
+kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
 kafkaman-rdkafka = { path = "../../crates/kafkaman-rdkafka", optional = true }
 kafkaman-test = { path = "../../crates/kafkaman-test" }
 kafkaman-worker = { path = "../../crates/kafkaman-worker" }
@@ -29,8 +28,13 @@ time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+# A dependency rather than a dev-dependency: `src/lib.rs` owns the shared
+# container that every integration test in this package reuses.
+testcontainers.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 serde_json.workspace = true
-testcontainers = "0.27.3"
+
+[lints]
+workspace = true

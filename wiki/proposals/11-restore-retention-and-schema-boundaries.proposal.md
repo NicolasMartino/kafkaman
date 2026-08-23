@@ -206,6 +206,50 @@ a cached user costs nothing to replay — and guarding everything would be the
 over-abstraction this project consistently resists. Layer 3 belongs precisely
 where a double-fire is irreversible and expensive.
 
+### Operational growth of kafkaman's own tables
+
+**Added 2026-08-24.** Open Question 1 names storage growth of the *topic's* key
+space. The equivalent problem in Postgres was never named, and is worse because it
+has no compaction analogue: **nothing purges any kafkaman table.** There is no
+`DELETE` anywhere in `crates/` or `apps/`, so `Published` outbox rows, `Processed`
+received rows, and quarantine rows all accumulate for the life of the application.
+
+The three-way split above already determines the answer per table, which is the
+point worth recording — this needs no new policy, only the existing directive
+applied continuously rather than only at recovery:
+
+| Schema | Verb | Retention consequence |
+|---|---|---|
+| `kafkaman_outbound` | drop | Safe to purge. The outbox is already excluded from the backup set and rebuilt empty on recovery, so nothing is permitted to depend on a historical row. `Replay::outbox` is now rejected as unsafe, so no read path over old rows exists at all. |
+| `kafkaman_inbound` | protect | **Do not purge.** It is the only durable record of *what was done*. Purging `Processed` rows additionally shrinks the ingest dedupe window — the unique `idempotency_key` index is what makes redelivery a no-op — so a purge shorter than the redelivery window silently re-runs handlers. |
+| `kafkaman_cache` | rebuild | **Do not purge.** It *is* the state. Reclaiming soft-deleted rows is Open Question 2 and gates on proposal 10's `cache_state`, not on a retention window. |
+
+Only the outbox is in scope, and its scope is inherited from the verb rather than
+argued fresh. `Failed` outbox rows are the invalid-send audit trail from the
+error-row-symmetry decision and are the one class within `kafkaman_outbound` that
+retention should keep by default.
+
+### Index-adding changesets block writes
+
+**Added 2026-08-24.** `run_migrations` applies each changeset inside a transaction
+(`conn.begin()` per changeset), and `CREATE INDEX CONCURRENTLY` cannot run in a
+transaction block. Every index kafkaman's schema builds therefore takes a `SHARE`
+lock and blocks writes for the duration of the build.
+
+On a small table that is milliseconds. On a table that has grown without bound —
+which is the state the previous section describes as the default — it is a write
+outage, and because `enqueue` runs *inside the caller's business transaction* the
+outage propagates into application requests rather than staying inside kafkaman.
+
+This is an invariant of exactly the kind this proposal exists to name: the
+migration engine's correctness is unaffected, but its *operational* safety silently
+depends on tables being small, which nothing currently ensures. Two consequences:
+
+- Retention is close to a prerequisite for adding any index to an existing
+  deployment's outbox, so the two changes are ordered, not independent.
+- Any compatibility note introducing an index should say so, because the adopter
+  cannot infer it from the changeset.
+
 ## Consequences
 
 Positive:

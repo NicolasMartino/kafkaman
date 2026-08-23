@@ -1,5 +1,556 @@
 # Wiki Log
 
+## [2026-08-25] update | external review follow-ups
+
+Five findings from an independent review of the staged refactor, all confirmed
+against the code and all fixed. Two were introduced by this branch.
+
+`RecordHeaders` resolved duplicate Kafka header keys with `or_insert` for both
+namespaces. That matches `main` for reserved headers but inverts it for user
+headers, which `main` stored with `BTreeMap::insert` — last wins. A producer
+sending a repeated header key would have had a different value persisted than
+before the branch. User headers are back to last-wins, and both directions are
+now pinned by a test that was verified to fail against the regression.
+
+`kafkaman_worker::run` checked for shutdown only after a cycle, so a relay handed
+an already-cancelled token still claimed and published one batch;
+`run_dispatcher` and `run_purger` both guard at the top of the loop. Added the
+guard and a test that runs the loop against a pre-cancelled token.
+
+`apps/axum-outbox` still declared a `testcontainers` dev-dependency that nothing
+referenced once the container helpers moved into `durable-send-tests`.
+`kafkaman_rdkafka::Error::TestHook` was the last test vocabulary in a production
+error surface and is now `Observer`. And `Harness::ensure_message` hand-rolled a
+duplicate check and then called the infallible `with_message`, silently keeping
+the first topic when a test registered one message type under two — the exact
+conflict `ResolvedConfig::try_with_message` exists to reject; it uses the
+fallible path now.
+
+Tests 170 → 172. Pages affected: `crates/kafkaman-rdkafka/src/ingest_record.rs`,
+`crates/kafkaman-rdkafka/src/error.rs`, `crates/kafkaman-rdkafka/src/tests.rs`,
+`crates/kafkaman-worker/src/relay.rs`, `crates/kafkaman-test/src/harness.rs`,
+`apps/axum-outbox/Cargo.toml`,
+`tests/durable-send/tests/durable_send/relay_and_publish.rs`,
+`tests/durable-send/tests/redpanda_full_loop/ingest_dedup.rs`,
+`wiki/compatibility/module-test-separation-internal-hooks.compat.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-25] update | doc-link gate and generated enum lists
+
+Second review pass over the module refactor, fixing what the first one missed.
+
+Splitting the crate roots into modules broke seven `[`item`]` doc links that had
+resolved while everything shared one namespace. `fmt` and `clippy` say nothing
+about those, so this is the `rustfmt` hole again in a different gate: `just lint`
+and the CI lint job now run `cargo doc --workspace --all-features --no-deps`
+under `RUSTDOCFLAGS=-D warnings`. Verified the gate bites by reintroducing a
+broken link (exit 101) before repairing all seven.
+
+`ReceivedFailureKind` and `ReceivedIngestFailureKind` still carried hand-written
+`ALL: [Self; N]` arrays with hardcoded lengths — the exact hazard `sql_enum!`
+was written to remove for `OutboxStatus` and `ReceiveStatus` in the sibling file.
+Every other accessor on them is a compiler-checked `match`, but `ALL` is what
+`from_discriminant` searches, so a missed variant surfaced as a stored row that
+no longer read back. Both now come from `discriminant_enum!`, sharing one
+`count_idents!` with `sql_enum!` in `kafkaman-core`'s private `enum_macros`.
+`ALL`'s type and length are unchanged.
+
+`migrate` needs two pooled connections since the advisory-lock fix and now says
+so before blocking: a single-connection pool returns `MigrationPoolTooSmall`
+rather than a pool timeout that names nothing. Also collapsed the sqlx hook
+plumbing — two identical type aliases and four near-identical runners became one
+alias, one `DispatchHookSlot`, and one runner — and replaced the last
+`use super::` in production code.
+
+Pages affected: `crates/kafkaman-core/src/enum_macros.rs`,
+`crates/kafkaman-core/src/failure_kind.rs`, `crates/kafkaman-core/src/status.rs`,
+`crates/kafkaman-sqlx/src/hooks.rs`,
+`crates/kafkaman-sqlx/src/migration_runner.rs`,
+`crates/kafkaman-sqlx/src/tests/migration_runner.rs`, `justfile`,
+`.github/workflows/ci.yml`,
+`wiki/compatibility/module-test-separation-internal-hooks.compat.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-25] update | module refactor completion and migration lock fix
+
+Completed the module separation started on 2026-08-24, and fixed one latent bug
+it surfaced.
+
+`migrate` took a session-scoped `pg_advisory_lock` on a pooled connection. A
+dropped future skipped the unlock and returned the connection to the pool still
+holding it, leaving the schema permanently unmigratable. Both entry points now
+use `pg_advisory_xact_lock` inside a transaction, which a queued rollback
+releases on cancellation. Lock keys are unchanged, so a rolling deploy still
+serializes against an old binary.
+
+`use super::*` was removed from all 49 production module files, so each module
+declares what it depends on and the crate roots hold only a module graph and a
+named public surface. Grab-bag files were split along the seams their names
+admitted: `config_tables_router.rs` into four, `error_identifier_message.rs`
+into three, `outbox_relay.rs` (which holds no relay) into three.
+`kafkaman-worker` and `kafkaman-test` got the same treatment.
+
+Duplication was removed rather than relocated: eight changesets now come from one
+`descriptor_changeset!` macro; the four pool/transaction twins in
+`dispatch_rows.rs` became two functions over `&mut PgConnection`; the test
+suite's 79 repetitions of the Postgres-and-harness prologue became
+`start_harness()`. `RetryPolicyOverride::apply_to` is a struct literal, so a new
+field is a compile error rather than a silently ignored override.
+
+Also fixed: a TOCTOU race in the Redpanda port picker (now retried), a dead
+`#[allow]` in `config/schema.rs`, two `\n`-escaped SQL one-liners, and a
+`create_order` double clone. Tests went 141 to 169 with no test lost; the largest
+Rust file is 342 lines, from 650.
+
+Pages affected:
+- wiki/compatibility/module-test-separation-internal-hooks.compat.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-24] update | module and test separation refactor
+
+Split large production crate roots into focused modules and split the large
+integration tests into named test modules. Moved consumer-facing test-hook
+ergonomics to `kafkaman-test`, leaving production crates with hidden
+`internal-hooks` observer gates only. No schema or runtime behavior changes.
+
+The fragments are declared with `mod` and re-exported from each crate root with
+`pub use`, so public paths are unchanged. An interim `include!`-based split was
+replaced because `rustfmt` only walks module declarations: it left 9,083 of the
+repo's 15,386 Rust lines outside the `cargo fmt --all -- --check` gate that CI
+runs, while CI still reported success. Cross-module uses that the compiler
+flagged were narrowed to `pub(crate)` rather than made public, and
+`kafkaman-sqlx`'s `dispatch.rs` was further split into `dispatch`,
+`dispatch_cache`, `dispatch_failure`, and `dispatch_rows`. The four integration
+tests are now `tests/<name>/main.rs` targets with sibling case modules. Largest
+remaining Rust file: 594 lines, down from 4,382.
+
+Pages affected:
+- wiki/compatibility/module-test-separation-internal-hooks.compat.md (new)
+- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-24] create | topic convergence, rebuild over repartitioning
+
+Redpanda Console, added to the example stack that day, showed both entity topics
+running with `cleanup.policy=delete` — so the example could not support the
+rebuild the entity-first model promises, and nothing reported it. The gap was
+already recorded under **Deferred** in the two M5 compatibility notes and as
+"Boot-time broker topic validation remains pending" in the entity-first plan;
+what was new was evidence that it is load-bearing rather than theoretical. There
+is no `AdminClient`, `describe_configs`, or `cleanup.policy` reference anywhere
+in `crates/`.
+
+Accepted proposal 13 and promoted it to a decision. A topic's required
+configuration moves onto `MessageDescriptor`, defaulted to `cleanup.policy=compact`
+alone by the model rather than declared per contract — proposal 12 already
+settled that every in-purview type is a compact entity snapshot, so
+`examples/contracts` does not change. Convergence happens at boot beside
+`migrate()`: `verify` by default, `create` opt-in because ACLs routinely deny
+`CreateTopics`, `off` as an escape hatch that warns.
+
+The larger decision is that **repartitioning is never performed**. Because every
+message is a full snapshot sourced from the owner's state, the log is a derived
+artifact rather than the system of record, so a topic is rebuilt by republishing
+every entity at a cost bounded by entity count, not event count. That turns
+partition count from an irreversible choice into a recoverable one. It also
+resolves a second Deferred item: the guarded upsert compares `applied_topic` and
+`applied_partition`, and `classify_skipped_cache_apply` already raises a terminal
+`CacheOriginMismatch` on a move so the row cannot freeze silently — what was
+missing was authorization to resolve it, and the declared topic supplies exactly
+that. Two deferred items solve each other.
+
+Also fixed the provisioning boundary: environment (databases, topics) may be
+provisioned externally, schema (tables) never is. A provisioner creating tables
+would bypass the M2 change engine and force one crate to know both services'
+asymmetric changelogs, recoupling what two separate databases exist to separate.
+The runtime cannot live in a contracts crate either — cargo unifies features
+across a workspace, so an optional `provision` feature would not stay optional.
+
+The execution plan sequences five phases and records that the provisioner is
+Phase 5, not Phase 1, because it is a thin caller of `create` mode.
+Pages affected: `wiki/proposals/13-topic-convergence-and-environment-provisioning.proposal.md`,
+`wiki/decisions/topic-convergence-and-rebuild.decision.md`,
+`wiki/plans/topic-convergence.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-24] promote | M5 entity-first propagation closeout
+
+Promoted validated M5 behavior to an active spec and closed the execution plan.
+The closeout records the implemented entity-cache surface: required
+`KafkaMessage::entity_key`, per-type cache tables, received-row entity-key
+persistence, offset-guarded cache upsert, per-entity outbox supersede,
+claim-time collapse of stale same-entity pending rows, `Replay::outbox`
+rejection as unsafe, wire-carried producer metadata, jittered receive retry
+backoff, and opt-in outbox retention.
+
+Corrected stale wiki claims found during closeout: the M4 spec now reflects
+equal-jitter backoff, and the first M5 cache compatibility note no longer claims
+the cache key comes from `kafkaman-entity-key` headers or falls back to
+`message_id`. M5 deferrals are explicit: bootstrap/readiness, boot-time broker
+topic validation, advisory origin intent, a positive state-sourced republish API,
+proactive topic-lifecycle re-bootstrap, soft-delete workflow/reclamation, and
+the two-service example. The roadmap now marks M6 observability/operability as
+the active lane that can run in parallel with the example worktree.
+
+Verification:
+- `rtk cargo test --workspace --all-features` - 141 passed, 3 ignored.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests` - 69
+  passed, 3 ignored.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features
+  redpanda --test redpanda_full_loop -- --test-threads=1` - 11 passed.
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` -
+  no issues found.
+- `rtk cargo fmt --all -- --check`
+
+Pages affected:
+- wiki/specs/entity-first-propagation.spec.md (new)
+- wiki/specs/m4-retry-backoff-dlq.spec.md
+- wiki/compatibility/m5-entity-first-cache-api.compat.md
+- wiki/compatibility/m5-entity-first-outbox-supersede.compat.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+||||||| parent of b53f80d (docs: record topic convergence decision)
+
+
+## [2026-08-24] plan | the example app cannot start; two-service example planned
+
+Adding a `[retention]` section to `kafkaman.example.toml` surfaced that **the
+example app has never been runnable**. `Config::discover()` walks up from the
+current directory looking for `kafkaman.toml`, and no such file exists anywhere in
+the repo, so `ResolvedConfig::from_config(None, [descriptor])` fails at boot with
+"missing config file for registered kafkaman features". Its HTTP test never caught
+it because the test builds config through `Config::from_str`, bypassing discovery.
+Same failure mode as the example config file itself: nothing exercised it, so it
+rotted.
+
+Two further gaps followed from looking at it. The example demonstrates roughly a
+third of the product — one message type, an outbox, a relay — while the entity-first
+decision states the purview as compact entity snapshots for distributed caches, and
+nothing anywhere shows a cache being read or two services converging. And nothing
+tests wiring: the integration tests all go through `Harness` with direct database
+access, so a dispatcher never spawned, a topic mismatch, or a `CreateCacheTable`
+missing from a changelog passes every test in the workspace.
+
+Planned in response: rename `apps/` to `examples/`, split the single app into
+`product` and `order` services sharing a contracts crate, and drive the whole thing
+from a new HTTP-only test package.
+
+The design choice worth recording is on the return path. product does **not**
+decrement stock when an order arrives; it recomputes availability from its converged
+cache of orders, filtered to fulfilled ones. That is idempotent by construction —
+the same snapshot applied twenty times still converges to one cache row — where a
+decrementing handler is correct only because the handler and the processed-mark
+share a transaction. It also means **cancellation restores the count for free**,
+which an event-accumulating design cannot do. Caching only fulfilled orders was
+considered and rejected: it would strand a stale row on a Fulfilled → Cancelled
+transition, and there is no ingest-time filter hook anyway.
+
+Planning also surfaced a library documentation gap: `dispatch_once` runs the handler
+*before* upserting the message into the cache, so any handler deriving state from
+its own cache sees that entity one version stale. Nothing says so. It forces an
+exclude-and-substitute correction in the deriving handler, and should be documented
+on `dispatch_once` and `MessageRouter`.
+
+The plan adopts the owned-container-per-test rule from the amended
+library-test-strategy decision rather than the per-binary sharing it replaced, and
+carries the `com.kafkaman.*` labels so the new package's containers are reachable by
+`just clean-containers`. Containers being owned per test rather than shared argues
+for few, fat tests that walk the whole lifecycle over many thin ones.
+
+Pages affected:
+- wiki/plans/two-service-distributed-cache-example.plan.md (new)
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-24] implementation | owned Postgres testcontainers per test
+
+Recorded the durable-send testcontainer lifecycle decision in the library test
+strategy. Postgres-backed tests now prefer one owned container per test/harness
+over one shared static container per test binary, because Testcontainers cleanup
+is `Drop`-based and `OnceCell<ContainerAsync<_>>` prevents that drop from running
+at process exit. The accepted tradeoff is slower Docker-backed runs in exchange
+for avoiding leaked shared containers. Also recorded the label-scoped cleanup
+fallback for interrupted runs.
+
+Implementation replaces the durable-send shared Postgres URL with an owned guard,
+keeps that guard in each test scope, labels kafkaman-managed Postgres and
+Redpanda testcontainers, and narrows `just clean-containers` to those labels. The
+same static Postgres holder was removed from the axum-outbox HTTP integration
+test because it runs in the workspace gate.
+
+Verification:
+- `rtk just lint`
+- `rtk just test all`
+- `rtk just test coverage` (85.14% lines)
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_send durable_send_publishes_record_and_marks_row -- --exact`
+- `rtk docker ps -a --filter label=com.kafkaman.project=kafkaman --filter label=com.kafkaman.managed-by=testcontainers --filter label=com.kafkaman.test-service=postgres --format '{{.ID}} {{.Image}} {{.Status}} {{.Names}}'` returned no containers after the focused test.
+
+Pages affected:
+- wiki/decisions/library-test-strategy.decision.md
+- wiki/index.md
+- wiki/log.md
+
+Code affected:
+- apps/axum-outbox/tests/http.rs
+- justfile
+- tests/durable-send/src/lib.rs
+- tests/durable-send/tests/*.rs
+
+## [2026-08-24] implementation | outbox retention; claim-order index refuted
+
+Measuring R1's fix surfaced two problems neither review pass had found, and
+scoping the first surfaced a third.
+
+**R14 — the claim's ordering cannot be index-served, and the obvious fix does not
+work.** `claim_batch` orders candidates by `created_at`; under a 200k `Pending`
+backlog that is a sequential scan plus an external merge sort spilling 7,840 kB to
+disk. A partial index on the ordering column was measured and **refuted**: the plan
+is byte-identical with and without it, because the candidate predicate is an `OR`
+across two statuses and the planner must examine every row to decide membership.
+The stage's gate was structural — the disappearance of the `Sort` node, not a
+faster wall clock — and it held, so nothing shipped. The refuted index stays in the
+benchmark as a recorded negative result.
+
+Two corrections to how R14 was first written up, both now in `review.md`. It does
+not cost every relay cycle: the steady-state shape is 0.3 ms on the existing index,
+so it bites only when the relay is behind. And most of the backlog-shape cost is
+JIT compilation triggered by the inflated cost estimate, not the scan itself.
+Fixing it properly means removing the `OR` — a `UNION ALL` of separately-ordered
+branches — which is a semantic change to the correctness-critical claim and hits
+Postgres rejecting `FOR UPDATE` with `UNION`. Left as its own change.
+
+**Nothing purged any kafkaman table.** No `DELETE` existed in the workspace, so the
+outbox grew for the life of the application. Retention now exists and is opt-in:
+`purge_outbox_once` for one bounded batch, `run_purger` for the loop, mirroring the
+existing `relay_once`/`run` pairing. Scope was inherited from the restore
+proposal's drop/protect/rebuild split rather than argued fresh — the outbox carries
+`drop`, so nothing may depend on a historical row, while the received table carries
+`protect` and its dedupe window *is* its retention window. `Failed` outbox rows are
+the invalid-send audit trail and are spared unless explicitly opted in.
+
+**Index-adding changesets block writes.** Changesets apply inside a transaction, so
+`CREATE INDEX CONCURRENTLY` is unavailable and every index build takes a `SHARE`
+lock. On an outbox grown without retention that is an outage, and because `enqueue`
+runs inside the caller's business transaction it propagates into application
+requests. Recorded in proposal 11 and flagged in the compatibility note, since an
+adopter cannot infer it from the changeset.
+
+Applying the refutation's lesson, the retention index was verified used rather than
+assumed: Index Scan, no sort, 0.47 ms over 200k rows.
+
+139 tests pass (3 ignored diagnostics). `cargo fmt --check` and
+`clippy -D warnings` clean.
+
+Pages affected:
+- wiki/decisions/outbox-retention-policy.decision.md (new)
+- wiki/compatibility/m5-outbox-retention.compat.md (new)
+- wiki/plans/outbox-retention.plan.md (new)
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md (amended)
+- wiki/index.md
+- wiki/log.md
+- review.md
+
+## [2026-08-24] review | code audit remediation reviewed and corrected
+
+Reviewed the remediation pass above by reading the diff and resulting source
+rather than its own outcome table, merging a third independent review whose four
+findings were all re-verified and all confirmed. Seven issues fixed, five of them
+gaps the remediation itself introduced or left.
+
+Silent-failure classes closed:
+
+- A transient publish failure could permanently invert an entity's state. Enqueue
+  supersedes only rows that are Pending at that instant, so a Publishing row
+  survives and `mark_publish_failed` returns it to Pending; the newer row then
+  publishes first because it is due immediately while the retry is not, and the
+  older state lands at the higher offset. This is decision point 9's corruption
+  reached through retry rather than replay, and all three review passes had missed
+  it. `claim_batch` now collapses each entity's Pending queue to its newest row
+  before selecting candidates.
+- `ResolvedConfig::from_config` still used the silent `with_message`, so F15's
+  duplicate-descriptor fix protected only a helper nobody production-facing
+  called.
+- Relaxing `parse_duration` to accept zero removed the only guard on a zero
+  `initial_backoff`, which turns a permanently failing row into an unthrottled
+  loop against the database. `validate_policy` now rejects it.
+- `CacheOriginMismatch` and `MissingEntityKey` were retried to exhaustion despite
+  being deterministic. Failure *class* and *retryability* are now separate
+  concepts (`FailureDisposition`), and both are terminal on the first attempt.
+  Decision point 4's consecutive-regression breaker is now explicitly declined in
+  code, with the reason: a breaker halts the pipeline, and one entity's
+  repartition must not stop dispatch for every other entity.
+- `received_entity_key`'s `kafkaman-entity-key` tier was unreachable through every
+  supported write path, yet documented as live in three places and covered by a
+  passing unit test that asserted it worked — green only because the fixture built
+  the row struct directly. The tier is gone and the test now pins its absence. The
+  header is still published, which is its actual purpose: foreign consumers cannot
+  deserialize the typed payload, kafkaman's own ingest always can.
+
+Test gaps closed: a legacy received-table migration test for
+`AddReceivedEntityKey` (public API and step 1 of the documented upgrade, exercised
+by nothing) including what happens to rows already present; the first unit tests
+in `kafkaman-rdkafka`, pinning the deliberate asymmetry where a malformed
+idempotency source degrades but a malformed occurrence time is rejected; and a
+real broker-hop test for `partition_key != entity_key`, the shape F2 broke, which
+the F2 regression test never actually crossed a broker with.
+
+Record corrections: line coverage is 84.86%, not the 88.45% first recorded — two
+consecutive runs produce byte-identical counts, so the metric is deterministic and
+the original figure was never produced by the documented command. Eleven plan
+items had been dropped without being listed under "Not done", and two reversals
+were reported as successes; both are now recorded in `review.md`. The container
+reduction claim covers PostgreSQL only.
+
+Then measured rather than reasoned. An `#[ignore]`d diagnostic
+(`tests/durable-send/tests/outbox_claim_cost.rs`) seeds a 200k-row backlog and
+runs `EXPLAIN (ANALYZE, BUFFERS)` on every statement a relay cycle executes. It
+refuted two things about the R1 fix that had been argued from reading the SQL: the
+predicted index was not the one the planner chose (it hash-joins two sequential
+scans and spills to disk), and the claim that R1 had made the cycle unbounded was
+wrong — `claim_batch` was already the most expensive statement in the cycle and
+already scanned the whole backlog. The collapse was still reshaped to drive from
+the claim's own bounded window, worth 241ms → 69ms and no temp spill, but for the
+smaller reason. The numbers are recorded in `review.md`.
+
+That measurement also surfaced R14: `claim_batch`'s `ORDER BY created_at` can use
+no index, because the only index covering its predicate leads with `status` and a
+range on `next_attempt_at` destroys ordered retrieval on `created_at`. Every cycle
+sequentially scans and sorts — 7,840kB spilled to disk at a 200k backlog, and 368ms
+to return 100 rows. Pre-existing, larger than anything this pass introduced, and
+left as its own change because the fix is a schema change needing a changeset and a
+compatibility note. The benchmark is in place to prove it.
+
+Finally, reconciled `review.md`'s pass-1 outcome table with the shipped code. Three
+of its rows had gone stale (F2's entity-key resolution order, F11/F12's "hex
+replaced", F15's "zero durations accepted") and asserted things later sections of
+the same document contradict, ~250 lines above the corrections. Each now leads with
+what is true and points at the section that changed it, following the convention
+the document already used for the toolchain pin and the coverage figure.
+
+131 tests pass (1 ignored diagnostic). `cargo fmt --check` and `clippy -D warnings`
+clean.
+
+Pages affected:
+- review.md
+- wiki/compatibility/m5-code-audit-remediation.compat.md
+- wiki/log.md
+- wiki/index.md
+
+## [2026-08-24] implementation | code audit remediation
+
+Full-workspace line-by-line audit and remediation. Two independent review passes
+were merged; every claim was re-verified against source and toolchain before
+acceptance. Findings and the phased plan are recorded in `review.md`.
+
+Closed seven silent-failure classes, all of which were gaps between a documented
+invariant and its implementation:
+
+- `kafkaman-entity-key` did not survive a Kafka round trip (ingest strips the
+  reserved namespace), so any type whose partition key differed from its entity
+  key cached under the wrong identity. The entity key is now resolved from the
+  typed payload at ingest and stored in a new received-table column.
+- `received_entity_key` fabricated a key from `message_id` when nothing else was
+  available, giving unbounded non-converging cache growth. Now an error.
+- A partition change froze a cache row forever with no signal. Now reported as
+  `Error::CacheOriginMismatch`, per decision point 4.
+- The Kafka record key ignored `entity_key`, so keyless types scattered one
+  entity across partitions.
+- `Replay::outbox` republished stored rows at fresh, higher offsets, contradicting
+  the README and decision point 9. Now rejected.
+- `occurred_at` and `idempotency_source` never crossed the wire.
+- The entity advisory lock silently degraded outside a transaction.
+
+Also: `clippy -D warnings` was failing on the branch, on a test whose spawned
+task result was discarded — the assertion it was meant to make never ran.
+
+Infrastructure: added `[workspace.lints]`, `rust-toolchain.toml` (tracking
+stable), and a CI workflow running the existing `just check` and coverage gates,
+whose absence is how the lint failure reached the branch. The toolchain file
+initially pinned 1.90.0, which broke rust-analyzer's proc-macro expansion via an
+ABI mismatch against the editor's 1.97.1 server; it now tracks stable so the two
+cannot diverge. Consolidated ~61 per-test PostgreSQL
+containers into one per test binary via a shared test crate; that change also
+exposed real cross-test coupling on a shared business table.
+
+Coverage 84.86% lines; 120 tests pass (45 unit, 75 integration including the
+Redpanda full loop). *(Corrected 2026-08-24: this entry originally claimed 88.45%,
+which is not reproducible by the documented command. See the review-pass entry
+above.)*
+
+Pages affected:
+- review.md (new)
+- wiki/compatibility/m5-code-audit-remediation.compat.md (new)
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-14] implementation | remove delete-retention public surface
+
+Removed the superseded public retention-class API after the compact
+entity-cache purview decision. `RetentionClass`,
+`KafkaMessage::retention_class`, and `MessageDescriptor.retention_class` are
+gone. `KafkaMessage::entity_key()` is now required rather than defaulting to
+`message_id`, so each in-purview kafkaman message supplies a real entity
+identity.
+
+Cache-table creation, guarded cache upsert, internal `kafkaman-entity-key`
+header insertion, and same-entity outbox supersede now apply to every registered
+kafkaman message type instead of branching on `Compact`.
+
+Pages affected:
+- README.md
+- wiki/compatibility/m5-entity-first-cache-api.compat.md
+- wiki/compatibility/m5-entity-first-outbox-supersede.compat.md
+- wiki/proposals/12-entity-only-message-model.proposal.md
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+Code affected:
+- crates/kafkaman-core/src/lib.rs
+- crates/kafkaman-sqlx/src/lib.rs
+- crates/kafkaman-test/src/lib.rs
+- apps/axum-outbox/src/lib.rs
+- tests/durable-send/tests/durable_send.rs
+- tests/durable-send/tests/durable_receive.rs
+- tests/durable-send/tests/redpanda_full_loop.rs
+- tests/durable-send/tests/entity_first_propagation.rs
+- tests/durable-send/tests/entity_first_outbox_supersede.rs
+
+Verification:
+- `rtk cargo check --workspace --all-features`
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --tests -- --test-threads=1`
+- `rtk cargo test --workspace --all-features`
+
+## [2026-08-14] decision | compact entity-cache purview
+
+Recorded the user's clarified purview decision: kafkaman should be a
+distributed cache for compact domain entities only. Non-entity messages such as
+"send welcome email to user 123", payments, commands, analytics events, generic
+jobs, `mutation_jobs`-style durable queues, and direct transport are outside the
+library's product scope.
+
+This supersedes proposal 12's 2026-08-13 option 5 selection of a public
+`compact` / `delete` retention-class model. The follow-up implementation removes
+the public retention-class surface instead of carrying `delete` compatibility
+forward. M4 retry/backoff/DLQ remains relevant as entity-cache pipeline support,
+not as a generic durable job queue promise.
+
+Pages affected:
+- wiki/proposals/12-entity-only-message-model.proposal.md
+- wiki/decisions/entity-first-propagation-model.decision.md
+- wiki/decisions/messaging-scope-and-receive-model.decision.md
+- wiki/plans/entity-first-propagation.plan.md
+- wiki/compatibility/m5-entity-first-cache-api.compat.md
+- wiki/compatibility/m5-entity-first-outbox-supersede.compat.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
 ## [2026-08-14] implementation | M5 outbox supersede first slice
 
 Implemented Phase 3's outbound entity ordering foundation. Outbox rows now carry

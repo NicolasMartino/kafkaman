@@ -3,9 +3,14 @@
 - Document Class: Decision
 - Status: Accepted
 - Date: 2026-08-12
-- Amended: 2026-08-13
+- Amended: 2026-08-13; 2026-08-14
 - Category: Propagation model
-- Scope: Fixes entity-first propagation as kafkaman's headline use case and defines entity identity, the inbox/cache split, advisory intent, retention class, and soft-delete-first deletion. Amended 2026-08-13: the convergence ordinal is the Kafka offset, every type is an entity with a declared retention class, and outbound entity enqueue serializes on `(message_type, entity_key)`.
+- Scope: Fixes entity-only propagation as kafkaman's purview: compact domain
+  entity snapshots, the inbox/cache split, advisory intent, offset convergence,
+  per-entity outbound supersede, state-sourced republish, and
+  soft-delete-first deletion. Amended 2026-08-14: non-entity work items,
+  commands, generic jobs, emails, payments, analytics events, and direct
+  transport are outside kafkaman's product scope.
 - Sources:
   - wiki/proposals/09-entity-first-propagation.proposal.md
   - raw/design/2026-08-12-entity-first-propagation-discussion.md
@@ -20,23 +25,20 @@
 
 ## Decision
 
-1. **Propagation is doctrine, not scope.** kafkaman's mechanism remains durable
-   execution — outbox, ledger, claim-lease, retry, DLQ, idempotent receive. Its
-   headline use case is reference propagation and cache coherence, so services
-   avoid synchronous inter-service calls. User-facing interaction stays
-   HTTP-driven. This does not reopen the messaging-scope decision's refutation of
-   propagation-*only* as a library scope; nothing is removed. The accepted
-   proposal 12 amendment models work items as entities too, rather than excluding
-   them from kafkaman.
+1. **Propagation is now scope.** kafkaman's product purview is the distributed
+   cache for compact domain entities. Durable outbox/inbox, claim-lease, retry,
+   DLQ, and idempotent receive remain because they support reliable entity
+   propagation and cache coherence. They are no longer a promise that kafkaman
+   is a general durable job queue. This 2026-08-14 amendment reverses the
+   messaging-scope decision's rejection of propagation-only library scope.
 
-2. **Three identity axes coexist.** `message_id` is physical record identity.
-   `idempotency_key` is the work-item dedupe identity from the typed-idempotency
-   decision. `(entity_key, source_offset)` is the convergence identity.
-   Dedup and convergence answer different questions and neither substitutes for
-   the other. Every type has an `entity_key`; for existing M1-M4 work-item types
-   it defaults to `message_id`.
+2. **Three identity axes coexist for in-purview entity messages.** `message_id`
+   is physical record identity. `idempotency_key` is the durable processing
+   dedupe identity from the typed-idempotency decision. `(entity_key,
+   source_offset)` is the convergence identity. Dedup and convergence answer
+   different questions and neither substitutes for the other.
 
-3. **A convergence ordinal is required for propagating types**, because
+3. **A convergence ordinal is required for in-purview entity types**, because
    kafkaman's own retry backoff, `Replay::received` redrive, at-least-once
    redelivery, concurrent dispatch, and bootstrap replay all reorder application
    relative to production. Diff-and-upsert is insufficient: it answers "is this
@@ -67,26 +69,24 @@
    record metadata. `kafkaman-entity-key` is still carried where the entity key
    is not already the record key.
 
-6. **Every message type is an entity with a declared retention class.** The
-   accepted proposal 12 amendment replaces the implicit entity/non-entity split
-   with an explicit `compact` / `delete` retention class. `compact` means bounded
-   key space, compacted topic, cache table, bootstrap eligibility, and a
-   meaningful convergence guard. `delete` means unbounded key space,
-   delete-by-age topic, no cache table, no bootstrap offer, and a guard that is
-   structurally a no-op because the default `entity_key` is `message_id`.
+6. **Every in-purview kafkaman message is a compact entity snapshot.** The
+   2026-08-14 proposal 12 amendment supersedes the public `compact` / `delete`
+   retention-class model. In-scope types have bounded entity key space,
+   compacted topics, cache tables, bootstrap eligibility, and meaningful
+   convergence guards. Delete-by-age work items and unbounded-key job queues are
+   outside kafkaman's purview.
 
    Deltas remain rejected for `compact` cache types because deltas and log
    compaction are fundamentally incompatible: compaction drops intermediate
    records, leaving a late consumer with a torn, unreconstructable state.
 
-7. **One envelope, retention-class storage.** The existing received/inbox table
-   stays per-message and transient for every type, carrying status, attempts,
-   error history, retry, and DLQ. `compact` types additionally get a per-entity
-   cache table keyed on `entity_key`, holding current state plus
-   `applied_topic` / `applied_partition` / `applied_offset`. kafkaman owns the
-   cache table and performs a guarded upsert — apply only when
-   `incoming.source_offset > current.applied_offset`, after checking that topic
-   and partition match.
+7. **One in-scope storage model.** In-purview entity messages use the durable
+   received/inbox table as the transient processing ledger, carrying status,
+   attempts, error history, retry, and DLQ. They also get a per-entity cache
+   table keyed on `entity_key`, holding current state plus `applied_topic` /
+   `applied_partition` / `applied_offset`. kafkaman owns the cache table and
+   performs a guarded upsert — apply only when `incoming.source_offset >
+   current.applied_offset`, after checking that topic and partition match.
 
 8. **The outbox supersedes pending rows per entity.** Writing a message for an
    entity that already has a pending row marks that row `Superseded` and inserts
@@ -120,10 +120,10 @@
 9. **Republish is state-sourced, never row-sourced.** Re-emitting a stored
    outbox row is unsafe under an offset ordinal, because the republished record
    receives a new higher offset and stale state wins at every cache. For
-   propagating entity types, replay and drift repair re-read the entity's
+   in-purview entity types, replay and drift repair re-read the entity's
    current state and enqueue it normally, so a concurrent live update supersedes
    the still-pending repair row and wins correctly. This constrains M2's
-   `Replay::outbox` for entity types and is the reason the domain-version
+   `Replay::outbox` for in-purview types and is the reason the domain-version
    override could be dropped rather than narrowed. `Replay::received` is
    unaffected: redriven inbound rows retain their original `source_offset`.
 
@@ -166,6 +166,12 @@ The offset is only trustworthy because supersede keeps one message per entity in
 flight. Without it a racing relay writes the wrong order into the log and the
 offsets faithfully record it, which is exactly why the offset was rejected as an
 ordinal in the original proposal.
+
+The 2026-08-14 amendment changes product scope, not just implementation shape.
+The earlier durable-execution-first rationale treated `mutation_jobs` as proof
+that kafkaman should own generic durable work. The revised judgment is narrower:
+that evidence proves applications may need durable work queues, but kafkaman's
+public promise is cache coherence for compact entity snapshots.
 
 Entity-first follows from wanting compaction at all. Full snapshots make a
 compacted topic self-healing and make repeated application a no-op; deltas make
@@ -211,6 +217,14 @@ delta stream it exists to avoid.
   two states of one entity, supersede racing an in-flight send, delete followed
   by redelivery of a pre-delete state, and an unknown intent variant at an
   un-redeployed consumer.
+- The public scope narrows: non-entity durable jobs, commands, emails, payments,
+  analytics events, and direct transport are outside kafkaman's purview.
+- Existing M1-M4 APIs and specs that describe general durable execution need
+  compatibility/deprecation framing or consolidation so they do not read as a v1
+  promise beyond entity-cache plumbing.
+- The public `RetentionClass` split and default `entity_key = message_id` are
+  removed as pre-v1 API changes; every in-purview message now supplies a real
+  entity key.
 
 ## Implementation Sequencing
 
@@ -219,7 +233,9 @@ identity sits directly beside idempotency identity. That plan is now Completed
 and all five pre-merge review findings are closed, so execution planning is
 tracked in [entity-first-propagation.plan.md](../plans/entity-first-propagation.plan.md).
 The M3/M4 branch merged to `main` on 2026-08-13. Every M5 phase builds on that
-shipped receive surface.
+shipped receive surface. After the 2026-08-14 purview amendment, the same code
+is treated as entity-cache infrastructure first; generic durable-job exposure is
+not an expansion target.
 
 Pre-adding nullable `entity_key` and cache columns during the M3/M4 merge to
 save a migration is explicitly rejected: the change engine exists for exactly
@@ -230,9 +246,11 @@ speculative columns would have been wasted.
 
 ## Revisit When
 
-- The accepted retention-class split proves insufficient, for example because a
-  type declared `compact` has unbounded key cardinality in practice, or because a
-  `delete` type needs a cache table despite having no compaction backstop.
+- The compact entity-cache purview proves too narrow for a concrete v1 adopter
+  and the project intentionally reopens whether kafkaman should own generic
+  durable jobs.
+- An in-purview entity type has unbounded key cardinality in practice, which
+  would violate the compacted-topic assumption.
 - Message size under full-entity propagation becomes a measured problem for a
   real type, which would reopen the deltas-versus-snapshots choice for that type.
 - Topic growth from unreclaimed soft deletes becomes a measured problem, which

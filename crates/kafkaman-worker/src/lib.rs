@@ -1,17 +1,34 @@
-use std::{error::Error as StdError, time::Duration};
+//! The run loops: an outbox relay, a receive dispatcher, and an outbox purger.
+//!
+//! All three share a shape — do a bounded unit of work, log it, and pace
+//! against a shutdown token — but not a body, because what each logs and how
+//! each paces are genuinely different. What they do share is
+//! `sleep_or_shutdown`: racing the sleep against
+//! the token is the part that is easy to get wrong, and getting it wrong makes
+//! a shutdown take a full poll interval to be noticed.
+//!
+//! Every loop treats a failed cycle as transient: it logs and retries, because a
+//! database blip must not take a worker down. Only a configuration that can
+//! never succeed returns `Err`, and it is checked once up front rather than
+//! rediscovered every cycle.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+use std::error::Error as StdError;
 
 use async_trait::async_trait;
-use kafkaman_core::{ClaimedOutboxRow, MarkOutcome, PublishAck, RelayConfig, RelayStats};
-use kafkaman_sqlx::{
-    claim_batch, dispatch_once, mark_publish_failed, mark_published, MessageRouter, OutboxTable,
-    ReceivedTable,
-};
-use sqlx::PgPool;
-use time::OffsetDateTime;
-use tokio_util::sync::CancellationToken;
+use kafkaman_core::{ClaimedOutboxRow, PublishAck};
 
 pub use kafkaman_core;
 pub use kafkaman_sqlx;
+
+mod dispatcher;
+mod purger;
+mod relay;
+mod run_loop;
+
+pub use dispatcher::run_dispatcher;
+pub use purger::run_purger;
+pub use relay::{relay_once, run};
 
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -21,146 +38,21 @@ pub enum Error {
     #[error(transparent)]
     Sqlx(#[from] kafkaman_sqlx::Error),
 
-    #[error("invalid relay config: {0}")]
-    InvalidConfig(String),
+    #[error(transparent)]
+    Core(#[from] kafkaman_core::Error),
+
+    #[error("invalid dispatcher config: {field} {reason}")]
+    InvalidDispatcherConfig {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
+/// Somewhere to publish a claimed outbox row.
+///
+/// Returns a boxed error rather than a kafkaman one so a transport crate can
+/// report its own failures without this crate depending on it.
 #[async_trait]
 pub trait Publisher: Send + Sync {
     async fn publish(&self, row: &ClaimedOutboxRow) -> std::result::Result<PublishAck, BoxError>;
-}
-
-pub async fn relay_once<P: Publisher>(
-    pool: &PgPool,
-    publisher: &P,
-    table: &OutboxTable,
-    cfg: &RelayConfig,
-) -> Result<RelayStats> {
-    cfg.validate().map_err(Error::InvalidConfig)?;
-
-    let mut tx = pool.begin().await.map_err(kafkaman_sqlx::Error::from)?;
-    let claimed = claim_batch(
-        &mut tx,
-        table,
-        &cfg.worker_id,
-        cfg.lease_for,
-        cfg.batch_limit,
-    )
-    .await?;
-    tx.commit().await.map_err(kafkaman_sqlx::Error::from)?;
-
-    let mut stats = RelayStats {
-        claimed: claimed.len(),
-        ..RelayStats::default()
-    };
-
-    for row in claimed {
-        match publisher.publish(&row).await {
-            Ok(_) => match mark_published(pool, table, row.message_id(), row.claim_id).await? {
-                MarkOutcome::Updated => stats.published += 1,
-                MarkOutcome::StaleClaim => stats.stale += 1,
-                MarkOutcome::Missing => stats.missing += 1,
-            },
-            Err(err) => {
-                match mark_publish_failed(
-                    pool,
-                    table,
-                    row.message_id(),
-                    row.claim_id,
-                    &err.to_string(),
-                    cfg.retry_after,
-                )
-                .await?
-                {
-                    MarkOutcome::Updated => stats.failed += 1,
-                    MarkOutcome::StaleClaim => stats.stale += 1,
-                    MarkOutcome::Missing => stats.missing += 1,
-                }
-            }
-        }
-    }
-
-    Ok(stats)
-}
-
-pub async fn run<P: Publisher>(
-    pool: PgPool,
-    publisher: P,
-    table: OutboxTable,
-    cfg: RelayConfig,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    loop {
-        // A relay cycle failure (typically a transient claim/mark database
-        // error) must not kill the worker. Log it and retry on the next tick;
-        // only a shutdown signal ends the loop.
-        match relay_once(&pool, &publisher, &table, &cfg).await {
-            Ok(stats) if stats.claimed > 0 => tracing::debug!(
-                claimed = stats.claimed,
-                published = stats.published,
-                failed = stats.failed,
-                stale = stats.stale,
-                missing = stats.missing,
-                "relay cycle complete"
-            ),
-            Ok(_) => {}
-            Err(err) => tracing::error!(
-                error = %err,
-                "relay cycle failed; retrying after poll interval"
-            ),
-        }
-
-        tokio::select! {
-            _ = tokio::time::sleep(cfg.poll_interval) => {}
-            _ = shutdown.cancelled() => break,
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn run_dispatcher(
-    pool: PgPool,
-    table: ReceivedTable,
-    router: MessageRouter,
-    poll_interval: Duration,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
-
-        let claimed = match dispatch_once(&pool, &table, &router, OffsetDateTime::now_utc()).await {
-            Ok(stats) => {
-                if stats.claimed > 0 {
-                    tracing::debug!(
-                        claimed = stats.claimed,
-                        processed = stats.processed,
-                        failed = stats.failed,
-                        "receive dispatch cycle complete"
-                    );
-                }
-                stats.claimed
-            }
-            Err(err) => {
-                tracing::error!(
-                error = %err,
-                "receive dispatch cycle failed; retrying after poll interval"
-                );
-                0
-            }
-        };
-
-        if claimed > 0 {
-            continue;
-        }
-
-        tokio::select! {
-            _ = tokio::time::sleep(poll_interval) => {}
-            _ = shutdown.cancelled() => break,
-        }
-    }
-
-    Ok(())
 }

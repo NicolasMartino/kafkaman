@@ -1,11 +1,12 @@
 # Wiki Index
 
 Project: kafkaman
-Stage: M3/M4 merged; entity-first propagation active
-Updated: 2026-08-14
+Stage: M5 completed; M6 observability active; two-service example active in parallel
+Updated: 2026-08-24
 
-One-line: A Rust library plus optional worker runtime for reliable Kafka-backed
-service messaging, using Postgres as the durable execution ledger.
+One-line: A Rust library plus optional worker runtime for Kafka-backed
+distributed caches of compact domain entity snapshots, using Postgres as the
+durable entity propagation ledger and local cache store.
 
 ## Specs
 
@@ -18,12 +19,18 @@ service messaging, using Postgres as the durable execution ledger.
   migration reports, checksums, `applied_by`, `changelog!`, dry-run, and guarded
   send-side `Replay`. Status: Active.
 - [specs/m4-retry-backoff-dlq.spec.md](specs/m4-retry-backoff-dlq.spec.md) -
-  Validated M4 reliability behavior: per-type retry policy resolution, exponential
-  backoff with due-gated dispatch, terminal table-backed DLQ on exhaustion,
+  Validated M4 reliability behavior: per-type retry policy resolution, jittered
+  exponential backoff with due-gated dispatch, terminal table-backed DLQ on exhaustion,
   bounded error history, the `received_failed_rows`/`received_failed_count` DLQ
   inspect surface with `ReceivedFailureFilter`, and guarded `Replay::received`
   redrive (kind filter, history-preserving by default, opt-in `clear_history`).
   Status: Active.
+- [specs/entity-first-propagation.spec.md](specs/entity-first-propagation.spec.md)
+  - Validated M5 entity-cache behavior: required `entity_key`, per-type cache
+  tables, received-row entity identity, offset-guarded cache upsert,
+  per-entity outbox supersede and claim-time pending collapse,
+  `Replay::outbox` rejection, wire-carried producer metadata, jittered retry,
+  and opt-in outbox retention. Status: Active.
 - [specs/m3-durable-receive.spec.md](specs/m3-durable-receive.spec.md) -
   Validated M3 durable receive behavior: Kafka ingest writes a durable received
   row or quarantine row before committing offsets, idempotency-key dedup,
@@ -109,8 +116,8 @@ service messaging, using Postgres as the durable execution ledger.
   - M3 receive review-fix API and operational-data changes:
     `IngestStats.skipped`, `RdkafkaConsumer::Error::UnexpectedTopic`,
     `RdkafkaConsumer::Error::ConsecutiveSkipLimitExceeded`,
-    `IngestLoopStats`, `RdkafkaConsumer::run_ingester`, `test-hooks`
-    ingest/dispatch hook APIs, `ReceivedError.kind`,
+    `IngestLoopStats`, `RdkafkaConsumer::run_ingester`,
+    `kafkaman-test` ingest/dispatch hook APIs, `ReceivedError.kind`,
     `ReceivedIngestFailureKind`, `ReceivedInsertOutcome`, deterministic ingest
     quarantine, receive insert conflict classification, and retryable-only
     `Replay::received`. Status: Active.
@@ -129,17 +136,45 @@ service messaging, using Postgres as the durable execution ledger.
     JSON, and the resulting changeset checksum changes. Verified against
     Docker-backed PostgreSQL and Redpanda. Status: Active.
 - [compatibility/m5-entity-first-cache-api.compat.md](compatibility/m5-entity-first-cache-api.compat.md)
-  - M5 first-slice API and behavior changes: `RetentionClass`, defaulted
-    `KafkaMessage::entity_key`, defaulted `KafkaMessage::retention_class`,
-    `MessageDescriptor.retention_class`, `CacheTable`, `CreateCacheTable`, and
-    compact receive dispatch cache upsert guarded by Kafka offset. Verified by
-    the new entity-first propagation integration tests. Status: Active.
+  - M5 first-slice API and behavior changes after the entity-only narrowing:
+    required `KafkaMessage::entity_key`, removal of `RetentionClass`,
+    `KafkaMessage::retention_class`, and `MessageDescriptor.retention_class`,
+    plus `CacheTable`, `CreateCacheTable`, received-row entity-key persistence,
+    and receive dispatch cache upsert guarded by Kafka offset for registered
+    entity message types. Status: Active.
 - [compatibility/m5-entity-first-outbox-supersede.compat.md](compatibility/m5-entity-first-outbox-supersede.compat.md)
   - M5 outbound schema/API and relay behavior changes: `OutboxStatus::Superseded`,
     `OutboxRow.entity_key`, nullable outbox `entity_key`, `AddOutboxEntityKey`,
-    compact-type advisory enqueue serialization, pending-row supersede, and
+    entity-type advisory enqueue serialization, pending-row supersede, and
     same-entity `Publishing` rows blocking newer pending relay claims. Status:
     Active.
+- [compatibility/m5-code-audit-remediation.compat.md](compatibility/m5-code-audit-remediation.compat.md)
+  - Public API, schema, and behavior changes from the full-workspace code audit
+    remediation: received-table `entity_key` column and `AddReceivedEntityKey`,
+    `Replay::outbox` rejected as unsafe, `CacheApplyOutcome` /
+    `Error::CacheOriginMismatch`, `OutboxRow::record_key`, wire-carried
+    `occurred_at` and idempotency source, jittered retry backoff, and removal of
+    the panicking `Envelope::with_idempotency_key`. Amended by the review pass:
+    per-entity Pending collapse at claim time, terminal disposition for
+    deterministic cache errors, and the deleted `kafkaman-entity-key` resolution
+    tier. Status: Active.
+
+- [compatibility/m5-outbox-retention.compat.md](compatibility/m5-outbox-retention.compat.md)
+  - Outbox retention surface: `PurgeConfig`/`PurgeStats`, `purge_outbox_once`,
+    `run_purger`, the optional `[retention]` config section, and the terminal-status
+    partial index emitted by `CreateOutboxTable` plus `AddOutboxRetentionIndex` for
+    existing tables. Retention is opt-in; absent config nothing is deleted. Records
+    that the index build blocks writes, because changesets apply inside a
+    transaction and `CONCURRENTLY` is therefore unavailable. Status: Active.
+- [compatibility/module-test-separation-internal-hooks.compat.md](compatibility/module-test-separation-internal-hooks.compat.md)
+  - Source-organization and test API cleanup: production test hook features are
+    renamed to hidden `internal-hooks`, consumer-facing hook ergonomics live in
+    `kafkaman-test`, and large production/test files are split into focused
+    `mod` modules with explicit imports and named root re-exports, keeping public
+    paths and `rustfmt` coverage intact. Carries one behavior change — `migrate`
+    now scopes its advisory lock to a transaction, so a cancelled migration
+    cannot leave a pooled connection holding it — and requires a pool of at
+    least two connections. Status: Active.
 
 ## Decisions
 
@@ -147,6 +182,13 @@ service messaging, using Postgres as the durable execution ledger.
   - Missing handlers are row-level durable dispatch failures recorded under the
     claimed row lock, parking the row without head-of-line blocking younger
     rows. Status: Accepted.
+- [decisions/outbox-retention-policy.decision.md](decisions/outbox-retention-policy.decision.md)
+  - Only the outbox is purged: `Published` and `Superseded` rows past a configured
+    window, in bounded batches, with `Failed` audit rows spared unless opted in.
+    Received tables are never purged because their dedupe window *is* their
+    retention window; cache tables are the state. Scope is inherited from the
+    restore proposal's drop/protect/rebuild split rather than argued fresh. Status:
+    Accepted.
 - [decisions/dispatch-infrastructure-error-classification.decision.md](decisions/dispatch-infrastructure-error-classification.decision.md)
   - Post-handler infrastructure errors, including poisoned transactions after a
     swallowed SQL error, are recorded as receive failure accounting with a
@@ -180,20 +222,24 @@ service messaging, using Postgres as the durable execution ledger.
     Status: Accepted.
 
 - [decisions/entity-first-propagation-model.decision.md](decisions/entity-first-propagation-model.decision.md)
-  - Propagation is doctrine over the unchanged durable-execution mechanism.
-    Fixes three identity axes, every type as an entity with a declared retention
-    class, an inbox plus guarded cache table for `compact` types, advisory origin
-    intent, and soft-delete-first deletion. **Amended 2026-08-13:** the
+  - Propagation is now kafkaman's product purview: compact domain entity
+    snapshots, durable entity outbox/inbox plumbing, guarded cache tables,
+    advisory origin intent, and soft-delete-first deletion. **Amended
+    2026-08-13:** the
     convergence ordinal is the Kafka offset already stored on received rows,
     made trustworthy by key-serialized per-entity outbox supersede. Removes the
     producer-side version, the high-water table, the monotonicity constraint, the
     `kafkaman-entity-version` header, and the domain-version override; adds
-    state-sourced republish and topic-lifecycle invalidation. Status: Accepted.
+    state-sourced republish and topic-lifecycle invalidation. **Amended
+    2026-08-14:** non-entity work items, commands, jobs, emails, payments,
+    analytics events, and direct transport are outside kafkaman's product scope.
+    Status: Accepted.
 
 - [decisions/messaging-scope-and-receive-model.decision.md](decisions/messaging-scope-and-receive-model.decision.md)
-  - Durable-execution-first core; Kafka-only transport in v1; HTTP and synchronous
-  outcomes deferred; receive is fire-and-forget plus durable status with
-  `correlation_id`/`causation_id` in the envelope. Status: Accepted.
+  - Originally accepted a durable-execution-first core, Kafka-only transport in
+  v1, and fire-and-forget receive with durable status. **Amended 2026-08-14:**
+  compact entity-cache propagation is the v1 product scope; non-entity durable
+  work and direct transport are outside purview. Status: Accepted.
 - [decisions/message-identity-and-header-namespace.decision.md](decisions/message-identity-and-header-namespace.decision.md)
   - V1 persisted messages require an `idempotency_key`; received tables dedup on
   per-type unique idempotency keys; `kafkaman-*` Kafka headers are reserved and
@@ -225,20 +271,39 @@ service messaging, using Postgres as the durable execution ledger.
     `enqueue_on_connection` for atomic consume-then-produce. Status: Accepted.
 - [decisions/library-test-strategy.decision.md](decisions/library-test-strategy.decision.md)
   - kafkaman tests itself with unit, Postgres integration, and full-loop tiers;
-  dogfooding-first where tests sit at or above toolkit abstractions. Status:
-  Draft.
+  dogfooding-first where tests sit at or above toolkit abstractions. Durable-send
+  Postgres tests now use owned containers per test/harness because
+  Testcontainers cleanup is `Drop`-based and static `OnceCell<ContainerAsync<_>>`
+  sharing leaked containers. Status: Draft.
 - [decisions/consumer-test-tooling.decision.md](decisions/consumer-test-tooling.decision.md)
   - `kafkaman-test` is the consumer-facing test toolkit with Harness,
   deterministic one-step drivers, and future macro sugar. Status: Draft.
+
+- [decisions/topic-convergence-and-rebuild.decision.md](decisions/topic-convergence-and-rebuild.decision.md)
+  - A topic's required configuration belongs on `MessageDescriptor`, defaulted to
+  `cleanup.policy=compact` alone by the model rather than declared per contract,
+  and is converged at boot: `verify` by default, `create` opt-in, `off` as an
+  escape hatch. Repartitioning is never performed — topics are **rebuilt** by
+  republishing every entity from the owner's state, which the entity-first model
+  makes possible because the log is a derived artifact, at a cost bounded by
+  entity count rather than event count. The declared topic is what authorizes
+  cache-origin invalidation, so a migration converges while a misconfigured
+  consumer still fails terminally. Provisioning covers environment (databases,
+  topics) and never schema (tables). Status: Accepted.
 
 ## Roadmaps
 
 - [roadmaps/path-to-v1.roadmap.md](roadmaps/path-to-v1.roadmap.md) - Seven
   milestones to V1. M1 durable send, M2 change-engine/config, M3 durable
-  receive and M4 retry/DLQ are all Completed, merged, and promoted to specs.
+  receive, M4 retry/DLQ, and M5 entity-first propagation are all Completed,
+  merged, and promoted to specs.
   **Updated 2026-08-13:** entity-first propagation is Active as M5 ahead of
   observability, because it changes the table layout dashboards would otherwise
-  be built on; observability and hardening shift to M6 and M7. Status: Draft.
+  be built on; observability and hardening shift to M6 and M7. **Updated
+  2026-08-14:** M5 is compact entity-cache purview only; delete-retention
+  work-item APIs are removed from the public surface. **Updated 2026-08-24:**
+  M5 is completed; M6 observability is active and may proceed in parallel
+  with the two-service example. Status: Draft.
 
 ## References
 
@@ -306,25 +371,31 @@ service messaging, using Postgres as the durable execution ledger.
     excluded from backups and starts empty, the inbound ledger is never rewound
     past its processed-markers, a business restore needs a resync sweep, and
     irreversible actions carry their own idempotency record in an independent
-    restore domain. Splits kafkaman's tables three ways by reconstructibility —
+    restore domain. **Amended 2026-08-24:** adds storage growth of kafkaman's own
+    Postgres tables (nothing purges any table) and the invariant that index-adding
+    changesets block writes, since changesets apply inside a transaction. Splits kafkaman's tables three ways by reconstructibility —
     drop / protect / rebuild — while recording that PITR is cluster-wide, so the
     split buys backup-set composition rather than independent restore. GDPR
     erasure is resolved by publishing a redacted entity; storage growth is not.
     Status: Proposed.
 - [proposals/12-entity-only-message-model.proposal.md](proposals/12-entity-only-message-model.proposal.md)
-  - Collapses the message model so every type is an entity, with work items as
-    entities whose key is unique per item and whose convergence guard is a
-    harmless no-op. **Revised 2026-08-13 after review:** selects a uniform entity
-    model with a **declared retention class** (`compact` / `delete`) driving topic
-    config, cache-table generation, and bootstrap eligibility, over
-    entity-only-by-redefinition — because the latter keeps the two broker
-    configurations that already exist while deleting the type-level signal that
-    makes misconfiguration boot-detectable. Records hard exclusion as a costed
-    option 4, rejected because it strands the `mutation_jobs` evidence and most of
-    M4. Non-breaking: `entity_key` defaults to `message_id`, class defaults to
-    `delete`. Surfaces two conflicts in proposal 11 (the `rebuild` directive is
-    compaction-conditional; the resync sweep is load-bearing). Status: Accepted,
-    promoted as an amendment to the entity-first propagation decision.
+  - Collapses the message model to compact entity-cache propagation only.
+    **Revised 2026-08-13 after review:** temporarily selected a uniform entity
+    model with a declared `compact` / `delete` retention class. **Revised
+    2026-08-14:** supersedes that model and selects hard purview exclusion for
+    non-entity work: emails, payments, commands, analytics events, generic jobs,
+    `mutation_jobs`-style queues, and direct transport belong outside kafkaman.
+    The same-day implementation removes the public retention-class API instead
+    of carrying `delete` compatibility forward. Status: Accepted, promoted as
+    amendments to the entity-first propagation and messaging-scope decisions.
+
+- [proposals/13-topic-convergence-and-environment-provisioning.proposal.md](proposals/13-topic-convergence-and-environment-provisioning.proposal.md)
+  - Closes the deferred boot-time compact-topic validation, and establishes topic
+  rebuild as the answer to repartitioning. Motivated by direct evidence: the
+  example services were observed running with `cleanup.policy=delete` on both
+  `products` and `orders`, silently unable to support the rebuild the model
+  promises. Rejects fixing it with a broker default, rejects a per-contract
+  `topic_spec()`, and rejects a provisioner that creates tables. Status: Accepted.
 
 ## Plans
 
@@ -357,20 +428,40 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
   Status: Completed.
 
 - [plans/entity-first-propagation.plan.md](plans/entity-first-propagation.plan.md)
-- Active execution plan for entity-first propagation: gap-revealing convergence
-  tests, defaulted universal `entity_key`, declared retention class, `compact`
-  cache tables, boot-time topic validation, the offset-guarded upsert,
-  per-entity outbox supersede with entity-key enqueue serialization,
-  state-sourced republish, topic-lifecycle invalidation, and soft-delete-first.
-  First cache-upsert slice landed 2026-08-13 with retry, concurrent-dispatch,
-  and redrive convergence tests passing. Outbound supersede slice landed
-  2026-08-14 with key-level enqueue serialization and relay claim blocking
-  verified. Status: Active.
+- Completed M5 execution plan for entity-first propagation. Validated behavior
+  is promoted to `specs/entity-first-propagation.spec.md`; deferred work remains
+  cache bootstrap/readiness, boot-time broker topic validation, advisory origin
+  intent, a positive state-sourced republish API, proactive topic-lifecycle
+  re-bootstrap hooks, soft-delete workflow/reclamation, and the two-service
+  wiring example. Status: Completed.
+- [plans/two-service-distributed-cache-example.plan.md](plans/two-service-distributed-cache-example.plan.md)
+- Replaces the single send-only example app with two services — `product` and
+  `order` — proving entity-first cache convergence end to end over HTTP alone.
+  Records that the current example **cannot start** (no `kafkaman.toml` exists, and
+  its test bypasses `Config::discover`), that nothing today tests wiring above
+  `Harness`, and the derive-don't-decrement argument: availability is recomputed
+  from converged state rather than decremented, so redelivery cannot double-count
+  and cancellation restores the count with no compensating logic. Also records the
+  handler-runs-before-cache-upsert constraint and the exclude-and-substitute
+  correction it forces. Status: Active.
+- [plans/outbox-retention.plan.md](plans/outbox-retention.plan.md)
+- Two changes proposed together after measuring R1. The claim-order index was
+  **refuted by measurement and not shipped** — the candidate predicate is an `OR`
+  across two statuses, so no index can order it, and the plan is byte-identical with
+  and without the index. Outbox retention shipped, with its index verified
+  index-served rather than assumed. Status: Completed.
 - [plans/typed-idempotency-identity-error-row-fix.plan.md](plans/typed-idempotency-identity-error-row-fix.plan.md)
 - Completed fix plan for typed idempotency identity, transactional send/receive
   error-row symmetry, DLQ latest-failure-time semantics, and outbox replay
   checksum cleanup before merging M3/M4. All five pre-merge review findings are
   closed and every verification gate passes. Status: Completed.
+
+- [plans/topic-convergence.plan.md](plans/topic-convergence.plan.md)
+- Five-phase execution of the topic-convergence decision, in dependency order:
+  declaration and config with no I/O, `verify`, `create`, authorized cache-origin
+  invalidation, then the `examples/provision` binary. Records that the
+  provisioner is Phase 5 rather than Phase 1 because it is a thin caller of
+  `create` mode. Each phase carries its own deliberate-break gate. Status: Draft.
 
 ## Checklists
 
