@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, SqlIdentifier};
+use crate::{Error, Result, SqlIdentifier, TopicSpec};
 
 /// What a message type is called and where it is published.
 ///
@@ -14,6 +14,18 @@ use crate::{Error, Result, SqlIdentifier};
 pub struct MessageDescriptor {
     pub message_type: SqlIdentifier,
     pub topic: String,
+    /// What the topic must look like on the broker.
+    ///
+    /// Defaulted rather than declared per message type. Proposal 12 narrowed the
+    /// purview so that every in-purview type is a compact entity snapshot, which
+    /// makes compaction a property of the model — asking each contract to
+    /// restate it would invite one of them to declare a topic the rest of
+    /// kafkaman cannot honour.
+    ///
+    /// `#[serde(default)]` so descriptors serialized before this field existed
+    /// still deserialize, onto the same default they would have had.
+    #[serde(default)]
+    pub topic_spec: TopicSpec,
 }
 
 impl MessageDescriptor {
@@ -28,7 +40,17 @@ impl MessageDescriptor {
         Ok(Self {
             message_type: SqlIdentifier::new(message_type)?,
             topic,
+            topic_spec: TopicSpec::default(),
         })
+    }
+
+    /// Override the topic configuration this type requires.
+    ///
+    /// The only override with a legitimate use today is partitioning; the
+    /// cleanup policy is fixed by the model.
+    pub fn with_topic_spec(mut self, topic_spec: TopicSpec) -> Self {
+        self.topic_spec = topic_spec;
+        self
     }
 }
 

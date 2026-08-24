@@ -61,8 +61,9 @@ fn a_malformed_idempotency_source_degrades_instead_of_failing_ingest() {
         value: Some("{not json"),
     });
 
-    let (envelope, _key) =
-        record_envelope::<ProductSnapshot, _>(&record(headers)).expect("ingest must proceed");
+    let envelope = record_envelope::<ProductSnapshot, _>(&record(headers))
+        .expect("ingest must proceed")
+        .envelope;
 
     let identity = envelope
         .idempotency_key
@@ -81,7 +82,9 @@ fn a_well_formed_idempotency_source_survives_the_wire() {
         value: Some(r#"{"order_id":"o-1"}"#),
     });
 
-    let (envelope, _key) = record_envelope::<ProductSnapshot, _>(&record(headers)).unwrap();
+    let envelope = record_envelope::<ProductSnapshot, _>(&record(headers))
+        .unwrap()
+        .envelope;
     let source = envelope
         .idempotency_key
         .and_then(|identity| identity.source)
@@ -139,7 +142,9 @@ fn duplicate_headers_resolve_in_opposite_directions_by_namespace() {
             value: Some("second"),
         });
 
-    let (envelope, _key) = record_envelope::<ProductSnapshot, _>(&record(headers)).unwrap();
+    let envelope = record_envelope::<ProductSnapshot, _>(&record(headers))
+        .unwrap()
+        .envelope;
 
     assert_eq!(
         envelope.message_id, first,
@@ -149,5 +154,93 @@ fn duplicate_headers_resolve_in_opposite_directions_by_namespace() {
         envelope.headers.get("x-trace").map(String::as_str),
         Some("second"),
         "a repeated user header keeps the last copy, as `insert` always has"
+    );
+}
+
+/// A `traceparent` the producer sent must reach trace extraction and nothing
+/// else.
+///
+/// The failure this prevents is a handler receiving `traceparent` among its user
+/// headers and concluding the producer sent it as application data. A tracing
+/// SDK sent it, and it belongs to the third namespace — neither reserved nor
+/// user.
+#[test]
+fn w3c_trace_headers_are_extracted_and_kept_out_of_user_headers() {
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    let headers = header("kafkaman-idempotency-key", DIGEST)
+        .insert(Header {
+            key: "traceparent",
+            value: Some(TRACEPARENT),
+        })
+        .insert(Header {
+            key: "tracestate",
+            value: Some("vendor=1"),
+        })
+        .insert(Header {
+            key: "x-app-header",
+            value: Some("kept"),
+        });
+
+    let decoded = record_envelope::<ProductSnapshot, _>(&record(headers))
+        .expect("trace headers are never a reason to reject a record");
+
+    let trace = decoded
+        .producer_trace
+        .expect("a well-formed traceparent is extracted");
+    assert_eq!(trace.traceparent(), TRACEPARENT);
+    assert_eq!(trace.tracestate(), Some("vendor=1"));
+
+    assert_eq!(
+        decoded
+            .envelope
+            .headers
+            .get("x-app-header")
+            .map(String::as_str),
+        Some("kept"),
+        "an ordinary user header is untouched"
+    );
+    for key in ["traceparent", "tracestate", "TraceParent"] {
+        assert!(
+            !decoded.envelope.headers.contains_key(key),
+            "{key} must not be handed to application code as a user header"
+        );
+    }
+}
+
+/// Case is not a way around the namespace.
+///
+/// Kafka header keys are case-sensitive, so `TraceParent` is a distinct key to
+/// the broker. Treating it as an unrelated user header would let a producer
+/// smuggle a trace header past every rule that governs the real one.
+#[test]
+fn trace_header_matching_ignores_case() {
+    let headers = header("kafkaman-idempotency-key", DIGEST).insert(Header {
+        key: "TraceParent",
+        value: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+    });
+
+    let decoded = record_envelope::<ProductSnapshot, _>(&record(headers)).unwrap();
+    assert!(decoded.producer_trace.is_some());
+    assert!(decoded.envelope.headers.is_empty());
+}
+
+/// A malformed `traceparent` is dropped, not fatal.
+///
+/// Trace context is never required for a message to be correct, so a broken one
+/// must cost a trace and nothing else — least of all a quarantined record.
+#[test]
+fn a_malformed_traceparent_costs_the_trace_and_nothing_else() {
+    let headers = header("kafkaman-idempotency-key", DIGEST).insert(Header {
+        key: "traceparent",
+        value: Some("00-not-a-trace-id"),
+    });
+
+    let decoded = record_envelope::<ProductSnapshot, _>(&record(headers))
+        .expect("a malformed traceparent must not reject the record");
+    assert!(decoded.producer_trace.is_none());
+    assert!(
+        !decoded.envelope.headers.contains_key("traceparent"),
+        "unusable trace context is still trace context, and still not user data"
     );
 }

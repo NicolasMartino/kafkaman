@@ -6,11 +6,17 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["traces"]
 internal-hooks = []
+# W3C trace context capture and span parenting. On by default; opt out to build
+# without an `opentelemetry` dependency at all. Stored context is still read and
+# forwarded either way, so turning this off stops this process from producing
+# trace context without breaking propagation for the services around it.
+traces = ["kafkaman-core/traces"]
 
 [dependencies]
 kafkaman-config = { path = "../kafkaman-config" }
-kafkaman-core = { path = "../kafkaman-core" }
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

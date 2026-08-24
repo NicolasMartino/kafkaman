@@ -239,3 +239,49 @@ async fn replay_received_redrives_failed_rows_without_replaying_processed_rows()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn redrive_with_clear_history_resets_attempts_and_errors() -> TestResult {
+    let _test_guard = receive_test_lock().lock().await;
+    let schema = durable_send_tests::unique_schema("kafkaman_observe_clear");
+    let (_postgres, harness) = start_harness_with_config(retry_test_config(&schema, 1, 20)).await?;
+    let table = harness.received_table::<OrderCreated>().await?;
+
+    let event = Envelope::new(OrderCreated {
+        order_id: "order-observe-clear".to_owned(),
+    })
+    .with_idempotency_key("idem-order-observe-clear");
+    assert!(harness.insert_received(&event, 0, 9, None).await?);
+
+    let router = MessageRouter::new().handler::<OrderCreated>(|_conn, _meta, _msg| {
+        Box::pin(async move { Err(kafkaman_sqlx::Error::Handler("boom".to_owned())) })
+    });
+    // max_attempts is 1 in this config, so one dispatch exhausts the budget.
+    dispatch_once(harness.pool(), &table, &router, OffsetDateTime::now_utc()).await?;
+    let failed = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-clear")
+        .await?;
+    assert_eq!(failed.status, ReceiveStatus::Failed);
+    assert!(failed.attempts > 0);
+    assert!(!failed.errors.is_empty());
+
+    let replay = Replay::received_descriptor(Replay::RUNTIME_VERSION, OrderCreated::descriptor()?)
+        .max_rows(10)
+        .clear_history();
+    assert_eq!(
+        redrive_received(harness.pool(), &harness.config(), &replay).await?,
+        1
+    );
+
+    let cleared = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-clear")
+        .await?;
+    assert_eq!(cleared.status, ReceiveStatus::Pending);
+    assert_eq!(cleared.attempts, 0, "clear_history resets the retry budget");
+    assert!(
+        cleared.errors.is_empty(),
+        "clear_history drops recorded failures"
+    );
+
+    Ok(())
+}

@@ -18,14 +18,15 @@ use durable_send_tests::{
     TestResult,
 };
 use kafkaman_core::{
-    Envelope, KafkaMessage, OutboxStatus, ReceiveStatus, ReceivedError, ReceivedFailureKind,
-    ReceivedMeta,
+    Envelope, KafkaMessage, LifecycleEmission, OutboxStatus, ReceiveStatus, ReceivedError,
+    ReceivedFailureKind, ReceivedMeta,
 };
 use kafkaman_sqlx::{
     changelog, dispatch_once, enqueue_on_connection, insert_received_with_outcome, migrate,
-    migrate_dry_run, received_failed_count, received_failed_rows, Changeset, CreateReceivedTable,
-    InitSchema, MessageRouter, MigrationAction, MigrationContext, ReceivedFailureFilter,
-    ReceivedInsertOutcome, Replay,
+    migrate_dry_run, received_failed_count, received_failed_rows, received_status_summary,
+    received_stuck_rows, redrive_received, Changeset, CreateReceivedTable, InitSchema,
+    MessageRouter, MigrationAction, MigrationContext, ReceivedFailureFilter, ReceivedInsertOutcome,
+    ReceivedTable, Replay,
 };
 use kafkaman_test::{dispatch_once_with_hooks, DispatchTestHooks, EnvelopeTestExt};
 use kafkaman_worker::run_dispatcher;

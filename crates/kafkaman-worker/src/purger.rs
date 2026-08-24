@@ -3,6 +3,7 @@ use kafkaman_sqlx::{purge_outbox_once, OutboxTable};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::SchedulerMetrics;
 use crate::run_loop::sleep_or_shutdown;
 use crate::Result;
 
@@ -28,6 +29,8 @@ pub async fn run_purger(
 ) -> Result<()> {
     cfg.validate()?;
 
+    let metrics = SchedulerMetrics::new("purger", table.descriptor.message_type.as_str());
+
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -35,12 +38,18 @@ pub async fn run_purger(
 
         let deleted = match purge_outbox_once(&pool, &table, &cfg).await {
             Ok(stats) => {
+                metrics.cycle();
+                metrics.rows(
+                    "deleted",
+                    usize::try_from(stats.deleted).unwrap_or(usize::MAX),
+                );
                 if stats.deleted > 0 {
                     tracing::debug!(deleted = stats.deleted, "outbox retention batch reclaimed");
                 }
                 stats.deleted
             }
             Err(err) => {
+                metrics.error();
                 tracing::error!(
                     error = %err,
                     "outbox retention sweep failed; retrying after poll interval"

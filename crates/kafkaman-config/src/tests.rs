@@ -2,9 +2,11 @@
 
 mod config_file;
 mod duration;
+mod observability;
 mod retention;
 mod retry;
 mod schema;
+mod topics;
 
 /// A minimal config satisfying every required key, so a test can vary only the
 /// thing it is about.

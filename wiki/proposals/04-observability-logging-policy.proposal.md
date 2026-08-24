@@ -1,7 +1,7 @@
 # Observability and Logging Policy
 
 Document Class: Proposal
-Status: Proposed
+Status: Accepted
 Date: 2026-06-21
 Category: Observability
 Scope: Proposes configurable tracing, logging, metrics, and payload-safety policy for kafkaman, including per-message-type overrides.
@@ -15,6 +15,18 @@ Sources:
 Related:
 - wiki/proposals/03-direct-transport-mode.proposal.md
 - wiki/decisions/message-identity-and-header-namespace.decision.md
+- wiki/decisions/observability-operability-policy.decision.md
+- wiki/specs/m6-observability-operability.spec.md
+
+## Resolution
+
+Accepted and implemented by M6 on 2026-08-24. The validated outcome is recorded
+in `wiki/specs/m6-observability-operability.spec.md`; the durable policy choice is
+recorded in `wiki/decisions/observability-operability-policy.decision.md`.
+
+M6 selects global defaults plus per-message-type overrides, direct OpenTelemetry
+metrics, `tracing` spans/events without owning the host subscriber, sanitized
+admin routes in `kafkaman-axum`, and no payload/header emission by default.
 
 ## Context
 

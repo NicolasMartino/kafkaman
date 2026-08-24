@@ -15,6 +15,7 @@ Related:
 - wiki/specs/m2-change-engine-config.spec.md
 - wiki/decisions/message-identity-and-header-namespace.decision.md
 - wiki/decisions/retry-backoff-dlq-policy.decision.md
+- wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md
 
 ## Context
 
@@ -554,6 +555,31 @@ transaction. Treat this class as a landed regression target.
 - Why it matters: this is a live test reliability issue, not only future
   durability coverage.
 
+### Class Q - Runtime Supervision and Task Lifecycle
+
+#### Q1. A supervised loop that completes successfully shuts the service down
+
+- Mechanism: spawn into `RuntimeTasks` a task that returns `Ok(())` instead of
+  running until cancelled, and observe the runtime drain everything else.
+- Invariant: a loop that *finished its work* must be distinguishable from a loop
+  that *died*. Supervision should react to the second, not the first.
+- Current evidence: `crates/kafkaman/src/runtime/tasks.rs:98-107`. `wait()`
+  resolves on the first `join_next()`, and line 104 maps
+  `Some(Ok((_, Ok(())))) | None` to `Ok(())` — the same value a clean shutdown
+  returns. `Runtime::run` then calls `shutdown()`, which cancels the token and
+  drains every remaining loop.
+- Why it matters: **correct today, and a trap for the next person.** Every
+  kafkaman loop currently runs until cancelled, so the ambiguity has never been
+  reachable. The first loop that completes on purpose makes it reachable, and the
+  symptom is maximally misleading: the service exits seconds after boot, which
+  reads as a broker or database fault rather than a supervision bug.
+- Candidate trigger: the cache bootstrap replay in
+  [10-cache-bootstrap-and-readiness](10-cache-bootstrap-and-readiness.proposal.md),
+  which is designed to run to a watermark and stop.
+- Fix shape: a second `JoinSet` for completing tasks. `wait()` selects only over
+  the supervised set; `shutdown()` drains both. It must land *before* anything is
+  spawned into it, not alongside the first user.
+
 ## Priority Order
 
 1. A1 real two-dispatch-worker H1 regression — landed with
@@ -572,6 +598,9 @@ transaction. Treat this class as a landed regression target.
 11. L1/L3 lock starvation and pool saturation.
 12. M1 payload-safety observability test.
 13. O1 database-backed state-machine property test.
+14. Q1 completing-loop supervision ambiguity — ranked low only because it is
+    currently unreachable; it becomes blocking the moment a completing loop is
+    added, and should be fixed in the same change rather than after it.
 
 ## Coverage Matrix
 
@@ -622,6 +651,7 @@ transaction. Treat this class as a landed regression target.
 | O2 | Async scheduler model test | Chaos/model | Finds races | Future |
 | O3 | Nightly proxy chaos harness | Chaos/model | Finds rare bugs | Future |
 | P1 | TIMESTAMPTZ exact assertion precision | Test oracle | Prevents flakes | Proposed |
+| Q1 | Completing loop drains the runtime | Supervision | Currently unreachable | Proposed |
 
 ## Open Questions
 

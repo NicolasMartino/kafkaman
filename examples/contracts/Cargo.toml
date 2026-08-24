@@ -1,0 +1,19 @@
+[package]
+name = "example-contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The facade without the `rdkafka` feature: a contracts crate needs the message
+# vocabulary, not a transport. Each service turns the feature on for itself.
+kafkaman = { path = "../../crates/kafkaman" }
+serde.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

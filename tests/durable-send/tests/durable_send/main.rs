@@ -4,6 +4,7 @@
 mod claim_lease;
 mod config_validation;
 mod idempotency_and_headers;
+mod inspection;
 mod migrations;
 mod relay_and_publish;
 mod replay;
@@ -17,12 +18,13 @@ use kafkaman_core::{
 };
 use kafkaman_sqlx::{
     changelog, claim_batch, enqueue, mark_publish_failed, mark_published, migrate, migrate_dry_run,
-    AddIdempotencyKey, Changeset, CreateOutboxTable, InitSchema, MigrationAction, MigrationContext,
-    OutboxTable, Replay,
+    outbox_status_summary, outbox_stuck_rows, AddIdempotencyKey, Changeset, CreateOutboxTable,
+    InitSchema, MigrationAction, MigrationContext, OutboxTable, Replay,
 };
 use kafkaman_test::{EnvelopeTestExt, Harness};
 use kafkaman_worker::{BoxError, Publisher};
 use serde::Serialize;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize)]

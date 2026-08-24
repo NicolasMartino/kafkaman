@@ -1,8 +1,9 @@
 # Two-Service Distributed Cache Example
 
 - Document Class: Plan
-- Status: Active
+- Status: Completed
 - Date: 2026-08-24
+- Completed: 2026-08-24
 - Category: Delivery execution
 - Scope: Replace the single send-only example app with two services that prove
   entity-first cache convergence end to end, driven entirely by HTTP.
@@ -235,3 +236,99 @@ which is itself the argument for the example existing.
   likely new flake source; mitigated by deadline polling and the ephemeral port.
 - **Rename churn.** `apps/axum-outbox` appears in its Cargo.toml, the workspace
   members list, `.github/workflows/ci.yml`, its own tests, and the wiki.
+
+## Outcome (2026-08-24)
+
+Shipped as `examples/contracts`, `examples/order`, `examples/product`, and
+`tests/distributed-cache`. `cargo test --workspace --all-features` is green at
+153 passing: the 141 that existed, minus the 3 deleted `axum-outbox` HTTP tests,
+plus 15 new. `just lint` is clean and the coverage floor still passes at 91.2%
+lines.
+
+Every verification item held, including the one that mattered most: **both
+wiring breaks were demonstrated, not assumed.** Removing the dispatcher spawn
+failed the test at the convergence deadline (`did not settle past offset -1
+within 90s; last observed: None`); removing `CreateCacheTable` from `order`'s
+changelog failed it in three seconds on a 500 from the cache read. Nothing else
+in the workspace noticed either break.
+
+The Redpanda ephemeral-port approach worked cleanly, so F16 is fixed:
+`redpanda_full_loop.rs` reserves a port from the OS per container instead of
+hardcoding `19092`. Its process-global mutex was kept, with its comment
+rewritten — it never protected against a second *binary*, and what it still buys
+is not running a dozen brokers at once on a laptop.
+
+### Deviations from the plan
+
+**Two, both deliberate.**
+
+**Snapshot idempotency keys are derived from a per-entity version column**, not
+from the payload. The plan did not settle this, and payload-derived keys are the
+obvious choice that quietly breaks the example's own step 4: cancelling restores
+availability to a value already published, so a payload digest would re-derive a
+key the consumer has already seen and the restoring snapshot would be dropped as
+a duplicate — the cache would sit at 7 forever. `orders.version` and
+`products.version` increment on every state change, so a retried write of one
+state still deduplicates while a genuinely new state never can. This is an
+idempotency identity, not a convergence ordinal; the ordinal is still the Kafka
+offset, so the entity-first decision's argument against producer-stamped
+versions does not apply.
+
+**The availability-only rejection runs before discontinuation, not after.** The
+plan's step 6 ("order 999 → rejected on availability alone") follows step 5,
+which discontinues the product — after which any rejection proves nothing about
+the quantity comparison, because the status check fires first. Reordering keeps
+both assertions meaningful without a second product.
+
+### Smaller decisions worth recording
+
+- **Wire enums carry a catch-all `Unrecognized(String)` variant.** The
+  entity-first decision makes this a hard requirement for the origin-intent enum;
+  domain status enums travel identically and have the identical failure mode
+  (a new variant at an un-redeployed consumer is a deterministic ingest skip, and
+  enough of them trip the topic-wide breaker). Serde's `#[serde(other)]` does not
+  cover externally-tagged string enums, so they round-trip through `String`.
+- **`Config::discover()` is exercised by each service's own tests, not by the
+  two-service one.** Discovery walks up from the process's current directory, so
+  it cannot serve two services in one process. Cargo runs an integration test
+  with the package root as the current directory, which is exactly where each
+  binary is meant to be run from — so `examples/*/tests/` test discovery for
+  real, and `tests/distributed-cache` loads the same files by path.
+- **The example configs had to be un-ignored.** `.gitignore` matched
+  `kafkaman.toml` at every level, which is what made the original example
+  unrunnable in the first place; `!examples/*/kafkaman.toml` is now an explicit
+  exception, with the reasoning in the file.
+- **`product` republishes unconditionally**, without change detection. A snapshot
+  repeating a value is harmless under a guarded upsert, and always republishing
+  makes "this order has been accounted for" something a consumer can wait on —
+  which is what lets the test assert on a *rising `applied_offset`* rather than
+  on a timeout.
+- **Handler-tier cases live in `examples/product/tests/`, not in the two-service
+  test.** The exclusion bug and the double-count case need Postgres but no
+  broker, and the case that actually distinguishes a correct exclusion from a
+  missing one — two orders, one re-fulfilled — costs a fraction of a round trip
+  there.
+- **No compatibility note.** The library's public API is unchanged; the only
+  library edit is rustdoc on `dispatch_once` and `MessageRouter::handler`.
+  `kafkaman.example.toml`'s per-type retry override moved from `order_created` to
+  `order_snapshot` to track the example's rename, which is documentation.
+
+### One consequence the plan did not anticipate
+
+**The rename reverses a deliberate 2026-06-21 decision, and the coverage number
+moved for a reason that has nothing to do with test quality.** The example was
+moved *out of* `examples/` into `apps/axum-outbox` back then specifically because
+`cargo llvm-cov` excludes `examples/`, so keeping it there stopped it counting
+toward the workspace total. Renaming back removes roughly 900 lines of example
+code from the denominator: the floor still passes comfortably at 91.2% lines, but
+what it now measures is `crates/` alone.
+
+Recorded rather than reversed, because on balance it is the better number.
+kafkaman's coverage gate exists to describe the library, and the library test
+strategy already states that coverage % is a signal while the gate is that the
+durability invariants are exercised — a percentage propped up by demonstration
+code answers neither question. The example services are covered by their own
+tests either way; they simply no longer flatter the total.
+
+The thing to avoid is reading the coverage number across this change as if it
+were comparable. It is not.

@@ -17,6 +17,12 @@ pub enum Error {
     #[error("delivery failed: {0}")]
     Delivery(String),
 
+    #[error(transparent)]
+    Core(#[from] kafkaman_core::Error),
+
+    #[error("topic `{topic}`: {message}")]
+    TopicAdmin { topic: String, message: String },
+
     /// An `internal-hooks` observer returned an error.
     ///
     /// Named for what it is in this crate rather than for who uses it: the

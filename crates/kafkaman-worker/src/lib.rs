@@ -22,12 +22,17 @@ pub use kafkaman_core;
 pub use kafkaman_sqlx;
 
 mod dispatcher;
+mod metrics;
 mod purger;
+#[cfg(feature = "metrics")]
+mod queue_metrics;
 mod relay;
 mod run_loop;
 
 pub use dispatcher::run_dispatcher;
 pub use purger::run_purger;
+#[cfg(feature = "metrics")]
+pub use queue_metrics::{run_queue_metrics, QueueMetricsConfig};
 pub use relay::{relay_once, run};
 
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
@@ -43,6 +48,12 @@ pub enum Error {
 
     #[error("invalid dispatcher config: {field} {reason}")]
     InvalidDispatcherConfig {
+        field: &'static str,
+        reason: &'static str,
+    },
+
+    #[error("invalid queue metrics config: {field} {reason}")]
+    InvalidQueueMetricsConfig {
         field: &'static str,
         reason: &'static str,
     },

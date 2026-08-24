@@ -1,0 +1,45 @@
+# kafkaman config for the `product` example service.
+#
+# Committed, unlike a real deployment's `kafkaman.toml` — see the repository
+# `.gitignore`. It holds no secrets (the connection string and broker list are
+# environment variables, not kafkaman keys), and an example config nothing reads
+# is an example config that rots. This file is loaded by `Config::discover()`
+# from the binary and asserted by this package's own tests.
+#
+# Intervals are short because two services and six loops have to converge inside
+# a test's patience. A real deployment would poll far less often.
+
+[database]
+schema = "kafkaman"
+
+[relay]
+worker_id = "product-1"
+batch_limit = 100
+lease_for = "30s"
+retry_after = "250ms"
+poll_interval = "100ms"
+
+[retry.defaults]
+max_attempts = 5
+initial_backoff = "250ms"
+max_backoff = "10s"
+multiplier = 2.0
+errors_limit = 16
+dlq = "table"
+
+# Dispatch retries apply to what this service *consumes*. The deriving handler
+# touches two tables and republishes, so it has more ways to hit a transient
+# failure than a no-op handler does — a slightly larger budget is warranted.
+[retry.messages.order_snapshot]
+max_attempts = 8
+
+# Checked at boot, before the pool is opened and before any loop is spawned.
+#
+# Spelled out rather than left to the default, which is the same value: this is
+# an example, and the knob that keeps entity topics compacted is worth seeing.
+# `verify` means this service reads the broker's topic configuration and refuses
+# to start on a topic that is missing or not `cleanup.policy=compact` — it never
+# writes. `examples/provision` runs first, in `create` mode, and is what puts
+# the topics there.
+[topics]
+mode = "verify"

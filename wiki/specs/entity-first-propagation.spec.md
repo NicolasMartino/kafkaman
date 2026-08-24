@@ -3,6 +3,8 @@
 Document Class: Spec
 Status: Active
 Date: 2026-08-24
+Revised: 2026-08-25 (topic convergence; see the topic-convergence-and-rebuild decision)
+Revised: 2026-08-26 (dispatch handler ordering; the handler now runs *after* the cache upsert)
 Category: Entity-first propagation
 Scope: Validated M5 behavior for compact entity-cache propagation, offset-guarded cache convergence, per-entity outbound supersede, unsafe replay rejection, wire-carried producer metadata, retry jitter, and opt-in outbox retention.
 Sources:
@@ -15,13 +17,18 @@ Sources:
 - wiki/compatibility/m5-outbox-retention.compat.md
 - wiki/decisions/outbox-retention-policy.decision.md
 - crates/kafkaman-core/src/lib.rs
+- crates/kafkaman-core/src/topics.rs
 - crates/kafkaman-sqlx/src/lib.rs
 - crates/kafkaman-rdkafka/src/lib.rs
+- crates/kafkaman-rdkafka/src/topics.rs
 - crates/kafkaman-worker/src/lib.rs
 - tests/durable-send/tests/entity_first_propagation.rs
 - tests/durable-send/tests/entity_first_outbox_supersede.rs
 - tests/durable-send/tests/outbox_retention.rs
 - tests/durable-send/tests/redpanda_full_loop.rs
+- tests/durable-send/tests/topic_convergence.rs
+- tests/distributed-cache/tests/provision.rs
+- examples/provision/src/lib.rs
 Related:
 - wiki/specs/m3-durable-receive.spec.md
 - wiki/specs/m4-retry-backoff-dlq.spec.md
@@ -68,10 +75,41 @@ this column existed.
 
 ### Receive-side convergence
 
-Receive dispatch still runs the handler first. On handler success,
-`apply_successful_dispatch` applies the cache update and marks the received row
-`Processed` in the same transaction. A rollback of that transaction rolls back
-both the handler effects and the cache/processed mark.
+**Revised 2026-08-26.** This section previously read "Receive dispatch still
+runs the handler first", which was validated truth until the reorder shipped and
+is now wrong. See
+[decisions/dispatch-handler-ordering.decision.md](../decisions/dispatch-handler-ordering.decision.md)
+for why it changed and
+[compatibility/dispatch-handler-ordering.compat.md](../compatibility/dispatch-handler-ordering.compat.md)
+for what it means for a low-level caller.
+
+Receive dispatch runs, in one transaction: claim the row, look up its handlers,
+open the dispatch savepoint, run the optional pre-upsert handler, apply the cache
+upsert, run the optional post-upsert handler, mark the received row `Processed`.
+
+- `MessageRouter::handler` is the post-upsert position and the default. A handler
+  deriving state from its own cache sees the incoming record already applied.
+- `MessageRouter::handler_before` is the explicit pre-image opt-in and returns a
+  `HandlerFlow`, which may skip the post-upsert handler but never the upsert.
+- Neither position can suppress the cache upsert. There is no ingest-time filter
+  hook, and adding one is permanently out of scope: the cache is the converged
+  current state of every entity on the topic, so a filtered record leaves a stale
+  row that only the filtered message could have corrected.
+- The post-upsert handler is skipped when the cache apply outcome is `Ignored`,
+  and runs for `Applied` and `Migrated`. `DispatchStats.processed` therefore no
+  longer implies the handler ran; it remains the row-disposition count that
+  [decisions/dispatch-stats-semantics.decision.md](../decisions/dispatch-stats-semantics.decision.md)
+  defines.
+- The savepoint opens *before* the upsert and covers both hooks, so a handler
+  failure rolls back the upsert, the handler's own writes, and any
+  consume-then-produce enqueue together. This is the part that is not
+  mechanically safe and is asserted behaviourally: with the savepoint left after
+  the upsert, a failed handler commits an advanced cache row, the retry yields
+  `Ignored`, and the handler is skipped forever.
+- The `MissingHandler` lookup remains ahead of the upsert and now checks both
+  positions. An unregistered type parks its row `Retryable` with the cache
+  untouched, unchanged from
+  [decisions/missing-handler-dispatch-policy.decision.md](../decisions/missing-handler-dispatch-policy.decision.md).
 
 The cache upsert resolves entity identity from the persisted received-row
 `entity_key` column, with a Kafka record-key fallback only for legacy rows
@@ -84,11 +122,29 @@ incoming record matches the currently applied topic and partition and has a
 higher `source_offset`. Older retry, redrive, redelivery, and concurrent
 dispatch rows are therefore processed without regressing cache state.
 
+**Revised 2026-08-25.** The guard is no longer the only write path. A record
+that arrives on the topic its message type *declares*, for an entity whose cache
+holds a different topic, is written outside the guard by `migrate_cache_origin`
+— see the outcome table below.
+
 `CacheApplyOutcome::Applied` records forward progress. `Ignored` records a
-correct stale-record loss. Topic or partition mismatch is reported as
-`CacheOriginMismatch`, not as a normal ignored record, because offsets are not
-comparable across origins. `MissingEntityKey` and `CacheOriginMismatch` are
-terminal receive failures on the first attempt.
+correct stale-record loss. `Migrated` records that the cache adopted a new
+origin and the offset guard was reset.
+
+**Revised 2026-08-25.** As shipped in M5, any topic or partition mismatch was
+reported as `CacheOriginMismatch` and was never a normal ignored record. That is
+now true of only two of the four cases, because the topic a message type
+declares is what distinguishes a rebuilt topic from a misconfigured consumer:
+
+| Cached origin | Incoming record | Outcome |
+|---|---|---|
+| same topic, same partition | — | `Ignored` |
+| same topic, different partition | — | `CacheOriginMismatch`, terminal |
+| different topic | on the declared topic | `Migrated`, guard reset |
+| different topic | not on the declared topic | `Ignored` when the cache already sits on the declared topic, otherwise `CacheOriginMismatch` |
+
+`MissingEntityKey` and `CacheOriginMismatch` remain terminal receive failures on
+the first attempt.
 
 ### Outbound per-entity supersede
 
@@ -198,8 +254,17 @@ The two-service distributed-cache example is not part of this closeout. It
 remains the active wiring proof in a separate worktree: two services, two
 databases, HTTP-only assertions, and end-to-end cache convergence.
 
-Broker topic validation is not implemented. kafkaman does not yet check at boot
-that entity topics use `cleanup.policy=compact` alone.
+Broker topic validation is implemented and wired into boot. **Revised
+2026-08-25:** `kafkaman_rdkafka::converge_topics` verifies that entity topics use
+`cleanup.policy=compact` alone, under `[topics] mode` (`verify` by default,
+`create`, or `off`), and `kafkaman_core::topics::reconcile` holds the decision.
+`ResolvedConfig` carries the mode. Both example services call it after config
+resolution and before the pool is opened, and `examples/provision` creates the
+topics in `create` mode beforehand — the check refuses to start on an absent
+topic and will not let a broker auto-create one, so provisioning is a
+prerequisite rather than a convenience. kafkaman still calls none of this on a
+consumer's behalf: it is a capability an application wires in, and now one the
+in-tree example demonstrates wiring.
 
 There is no public advisory origin-intent enum yet. The accepted decision still
 requires intent to be advisory and forward-compatible, but M5 does not expose or
@@ -209,9 +274,13 @@ There is no state-sourced republish API yet. M5 validates the negative half:
 row-sourced `Replay::outbox` is rejected. A positive resync surface must re-read
 current domain state and enqueue through the normal supersede path.
 
-Topic-lifecycle invalidation is partial. A per-row origin mismatch fails
-terminally as `CacheOriginMismatch`, but there is no broker topic-ID detection,
-global consecutive-regression circuit breaker, or forced re-bootstrap hook.
+Topic-lifecycle invalidation is partial. **Revised 2026-08-25:** a cross-topic
+origin change onto the declared topic now migrates rather than failing, which is
+what makes a topic rebuild survivable; an in-place partition change still fails
+terminally as `CacheOriginMismatch`, deliberately, because the supported way to
+change a partition count is to republish every entity onto a new topic. There is
+still no broker topic-ID detection, global consecutive-regression circuit
+breaker, or forced re-bootstrap hook, and no tooling for the cutover itself.
 
 Soft-delete-first is not validated as a domain deletion workflow. Cache tables
 have a `deleted` column, but M5 does not yet define a typed deletion surface,

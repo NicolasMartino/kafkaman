@@ -1,0 +1,47 @@
+# The build context is the workspace root, because the example services depend on
+# `crates/` and `examples/contracts`. That makes this file mandatory rather than
+# a nicety: `target/` alone is several gigabytes, and every byte of it would be
+# uploaded to the daemon before the build could start.
+target/
+**/target/
+
+# No trailing slash on purpose. In a git *worktree* — which is how this repo is
+# often checked out — `.git` is a one-line file holding a gitdir pointer, not a
+# directory, and `.git/` would silently fail to match it.
+.git
+.gitignore
+
+# Excluded because it changes the build, not because it is large.
+#
+# It sets `channel = "stable"`, but the rust image's default toolchain is named
+# by exact version. Leaving this in the context makes rustup treat "stable" as a
+# second toolchain and download it, plus rustfmt and clippy, inside the RUN
+# where it is not layer-cached — so every cold build pays for it again. The
+# image already *is* current stable, which is what this file asks for, and
+# Cargo.lock is what actually provides reproducibility.
+#
+# If the repo ever pins a specific version here, drop this line: the container
+# would otherwise silently build on a different compiler than everything else.
+rust-toolchain.toml
+
+# Knowledge base and agent scaffolding. None of it is a build input.
+raw/
+wiki/
+.serena/
+.llm_wiki/
+.claude/
+.github/
+project_guidelines.md
+AGENTS.md
+CLAUDE.md
+
+# Note there is deliberately no `kafkaman.toml` rule here. Docker matches these
+# patterns against the full context-relative path rather than at every directory
+# level the way git does, so a bare `kafkaman.toml` would not exclude the
+# per-service configs anyway — but spelling one out invites the belief that it
+# would. The Dockerfile copies each service's config in explicitly.
+.env
+.env.*
+.DS_Store
+**/*.rs.bk
+Cargo.lock.orig

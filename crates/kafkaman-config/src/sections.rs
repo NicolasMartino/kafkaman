@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kafkaman_core::{PurgeConfig, RelayConfig};
+use kafkaman_core::{LifecycleEmission, PurgeConfig, RelayConfig, TopicMode};
 use serde::Deserialize;
 
 use crate::duration::deserialize_duration;
+use crate::observability::{validate_observability_override, validate_observability_policy};
 use crate::retry::validate_policy;
-use crate::{ConfigErrors, ConfigIssue, RetryConfig, RetryPolicy, RetryPolicyOverride};
+use crate::{
+    ConfigErrors, ConfigIssue, ObservabilityConfig, ObservabilityPolicy,
+    ObservabilityPolicyOverride, RetryConfig, RetryPolicy, RetryPolicyOverride,
+};
 
 /// The `[relay]` section of `kafkaman.toml`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -30,6 +34,10 @@ impl RelaySection {
             lease_for: self.lease_for,
             retry_after: self.retry_after,
             poll_interval: self.poll_interval,
+            // The relay section carries no lifecycle knobs of its own; callers
+            // overlay the resolved per-message-type policy with
+            // `RelayConfig::lifecycle`.
+            lifecycle: LifecycleEmission::default(),
         };
         cfg.validate().map_err(|err| err.to_string())?;
         Ok(cfg)
@@ -115,6 +123,73 @@ impl RetrySection {
         if issues.is_empty() {
             Ok(RetryConfig {
                 defaults: self.defaults,
+                overrides,
+            })
+        } else {
+            Err(ConfigErrors::new(issues))
+        }
+    }
+}
+
+/// The `[topics]` section.
+///
+/// `TopicMode` itself lives in `kafkaman-core` beside the `reconcile` function
+/// that gives each variant meaning, so the decision table has one home.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TopicsSection {
+    #[serde(default)]
+    pub mode: TopicMode,
+}
+
+/// The `[observability]` section of `kafkaman.toml`: defaults plus per-type
+/// overrides.
+///
+/// `Default` is what an absent section means, and it is deliberately the same
+/// value as an empty `[observability]` table: no overrides anywhere, so every
+/// policy falls through to [`ObservabilityPolicy::default`].
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySection {
+    #[serde(default)]
+    pub defaults: ObservabilityPolicyOverride,
+    #[serde(default)]
+    pub messages: BTreeMap<String, ObservabilityPolicyOverride>,
+}
+
+impl ObservabilitySection {
+    pub fn resolve(
+        self,
+        registered_messages: &BTreeSet<String>,
+    ) -> std::result::Result<ObservabilityConfig, ConfigErrors> {
+        let mut issues = Vec::new();
+        let defaults = self.defaults.apply_to(ObservabilityPolicy::default());
+        validate_observability_policy("observability.defaults", &defaults, &mut issues);
+
+        let mut overrides = BTreeMap::new();
+        for (message_type, override_policy) in self.messages {
+            if !registered_messages.contains(&message_type) {
+                issues.push(ConfigIssue::new(
+                    format!("observability.messages.{message_type}"),
+                    "message type is not registered",
+                ));
+            }
+
+            // Validate the override's own fields, not the merged result. A bad
+            // default is one mistake in one place; reporting it again under
+            // every message type that inherits it buries the actual fix under
+            // repetitions of it.
+            validate_observability_override(
+                &format!("observability.messages.{message_type}"),
+                &override_policy,
+                &mut issues,
+            );
+            overrides.insert(message_type, override_policy);
+        }
+
+        if issues.is_empty() {
+            Ok(ObservabilityConfig {
+                defaults,
                 overrides,
             })
         } else {

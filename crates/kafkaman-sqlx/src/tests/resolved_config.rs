@@ -107,6 +107,13 @@ fn the_shipped_example_config_resolves_and_covers_every_section() {
         "the example's per-type override should demonstrate an actual override"
     );
 
+    let default_observability = resolved.observability.policy_for("unregistered_type");
+    let overridden_observability = resolved.observability.policy_for("order_created");
+    assert_ne!(
+        default_observability.sample_success, overridden_observability.sample_success,
+        "the example's per-type observability override should demonstrate an actual override"
+    );
+
     // Every optional section the crate reads must be present and valid, or the
     // example is not the complete knob list it claims to be.
     cfg.retention()
@@ -156,4 +163,71 @@ fn from_config_rejects_a_message_type_registered_under_two_topics() {
     )
     .expect("an identical descriptor is a duplicate, not a conflict");
     assert_eq!(resolved.messages().len(), 1);
+}
+
+#[test]
+fn the_topic_mode_resolves_with_everything_else() {
+    // Reading `[topics]` at the call site instead would mean a mistyped mode
+    // surfaced later and separately from the rest of the config report — after
+    // a pool was already open, which is exactly what this crate promises not to
+    // do.
+    use kafkaman_core::TopicMode;
+
+    // Absent means `verify`, not "skip": a service publishing entity snapshots
+    // onto an uncompacted topic cannot rebuild them, and a silent default would
+    // preserve that failure.
+    let cfg = ResolvedConfig::from_config(Some(&minimal_config()), [descriptor("order_created")])
+        .expect("a config without a [topics] section still resolves");
+    assert_eq!(cfg.topics, TopicMode::Verify);
+
+    let explicit = kafkaman_config::Config::parse(
+        r#"
+            [database]
+            schema = "kafkaman"
+
+            [relay]
+            worker_id = "worker-a"
+            batch_limit = 10
+            lease_for = "30s"
+            retry_after = "1s"
+            poll_interval = "250ms"
+
+            [topics]
+            mode = "create"
+            "#,
+    )
+    .unwrap();
+    let cfg = ResolvedConfig::from_config(Some(&explicit), [descriptor("order_created")])
+        .expect("an explicit mode resolves");
+    assert_eq!(cfg.topics, TopicMode::Create);
+}
+
+#[test]
+fn an_unknown_topic_mode_fails_resolution_rather_than_defaulting() {
+    // The failure that matters: `mode = "verfy"` silently taking the default
+    // would look identical to a working config while checking nothing the
+    // operator asked for. It must be rejected, and it must name the section.
+    let cfg = kafkaman_config::Config::parse(
+        r#"
+            [database]
+            schema = "kafkaman"
+
+            [relay]
+            worker_id = "worker-a"
+            batch_limit = 10
+            lease_for = "30s"
+            retry_after = "1s"
+            poll_interval = "250ms"
+
+            [topics]
+            mode = "verfy"
+            "#,
+    )
+    .unwrap();
+
+    let err = ResolvedConfig::from_config(Some(&cfg), [descriptor("order_created")])
+        .expect_err("an unknown mode must be rejected");
+    let message = err.to_string();
+    assert!(message.contains("topics"), "{message}");
+    assert!(message.contains("verfy"), "{message}");
 }

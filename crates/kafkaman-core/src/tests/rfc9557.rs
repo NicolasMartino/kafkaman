@@ -46,3 +46,30 @@ fn every_rendered_timestamp_parses_back_to_itself() {
         assert_eq!(rfc9557::parse(&rendered).unwrap(), value, "{rendered}");
     }
 }
+
+#[test]
+fn rfc9557_option_round_trips_through_json() {
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    struct Holder {
+        #[serde(with = "rfc9557::option")]
+        at: Option<OffsetDateTime>,
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let some = Holder { at: Some(now) };
+    let json = serde_json::to_value(&some).unwrap();
+    assert!(
+        json["at"].is_string(),
+        "an optional timestamp must serialize as a string, got {}",
+        json["at"]
+    );
+    assert_eq!(
+        serde_json::from_value::<Holder>(json).unwrap().at,
+        Some(now)
+    );
+
+    let none = Holder { at: None };
+    let json = serde_json::to_value(&none).unwrap();
+    assert!(json["at"].is_null());
+    assert_eq!(serde_json::from_value::<Holder>(json).unwrap().at, None);
+}

@@ -13,6 +13,8 @@
 - Related:
   - wiki/decisions/retry-backoff-dlq-policy.decision.md
   - wiki/specs/m1-durable-send.spec.md
+  - wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md
+    (amends clause 5: adds W3C trace headers as a third namespace)
 
 ## Decision
 

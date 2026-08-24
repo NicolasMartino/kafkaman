@@ -64,9 +64,11 @@
   publishes through `RdkafkaPublisher` to a real broker. It offers explicit
   `relay_once`, ephemeral schema migration, row assertions, and published-record
   assertions, and serializes concurrent dynamic message registration.
-- `apps/axum-outbox` demonstrates host wiring: migrate with local changelog,
+- `examples/order` demonstrates host wiring: migrate with local changelog,
   start relay worker, and enqueue inside the same SQL transaction as the business
-  insert.
+  insert. (Was `apps/axum-outbox` until 2026-08-24, when the examples were
+  reshaped into the two-service distributed cache; the M1 send path it shows is
+  unchanged, and it now also runs the receive side.)
 
 ## Verified Gates
 

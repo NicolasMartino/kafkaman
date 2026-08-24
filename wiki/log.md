@@ -1,5 +1,1311 @@
 # Wiki Log
 
+## [2026-08-27] update | review corrections and one verified enqueue finding
+
+Second review pass over the staged 2026-08-26 change. Two of its findings were
+stale-text defects the first pass introduced by fixing one half of a claim and
+not the other; the third is new and came out of verifying something proposal 16
+had recorded as unverified.
+
+**Proposal 10 said `get()` twice.** The revision establishes that kafkaman ships
+no typed key-value getter and that readiness therefore gates the qualified table
+name, but the original *Readiness surface* section still read "with `get()`
+available only on `Ready`" — reintroducing the API shape the revision exists to
+remove. Amended in place rather than rewritten, since the argument around it is
+untouched by which capability is gated.
+
+**The builder plan's item-7 lead-in outlived its item.** Item 7 was rewritten to
+record the tombstone representation as settled by Phase 0; the paragraph
+introducing the list still announced it as "the one thing that remains genuinely
+undecided". Fixed.
+
+**Proposal 16's open finding is now settled, and it inverts.** The page recorded
+that both example contracts declare `partition_key` returning the same value as
+`entity_key` and asked whether the documented fallback makes those four lines per
+type redundant. Verified against the enqueue path: redundant for routing —
+`record_key` is `partition_key.or(entity_key)` and the publisher keys from
+nothing else — but **not** redundant overall.
+`crates/kafkaman-sqlx/src/outbox_enqueue.rs:54` attaches the
+`kafkaman-entity-key` header only when the *declared* partition key differs from
+the entity key, so declaring them equal suppresses it while returning `None` does
+not. A derive that omitted `partition_key` would therefore start emitting a
+header on every record from both example types, stating what the record key
+already says.
+
+The condition is the real defect: it tests the declared key where the header's
+purpose is about the effective one, and the fallback makes those different
+things. `RegionalOrder` is the case the header exists for — declared `eu-west`,
+entity `order-77`, header present and asserted in the full-loop test. Narrowing
+the condition to the effective record key is a **prerequisite** for the derive's
+`partition_key` default, not a follow-up: land the derive first and it is a
+silent wire change for every type that declares the two keys equal.
+
+No code changed.
+Pages affected: wiki/index.md, wiki/log.md,
+wiki/plans/runtime-builder-and-axum-composition.plan.md,
+wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md,
+wiki/proposals/16-message-contract-derive.proposal.md
+
+## [2026-08-26] design | next dev-UX increment scoped; merge and OTel deferred
+
+A design session over what follows the runtime-builder workstream. No code
+changed. Five findings came out of it, two of which contradicted live wiki pages
+and one of which is a latent trap in shipped code — recorded here because they
+existed only in conversation.
+
+**Proposal 10 was written for the wrong cache shape.** It assumes a per-process
+cache, reaches for the Kafka Streams GlobalKTable distinction, and prescribes
+per-instance consumer groups reading all partitions. kafkaman's cache is a
+Postgres table every replica of a service queries —
+`entity-first-propagation-model.decision.md:111` states it as load-bearing: "all
+instances share one database". The failure the proposal is built around, a second
+pod holding half the data, cannot happen; that pod holds no data. Per-instance
+groups, group naming and group cleanup all dissolve, which *dissolves* its first
+open question rather than answering it.
+
+The hazard it misses is worse than the one it describes: **a fresh database under
+a surviving consumer group.** A restored database booting with the same
+`consumer_group` starts at that group's committed offset, and every entity below
+it is missing from the cache permanently and silently. Nothing recovers from it.
+The replay consumer survives, reframed as assign-based and non-committing,
+triggered by what the database says rather than where the group's offsets are.
+
+The readiness typestate survives too, with one change: there is no `get()` to
+gate, because kafkaman deliberately ships no typed getter — "the table is the
+API". So `Cache<Bootstrapping>` → `Cache<Ready>` gates the *qualified table name*,
+which is the narrowest thing that can be withheld and the one every query has to
+interpolate. Open questions 2-5 are answered on the page rather than left open.
+
+**Concurrent dispatch would silently corrupt derived state.** New proposal 15.
+The claim layer has been ready for a long time — `received_rows.rs:38` uses
+`FOR UPDATE SKIP LOCKED` and says so in a comment — so only the ability to *ask*
+is missing. But `examples/product/src/lib.rs::recompute_availability` reads a
+`SUM` and writes it back, so two orders for one product dispatched concurrently
+under READ COMMITTED both compute a partial sum and the last writer wins. It is
+correct today *only* because dispatch is serial, not because anyone reasoned
+about it. Hence: opt-in, default 1, documented as a handler-contract change, and
+the example fixed with `SELECT … FOR UPDATE` so the demonstration ships with the
+knob.
+
+**The Tower question is settled, with reasons.** Deferred three times across the
+handler-model, receive-handler-surface and runtime-builder decisions. Rejected on
+two independent grounds. *Types:* handlers borrow the transaction connection, so
+`HandlerFuture<'a>` is lifetime-bound while `tower::Service::Future` is a
+lifetime-free associated type — and `retry` needs `clone_request` while `buffer`
+needs `Req: 'static`, bounds a unique mutable borrow can never satisfy. *Fit:*
+`poll_ready` addresses backpressure from uncontrolled inbound load, and the
+dispatcher pulls — the work waits durably in a table, so there is no shedding
+decision to express. Making dispatch event-driven via `NOTIFY` does not change
+that; push-versus-poll is not the axis, *whether you can refuse work* is. Kafka
+could not push anyway: it is pull-based at the protocol level and librdkafka's
+bounded prefetch queue already implements the backpressure below our code. What
+survives contact is `timeout` and `rate-limit`. So: borrow Tower's vocabulary, not
+its trait — a `Layer` carrying `'a`, plus proposal 14's `with_router` hook.
+
+**`RuntimeTasks::wait()` treats a completing loop as a shutdown signal.**
+`crates/kafkaman/src/runtime/tasks.rs:98-107`, line 104 maps
+`Some(Ok((_, Ok(()))))` to the same `Ok(())` a clean shutdown returns, after
+which `Runtime::run` drains everything. Correct today because every kafkaman loop
+runs until cancelled — and a trap for the first one that does not. A cache
+bootstrap loop would be exactly that, making a *successful* bootstrap kill the
+service seconds after boot, presenting as a broker fault. Filed as Class Q in the
+deep-durability catalog, and as a blocking prerequisite on proposal 10.
+
+**`#[derive(KafkaMessage)]`.** New proposal 16, for the 18 hand-written impls.
+Two rules matter more than the macro: `message_type`/`topic` stay explicit,
+because inferring them from the type name makes a struct rename a silent
+wire-contract change; and the derive stays sugar, per the standing principle that
+dropped `#[kafkaman::handler]`. Carries an open finding — both example contracts
+define `partition_key` returning the same value as `entity_key`, which the trait's
+documented fallback may make redundant.
+
+### Sequencing: merge and OTel first, deliberately
+
+None of the above is being built yet. The runtime-builder branch merges to
+`main` and `implementation/m6-observability` integrates *before* any of it,
+because every one of these slices touches the dispatcher loop, the builder, or
+the examples — precisely the files M6 instruments. Landing them first would make
+M6 rebase onto changed code or instrument code about to change underneath it.
+
+The delay has a measurable cost already: the cross-worktree coordination note
+recorded three `global::meter("kafkaman")` call sites; on
+`implementation/m6-observability` there are now six — two in
+`crates/kafkaman-rdkafka/src/metrics.rs`, three in
+`crates/kafkaman-worker/src/metrics.rs`, and one in
+`crates/kafkaman-worker/src/queue_metrics.rs`. None of them exist on this branch,
+where `crates/` still contains no `opentelemetry` at all. Every week unmerged is more
+instrumentation written against the global that clause 9 of the runtime-builder
+decision says must be injected — the one accepted clause the builder knowingly
+shipped against.
+
+Also recorded: `examples/order/src/boot.rs` exists only to satisfy the builder
+plan's 60-line gate and should be folded back into `service.rs`. Noted on the plan
+that created it, not in a backlog.
+
+Pages affected: `wiki/proposals/15-dispatch-concurrency-and-middleware.proposal.md`
+(new), `wiki/proposals/16-message-contract-derive.proposal.md` (new),
+`wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md`,
+`wiki/proposals/08-listen-notify-scheduler-wakeup.proposal.md`,
+`wiki/proposals/05-deep-durability-testing.proposal.md`,
+`wiki/plans/runtime-builder-and-axum-composition.plan.md`, `wiki/index.md`,
+`wiki/log.md`. No code changed.
+
+## [2026-08-26] implement | runtime builder shipped, dispatch handlers reordered
+
+All seven phases of
+[plans/runtime-builder-and-axum-composition.plan.md](plans/runtime-builder-and-axum-composition.plan.md)
+landed. The observable result: `examples/order/src/service.rs` went from 229
+lines to 51 and `examples/product/src/service.rs` from 201 to 55, and neither
+now names an outbox table, a changeset, a topic admin, a publisher, a consumer,
+or a `JoinSet`. A test asserts that, because it is invisible to the compiler and
+to every behavioural test — the services work identically whether the wiring is
+declared or hand-rolled.
+
+**The changelog is derived from declared roles.** Identity is
+`(table kind, message type, template version)`, allocated as a sparse band from
+an explicitly-versioned SHA-256 and pinned in a test against an independent
+computation, because the numbers end up as primary keys in a user's
+`changelog_history`.
+
+**Identity keys on the table kind, not the registration role** — an amendment
+implementation forced onto the decision. `cache::<T>()`, `handle::<T>()`, and
+`handle_before::<T>()` are three ways to state one schema fact, so keying on the
+registration role would have given identical DDL a different version depending on
+which was written, and adding a handler to an already-consumed type would have
+presented as a new changeset against an existing table.
+
+**Handlers now run after the cache upsert.** `examples/product/src/lib.rs`
+documented the trap it was working around — a handler deriving from its own cache
+saw the entity one version stale and had to exclude its own `entity_key` and add
+the incoming value back. Both halves are deleted. `handle_before` is the explicit
+pre-image opt-in; neither position can suppress the upsert.
+
+**The savepoint moved ahead of the upsert, and that was verified by breaking
+it.** Left where it was, a failed post-upsert handler commits an advanced cache
+row, the retry yields `Ignored`, and the handler is skipped forever. Moving the
+savepoint back makes
+`a_failing_post_upsert_handler_unwinds_the_cache_upsert_too` fail with the cache
+holding the failed handler's value, which is the failure the reorder would
+otherwise have shipped silently.
+
+### Three places implementation contradicted the plan
+
+1. **`handle_before` has no example, and the reason is worth keeping.** The plan
+   assigned `product` a pre-image hook that would skip the `SUM` recompute when
+   an order's fulfilled-ness had not changed. That is arithmetically correct and
+   would have hung the end-to-end suite: `two_service_cache.rs` waits for the
+   product cache offset to *advance* after an order is placed, and that advance
+   comes from `product` republishing. The republish is what makes propagation
+   observable, so suppressing it for "no availability change" deletes the signal
+   a consumer waits on. The plan's own fallback was taken — focused tests in
+   `dispatch_ordering.rs` cover the skip instead — and the finding is recorded in
+   `derive_availability`'s documentation, because it is a sharper statement of
+   "the pre-image is a cost guard, not a correctness guard" than the plan had.
+2. **The meter is deferred.** `implementation/m6-observability` is unmerged and
+   still calls `global::meter("kafkaman")`, so threading one would have been
+   guessing at a signature. Safe because builder setters are additive; the cost
+   is that the no-global-fallback rule stays accepted and untested.
+3. **`HandlerCtx` was pulled forward from phase 4 into phase 3**, rather than
+   shipping a handler signature that would be rewritten one commit later.
+
+### Two smaller things
+
+The purger is now wired. `[retention]` has always been parsed by
+`kafkaman-config` and never spawned anything; the builder starts one per
+published type when the section is present, and still deletes nothing when it is
+absent.
+
+`ReceivedMeta` became `#[non_exhaustive]` and gained a reserved `deleted` flag,
+settling the tombstone question onto
+[proposals/07-tombstone-and-deletion-semantics.proposal.md](proposals/07-tombstone-and-deletion-semantics.proposal.md).
+The deciding argument against `Option<T>`: kafkaman emits soft deletes as full
+entity states, so on any topic kafkaman produces the payload is never absent, and
+`Option<T>` would make every handler match on a `None` its own producer cannot
+emit. The `#[non_exhaustive]` half had to happen before first publication — the
+struct had sixteen public fields, so *adding* the flag later would itself have
+been the breaking change.
+
+`just examples demo` was run against a Postgres volume already migrated by the
+old hand-written changelog, so the demo doubled as a live test of the adoption
+path: both services booted, all seven smoke steps passed, and
+`changelog_history` ended up with seven rows for four tables — the four
+hand-numbered ones, now permanently inert, alongside the three generated ones.
+That is recorded in the compatibility note as observed rather than predicted.
+
+The escape hatch is a tested claim. `examples/product/src/service_manual.rs`
+boots the same service from the low-level primitives, `Services::start_with` is
+parameterised over the boot mode, and `tests/distributed-cache` runs against
+both.
+
+### Deliberate-break evidence, as the plan asked for it
+
+Stated with the distinction the plan's list elides — a *forced break* is a change
+made to the code to watch a test fail; a *property test* asserts the invariant
+without one. Both are worth having; conflating them overstates the second.
+
+| Gate | Kind | Evidence |
+| --- | --- | --- |
+| Savepoint covers the upsert | **Forced break** | Savepoint moved back after the upsert; `a_failing_post_upsert_handler_unwinds_the_cache_upsert_too` fails with the cache holding the failed handler's value. Restored and re-verified. |
+| Band-collision detection | **Forced break** | `build_changelog_with_forced_band` stubs the allocator to a constant and drives the real generation path. The 40-bit digest cannot be made to collide on demand, so the seam exists for this. |
+| Generated changelog stability under reordering | Property test | `declaration_order_changes_neither_versions_nor_checksums` and its `RoleRegistry` twin compare versions *and* checksums across a reordered declaration. |
+| The `Ignored` skip | Property test | `a_replayed_record_is_ignored_and_the_post_upsert_handler_does_not_run`, counting handler invocations across a replay. |
+| Missing-role detection | Partial | Conflicting and duplicate roles are covered, and `an_unregistered_type_parks_its_row_without_advancing_the_cache` covers the runtime consequence. What is *not* separately forced is a service omitting a role it needs: `ResolvedConfig` rejects the unregistered type at `build()`, so it fails before any loop starts, and the existing test proves the runtime half. Recorded as partial rather than claimed as done. |
+| A builder-started loop never calls `global::meter()` | **Not applicable** | The meter is deferred; `crates/` contains no `opentelemetry` on this branch, so there is nothing to break. This gate returns when M6 merges. |
+
+Pages affected: `crates/kafkaman/src/**` (new `runtime` module),
+`crates/kafkaman-core/src/**`, `crates/kafkaman-sqlx/src/**`,
+`examples/order/**`, `examples/product/**`, `tests/distributed-cache/**`,
+`tests/durable-send/tests/entity_first_propagation/**`, `README.md`,
+`examples/README.md`, `Cargo.lock`,
+`wiki/compatibility/runtime-builder-and-axum.compat.md`,
+`wiki/compatibility/dispatch-handler-ordering.compat.md`,
+`wiki/decisions/runtime-builder-and-axum-composition.decision.md`,
+`wiki/decisions/runtime-composition-and-topology.decision.md`,
+`wiki/plans/runtime-builder-and-axum-composition.plan.md`,
+`wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md`,
+`wiki/specs/entity-first-propagation.spec.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-26] update | runtime builder pages reviewed twice and corrected
+
+Reviewed the accepted builder proposal against the code it claims to replace and
+revised all three pages plus added one decision. The review changed six things
+that had been wrong or under-specified in the first draft.
+
+**Axum stops being a crate.** `crates/kafkaman/src/lib.rs` gates `rdkafka`
+behind a feature and re-exports it "so an application never has to name a second
+kafkaman crate" — and that is a C-linking dependency. A pure-Rust optional
+dependency does not warrant weaker treatment, so `kafkaman-axum` becomes
+`kafkaman::axum` behind an `axum` feature.
+
+**Changeset identity is settled.** The scheme is
+`(role, message_type, template_version)` allocated as a sparse hash band. Two
+code findings forced it: `descriptor_changeset!`'s `checksum_material` includes
+the version, so renumbering breaks every existing database — and it does *not*
+include the DDL, so an in-place template edit is completely invisible to the
+migration engine. That is not hypothetical: `create_outbox_table_sql` already
+carries the columns `AddIdempotencyKey`, `AddIdempotencySource`, and
+`AddOutboxEntityKey` exist to add. A contract-side wire version was considered
+and rejected — cache payloads are JSONB, so a new contract field needs no DDL,
+and `examples/contracts` is shared, so one bump would couple two independent
+migration timelines.
+
+**Handler ordering became its own decision.** `examples/product/src/lib.rs`
+documents a trap it calls "a genuine footgun": the handler runs before the cache
+upsert, so a derivation sees its own entity one version stale and must exclude
+its own `entity_key` and add the incoming value back. `handle::<T>` now runs
+after the upsert, `handle_before::<T>` is the explicit pre-image opt-in, neither
+may suppress the upsert, and a post-upsert handler is skipped on
+`CacheApplyOutcome::Ignored` — a distinction a pre-upsert handler cannot make.
+`apply_order_snapshot` loses the exclusion and the add-back.
+
+**Host-owned concerns became a normative list.** Pool, business schema, signal
+handling, process exit, telemetry install, config discovery, topic creation,
+executor choice, process topology. The builder takes a `PgPool` rather than a
+URL, and the `business_schema` hook was dropped entirely — with a host-supplied
+pool the caller can run its own migrator before or after `build()` without the
+builder fixing a position for it.
+
+**Telemetry takes an explicit meter with no global fallback.** (Sourced from
+the `implementation/m6-observability` worktree at `~/Documents/rust/kafkaman-m6`,
+not from this branch — `global::meter`, `RelayMetrics`, and `opentelemetry`
+appear nowhere under `crates/` here.) M6 constructs instruments inside the loops
+via `global::meter("kafkaman")`, and an OTel
+instrument binds permanently to whatever provider is installed at that moment.
+Hiding loop construction inside `build()` would hide that contract, so `build()`
+now assembles and `run()` starts loops, and the meter is passed in. Omitting it
+means no-op, not global lookup. This is a deliberate divergence from the
+instrumentation-library convention the M6 pipeline-ownership decision adopts.
+
+**The escape hatch became a tested equivalence claim.** Rather than splitting
+builder and hand-wired styles across the two services — which would compare
+different workloads, since `order` only caches while `product` derives and
+republishes — both services use the builder and `examples/product` gains a
+`service_manual.rs` with an identical signature. `Services::start` is
+parameterized over boot mode so the distributed-cache suite runs against both.
+
+The plan is now implementation-ready: all four original open questions are
+resolved and recorded, phases carry concrete gates including a symbol-absence
+grep test and a sub-60-line target for both `service.rs` files, and the example
+role mapping is written down with the honest finding that in this domain the
+pre-image is a cost guard rather than a correctness guard. A Cross-Worktree
+Coordination section records the three items owed to
+`implementation/m6-observability`: meter injection into `RelayMetrics::new` and
+the run loops, retargeting the `apps/` exporter rule and the SDK wiring to
+`examples/` now that `apps/axum-outbox` has been removed here, and the telemetry
+config keys `build()` must pass through.
+
+### Second pass, 2026-08-26: every code claim checked against the tree
+
+The pages above were then reviewed line by line against the code they cite.
+Most claims held — the `examples/product/src/lib.rs` quotes are verbatim,
+`checksum_material` really is `version;name;message_type;topic` with no SQL,
+`assert_changelog_order` really is unique-and-strictly-ascending,
+`create_outbox_table_sql` really does already carry the columns the three
+`Add*` changesets exist to add, `TopicMode::Verify` is the default, and the
+229/201 boot-file line counts are exact. Seven things did not.
+
+1. **`CacheApplyOutcome::Adopted` does not exist.** The variant is `Migrated`
+   (`crates/kafkaman-sqlx/src/dispatch_cache.rs`). `Adopted` is prose from the
+   log line it drives. Corrected in the decision and the plan.
+2. **Topic ownership contradicted itself.** The decision listed "topic creation"
+   as host-owned and said the builder "neither performs nor offers" it, while
+   the proposal and plan put `converge_topics` inside `build()` — and
+   `TopicMode::Create` creates topics. Reworded: the host owns the
+   *authority*, the builder executes the configured mode and never defaults to
+   or upgrades to `create`.
+3. **The tombstone shape was claimed settled and is not.** The decision pointed
+   at the plan; the plan said decide it later; and
+   `wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md` already
+   proposes a different answer — put the flag in `ReceivedMeta` rather than
+   change `P`. Reopened explicitly, with proposal 07's direction named as the
+   leading candidate and the outcome owed back to that page.
+4. **The Tower layer surface was pulled into scope on a false premise.** The
+   proposal said the handler-model decision "establishes" a `.layer(..)` stack.
+   It does the opposite — its *Accepted Reconciliation* calls the larger
+   Tower/extractor surface "future design space" — and `router.rs` has only
+   `new` and `handler`. Descoped to a shape constraint: roles yield a plain
+   `MessageRouter`, so a wrapping hook stays addable later.
+5. **The generated-version scheme was under-specified for a durable primary
+   key.** Width, reserved range, hash stability, sort-before-assert, and
+   collision behavior are now normative in both the proposal and the decision.
+6. **`MissingHandler` and the dispatch savepoint were unaddressed.** The router
+   lookup short-circuits ahead of the upsert today and stays there; the
+   savepoint must *move* ahead of the upsert, or a failed post-upsert handler
+   commits an advanced cache row and the retry is skipped as `Ignored` forever.
+7. **Smaller corrections.** `thiserror` is in six of seven crates, not all
+   seven — and the exception is `crates/kafkaman`, the crate that will host the
+   builder error. Two of the six "resolved" design questions were never open
+   questions. `wiki/specs/entity-first-propagation.spec.md` asserts the old
+   handler ordering as validated truth and is now named as the promotion
+   target. Telemetry claims are sourced to the M6 worktree explicitly, since
+   `global::meter`, `RelayMetrics`, and `opentelemetry` appear nowhere under
+   `crates/` on this branch. Cross-links and amendment notes were added to
+   `runtime-composition-and-topology`, `message-consumption-and-handler-model`,
+   `missing-handler-dispatch-policy`, `schema-and-change-management`, and
+   proposal 07, none of which previously pointed at the new pages. This entry's
+   own heading had been inserted above `# Wiki Log`, displacing the H1 to line
+   73; the file structure is restored.
+
+Pages affected: `wiki/decisions/dispatch-handler-ordering.decision.md` (new),
+`wiki/proposals/14-runtime-builder-and-axum-composition.proposal.md`,
+`wiki/decisions/runtime-builder-and-axum-composition.decision.md`,
+`wiki/plans/runtime-builder-and-axum-composition.plan.md`,
+`wiki/decisions/runtime-composition-and-topology.decision.md`,
+`wiki/decisions/message-consumption-and-handler-model.decision.md`,
+`wiki/decisions/missing-handler-dispatch-policy.decision.md`,
+`wiki/decisions/schema-and-change-management.decision.md`,
+`wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-25] create | runtime builder and Axum composition
+
+*Superseded in part by the 2026-08-26 entry above, which records what two review
+passes changed. This entry describes the first draft as written and is kept for
+the provenance chain, not as a current description of the pages.*
+
+Recorded the developer-UX follow-up from dogfooding the two-service example.
+The example now proves the distributed-cache model, but its service boot files
+manually repeat kafkaman invariants: config coverage, topic convergence,
+kafkaman changelog construction, migrations, relay, ingester, dispatcher,
+shutdown, and Axum composition.
+
+Accepted proposal 14 and promoted it to a decision. The chosen split is a core
+role-driven runtime builder plus optional Axum composition. Services declare
+`publish::<T>()`, `cache::<T>()`, and `handle::<T>(handler)` repeatedly; the
+builder derives kafkaman-owned changesets, verifies or creates compacted topics
+through the existing topic mode, starts the worker paths, and owns cancellation
+and supervision. HTTP stays outside core: the Axum helper composes an
+already-built runtime with an already-built router and graceful shutdown.
+
+The plan is active and starts with the migration hazard the builder introduces:
+generated changelog versions cannot come from mutable registration order,
+because existing databases store numeric versions and checksums. The first
+implementation phase therefore has to prove stable generated identities before
+the examples can drop their manual changelog files.
+
+Pages affected: `wiki/proposals/14-runtime-builder-and-axum-composition.proposal.md`,
+`wiki/decisions/runtime-builder-and-axum-composition.decision.md`,
+`wiki/plans/runtime-builder-and-axum-composition.plan.md`, `wiki/index.md`,
+`wiki/log.md`.
+
+## [2026-08-25] update | example collection reads
+
+Added collection read endpoints to the two-service example so the Swagger UIs
+show the current owned state without needing copied IDs: `GET /products` on
+`example-product` lists product-owned rows, and `GET /orders` on
+`example-order` lists order-owned rows. Both are local database reads only; they
+do not enqueue snapshots or touch Kafka. The handler tests now assert both the
+HTTP response and the generated OpenAPI path entries.
+
+Pages affected: `examples/product/src/http.rs`,
+`examples/order/src/http.rs`, `examples/product/tests/derive_availability.rs`,
+`examples/order/tests/service.rs`, `examples/README.md`, `wiki/log.md`.
+
+## [2026-08-25] implement | topic convergence phase 5: provisioning and boot wiring
+
+Closed the last phase of the topic-convergence plan. Two halves of one design:
+the services now *verify* their entity topics at boot, and a new
+`example-provision` package *creates* them beforehand — the first is only a
+workable posture because of the second.
+
+**Boot wiring.** Both example services call
+`converge_topics(&admin, cfg.topics, cfg.messages())` after config resolution
+and before the pool is opened, so a missing or non-compacted topic fails the
+process rather than being discovered by whoever eventually needs a rebuild.
+Every registered type is checked, inbound and outbound alike: a topic carrying
+entity snapshots has to be compacted whichever end of it a service is on.
+
+**`ResolvedConfig` carries `topics: TopicMode`.** Reading `[topics]` at the call
+site would have meant a mistyped mode surfacing separately from every other
+config problem, after a pool was already open — which is the one thing that
+crate promises not to do. Additive rather than breaking: the struct has a
+private field and was never constructible by literal.
+
+**The provisioner is a library with a binary on top**, not a binary alone,
+because `tests/distributed-cache` has to build its environment the same way
+compose does. The fixture calls `ensure_databases` and `provision_topics`
+directly, so a change to what provisioning means reaches the test instead of
+passing it by. `examples/initdb/10-databases.sql` is deleted: the environment
+was previously half a SQL file and half nothing, and only the SQL half ran on
+the host-side flow.
+
+**Two things the plan's sketch did not name.** Database names arrive from the
+environment and reach `CREATE DATABASE "..."` as quoted identifiers, so the
+alphabet is a boundary rather than a style rule — and the 63-byte cap is
+*refused* rather than truncated, because Postgres truncates silently and the
+service's connection string would then name a database that does not exist.
+Duplicate detection is the `CREATE` itself rather than a `pg_database` check,
+since check-then-create has a window a concurrent provisioner can win.
+
+**`provision` sits in the `services` compose profile, not the default one.**
+Putting it in the default set would have made `just examples up` build an image,
+breaking that flow's promise of starting in seconds. It provisions with
+`cargo run -p example-provision` instead, sharing the build the developer is
+about to pay for anyway. Compose's `--wait` was measured against a one-shot
+service before committing to the shape: it treats a clean exit as satisfied and
+re-runs are clean, both verified on v2.31.
+
+**The gate was demonstrated, not assumed.** Setting `mode = "off"` in
+`examples/order/kafkaman.toml` made
+`provisioning_precedes_boot_and_is_the_only_thing_that_creates_a_topic` fail at
+its first assertion, confirming the boot check is what that test observes rather
+than an incidental failure on the way to it. That test also asserts the load-
+bearing negative: after a failed boot, neither topic exists. Redpanda's
+dev-container mode has auto-creation on, so a check that named the topic in its
+metadata request would have manufactured the exact `delete` topic it was looking
+for.
+
+`rpk topic describe` now reports `cleanup.policy compact DYNAMIC_TOPIC_CONFIG`
+on both `products` and `orders`, where it reported `delete` before this
+workstream — which was the observation that started it, contradicting the
+compaction claim in `README.md` with nothing anywhere reporting it.
+`DYNAMIC_TOPIC_CONFIG` is the part worth reading: set deliberately, not
+inherited from a default that happened to agree.
+
+**The example recipes collapsed into one.** `examples-up`, `demo`,
+`examples-ui`, `examples-logs` and `examples-down` are now
+`just examples [demo|up|ui|logs|down]`, following the shape `test arg="all"`
+already had — a stack this small should not own five of the seven top-level
+verbs. `demo` is the default, so the headline "one command runs the whole thing"
+survives as `just examples`. Entries above this one name the old recipes,
+because that is what they were called at the time.
+
+Two unrelated recipes were fixed while there: `just --list` shows only the
+comment line immediately above a recipe, so `lint` and `clean-containers` were
+advertising the last sentence of their rationale paragraphs. Their summaries
+moved into `[doc(...)]` attributes, which decouples the listing from the prose.
+
+Verified: `cargo test --workspace --all-features` 228 passing / 41 suites (up
+from 220); `topic_convergence` 2 and `redpanda_full_loop` 11 against a real
+broker; `just lint` clean including the rustdoc gate; the demo green from a
+clean slate and again on a re-run; the infrastructure-only flow plus a host-run
+service booting against the provisioned stack.
+
+Still open from this workstream: an ACL-denied `CreateTopics` path (Redpanda's
+dev-container mode has no ACLs to deny with), bounded broker retry at boot,
+cutover tooling for a rebuild, and a positive state-sourced republish API.
+Neither of the first two blocked phase 5 — compose gates the provisioner on a
+healthy broker and the services on the provisioner — but a deployment without
+that ordering would want the retry.
+
+## [2026-08-25] update | merge the module refactor into topic convergence
+
+Merged `e8c7e9a` (147 files, +16k/-15k: crate roots split into modules, durable
+tests exploded into directories) into this branch. Merged rather than rebased —
+main already carries `Merge branch 'implementation/*'` commits, and a merge
+resolves each conflict once instead of replaying it across three.
+
+Git's conflict markers were close to useless for the four crate roots, because
+main *moved* the code our hunks were anchored to. The resolution was to take
+main's version of each `lib.rs` wholesale and hand-place our additions into the
+module it had carved out: `topics.rs` beside its siblings, error variants into
+`error.rs`, `MessageDescriptor::topic_spec` into `message.rs`, `TopicsSection`
+into `sections.rs`, `Config::topics()` rewritten over main's new `section()`
+helper, and the cache-origin logic into `dispatch_cache.rs` / `dispatch.rs`.
+Unit tests moved into the `src/tests/<module>.rs` layout with absolute crate
+paths.
+
+The refactor also removed work rather than adding it:
+
+- `topic_convergence.rs` lost ~45 lines. Main promoted the Redpanda fixture to
+  `durable_send_tests::redpanda()`, which reserves an OS port and retries the
+  bind-then-map race — strictly better than the F16 fix this branch carried, so
+  ours was discarded rather than ported.
+- The three cache-origin tests joined `entity_first_propagation/cache_apply.rs`,
+  next to the partition-change test that constrains them, and adopted
+  `start_harness()`.
+
+Two failures worth recording, both caught by main's tests rather than by
+review:
+
+- `the_shipped_example_config_resolves_and_covers_every_section` failed twice.
+  First because this branch renamed the example's message type to
+  `order_snapshot` while main's test still registered `order_created`. Then
+  because the test asserts the per-type retry override actually differs from the
+  defaults, and a second `order_created` reference had been missed. That test
+  exists to make `kafkaman.example.toml` executable documentation, and it worked.
+- It also surfaced a gap this branch left independently: `[topics]` was added as
+  a config section and never documented in `kafkaman.example.toml`. Now
+  documented, and the test extended to assert it — which is the point of a test
+  whose stated purpose is catching "a section added without being documented".
+
+One merge artifact rejected: the auto-merge carried main's swap of
+`testcontainers` for the shared `durable-send-tests` helper into
+`examples/order/Cargo.toml`. That change was made for `apps/axum-outbox`'s test
+file, which this branch deletes; an example should not reach into the library's
+test-support crate to run, so the direct dependency was restored.
+
+Green at 220 passing, clippy clean, the new `cargo doc -D warnings` gate passing
+(one intra-doc link needed qualifying), and `just demo` walking the lifecycle.
+Pages affected: `wiki/log.md`, `kafkaman.example.toml`, `crates/**`,
+`tests/durable-send/**`, `examples/order/Cargo.toml`.
+
+## [2026-08-25] update | rebase onto main; reconcile the M5 closeout
+
+Rebased the topic-convergence work onto `332721a` (the M5 closeout) and restored
+the two-service example from stash. Only `wiki/log.md` conflicted, in both
+operations — the log is newest-first, so every prepended entry lands on the same
+anchor. That will recur on every rebase; it is a property of the format.
+
+The mechanical rebase was the easy half. Main's closeout rewrote the
+documentation of behaviour this branch then changed in code, and **none of those
+files conflicted** — they applied clean and silently became wrong. Reconciled on
+the principle that a spec describes what is true now while a compatibility note
+records what one release shipped:
+
+- `wiki/specs/entity-first-propagation.spec.md` **amended**. It enumerated only
+  `Applied` and `Ignored`, said a topic or partition mismatch is reported as
+  `CacheOriginMismatch` and is never a normal ignored record, and listed broker
+  topic validation as unimplemented. All three are now false in part. It carries
+  the four-case outcome table, and states that topic validation exists as a
+  library capability but is not yet called from any boot sequence — landed rather
+  than delivered.
+- `wiki/roadmaps/path-to-v1.roadmap.md` **amended**, because a roadmap is live
+  orchestration rather than history and its post-M5 deferral list named an item
+  that has since landed.
+- The three M5 compatibility notes and the now-Completed entity-first plan were
+  **left alone** as release records, even though they contain statements this
+  branch supersedes. `m5-code-audit-remediation.compat.md` is the one to watch: it
+  still tells operators to treat `CacheOriginMismatch` as the signal to
+  re-bootstrap, which stays correct for an in-place repartition and is wrong for a
+  rebuilt topic.
+
+Corrections to this branch's own documents, which mattered more than main's:
+
+- Proposal 13 and the topic-convergence decision **misquoted** the entity-first
+  plan. They cited "Boot-time broker topic validation remains pending"; the
+  closeout rewrote that to "remains deferred after M5". The 2026-08-24 `create`
+  entry below carries the same misquote and is left as written, since this log is
+  append-only.
+- Both leaned on a Deferred bullet — "Topic/partition mismatch invalidation path"
+  — that the closeout deleted, having reframed that behaviour as shipped. The
+  proposal's main premise survives, because boot-time validation is still Deferred
+  in both notes; what changed is that this work *supersedes* a closed M5 behaviour
+  rather than *completing* an open deferral.
+- Three documents listed `Replay::outbox` **rejection** as deferred. It was
+  already implemented at the merge base — `Replay::outbox` returns
+  `Err(UnsafeOutboxReplay)` unconditionally. What is actually missing is the
+  positive resync surface. That error predated the rebase and was ours.
+- `wiki/index.md` still showed the topic-convergence plan as `Draft` with phases
+  1-4 landed.
+Pages affected: `wiki/specs/entity-first-propagation.spec.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`,
+`wiki/proposals/13-topic-convergence-and-environment-provisioning.proposal.md`,
+`wiki/decisions/topic-convergence-and-rebuild.decision.md`,
+`wiki/plans/topic-convergence.plan.md`,
+`wiki/compatibility/topic-convergence-api.compat.md`, `wiki/index.md`,
+`wiki/log.md`.
+## [2026-08-25] implementation | OTel Phases 2 and 3: traces across both durable gaps, and logs that point at them
+
+The half M6 did not build. Metrics answer "how much"; a trace answers "what
+happened to *this* message", and kafkaman puts two gaps in the middle of that
+question that no in-memory context survives.
+
+**The problem, stated once.** The outbox pattern separates enqueue from publish
+in time — different task, possibly different process, after a crash, after a
+lease expiry. A producer span opened at publish time is therefore orphaned from
+the transaction that created the row, and the trace an operator most wants is
+exactly the one the pattern breaks. The receive side has the same gap: ingest
+stores a row, dispatch claims it later. Trace context must be durable, stored
+beside the row, restored when the row is acted on — which is the journey
+`correlation_id` already makes.
+
+**The schema change, which is the irreversible part.** Two nullable columns,
+`traceparent` and `tracestate`, on every per-type outbox table *and* every
+received table, added by `AddOutboxTraceContext` and `AddReceivedTraceContext`.
+Existing rows keep null, and null is a state the runtime already treats as
+ordinary, so a deployment that applies the changesets and rolls the binary back
+keeps working.
+
+**Four spans**: `kafkaman.enqueue` inside the caller's transaction,
+`kafkaman.relay.publish` parented from the row's stored context,
+`kafkaman.ingest` linked to the producer, `kafkaman.dispatch` parented from the
+received row's context. The consumer links rather than parents because it polls a
+batch that may hold records from many unrelated traces; dispatch parents rather
+than links because by then exactly one row has been claimed.
+
+**A third header namespace.** `traceparent` and `tracestate` carry no
+`kafkaman-` prefix — the entire value of the standard is that a consumer which
+has never heard of kafkaman still reads them. `RecordHeaders` grew a third
+bucket: matched case-insensitively, first-wins like the reserved namespace,
+stripped from the user headers a handler sees. A producer sending them is the
+normal case, not an error.
+
+**Logs** are `opentelemetry-appender-tracing`, stamping every record with the
+ids of the span it was emitted in. That stamping is the whole feature and the
+reason logs had to follow traces rather than precede them: the lifecycle events
+`LifecycleSampler` already emits become trace-correlated records with no further
+work, which is what `sample_success` was for.
+
+**Five things the plan had wrong, all found by building it.**
+
+1. *The received table needs the columns too.* The decision persisted context on
+   the outbox row only, and drew dispatch as a child of ingest with no gap
+   between them. There is a gap, and it is the same gap.
+
+2. *A tracer with no caller span still produces context.* The decision said a row
+   enqueued outside any span has none. True only with no tracer installed —
+   `enqueue` opens its own span, so a background job gets a root span, the row
+   carries its context, and the publish descends from it. That is better than the
+   rule described, and both cases are now tested: `trace_absent` for an untraced
+   process, `trace_root_enqueue` for a traced one with no caller span. The test
+   that found this was written asserting the documented behaviour and failed.
+
+3. *Outgoing user headers named `traceparent` must be dropped.* An application
+   forwarding an incoming request's headers wholesale is doing something
+   ordinary; publishing its stale copy would put it on the wire ahead of the real
+   one, and first-wins on the consumer side would then link the wrong span.
+   Dropped at publish, logged at debug, kept in the row for triage. Rejecting at
+   enqueue was considered and refused: it turns a reasonable pattern into a
+   runtime error.
+
+4. *The W3C format is implemented by hand.* The propagators live in
+   `opentelemetry_sdk`, which no `crates/` manifest may touch. `traceparent` is
+   four fixed fields; `kafkaman-core::trace` parses and formats it directly,
+   accepting unknown versions with trailing fields per the Recommendation's
+   forward-compatibility rule and rejecting the all-zero ids and reserved `ff`
+   version.
+
+5. *`tracing-opentelemetry` is now allowed in library crates*, which amends the
+   ownership decision's "the API crate and nothing more". Reading the ambient
+   span's context has no other route — `tracing` spans live in the subscriber's
+   registry, not on the OpenTelemetry context stack. Its published manifest was
+   checked rather than assumed: `opentelemetry`, `tracing`, `tracing-core`,
+   `tracing-subscriber`, and **no SDK**. The substance of the boundary holds.
+
+**`traces` is a default-on feature with a no-op twin**, plumbed through every
+library crate and the facade, matching `metrics`. Turning it off drops the
+OpenTelemetry dependencies and stops this process producing context — but stored
+context is still read and still forwarded, so a service with tracing compiled out
+does not break propagation for its neighbours. `just lint` now compiles the
+disabled twins (`cargo check -p kafkaman --no-default-features`), because nothing
+else in the gate ever did and a twin that stops compiling is otherwise discovered
+by an adopter.
+
+`tests/observability/trace_propagation` is the gate: one message, a real
+Redpanda broker, both durable gaps, and assertions on every parent and link in
+the shape the decision draws.
+
+Evidence: `just lint` clean; `cargo test --workspace --all-features` (223 passed,
+4 ignored, up from 213).
+
+**Phase 4 is deliberately incomplete.** The Elasticsearch/Kibana compose profile
+is not built. It was specified as an extension of the two-service example's
+compose file, which is not on this branch, and the `apps/axum-outbox` example
+that currently carries the host wiring is being replaced by the example under
+construction in a separate worktree. Writing it here would be writing it twice.
+The wiring in `apps/axum-outbox/src/telemetry.rs` — three signals, installed
+before any kafkaman component, flushed on the drain path, proved end to end
+against a socket by `tests/telemetry_export.rs` — stands as the reference for
+that port.
+
+Pages affected:
+- `crates/kafkaman-core/src/trace.rs` (new), `rows.rs`, `lib.rs`, `Cargo.toml`
+- `crates/kafkaman-sqlx/src/outbox_enqueue.rs`, `received_storage.rs`,
+  `dispatch.rs`, `schema_sql.rs`, `changesets.rs`, `outbox_mark.rs`,
+  `queries.rs`, `lib.rs`, `Cargo.toml`
+- `crates/kafkaman-rdkafka/src/publisher.rs`, `ingest_record.rs`, `consumer.rs`,
+  `tests.rs`, `Cargo.toml`
+- `crates/kafkaman-worker/src/relay.rs`, `Cargo.toml`
+- `crates/kafkaman/Cargo.toml`
+- `tests/observability/` — `src/lib.rs`, `Cargo.toml`, and the
+  `trace_propagation`, `trace_absent`, `trace_root_enqueue` binaries
+- `apps/axum-outbox/` — host wiring for all three signals (moving)
+- `Cargo.toml`, `Cargo.lock`, `justfile`
+- `wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`
+- `wiki/decisions/telemetry-pipeline-ownership.decision.md`
+- `wiki/compatibility/m6-observability-operability-api.compat.md`
+- `wiki/plans/opentelemetry-completion.plan.md`
+- `wiki/index.md`, `wiki/log.md`
+
+## [2026-08-25] implementation | OTel Phase 1: the metrics surface, and three things the plan had wrong
+
+Phase 1 of `wiki/plans/opentelemetry-completion.plan.md`, with its Phase 5 test
+binaries landing beside it rather than trailing. M6 shipped counters only —
+"how many" without "how long" or "how much is waiting", which are the two
+questions an operator actually opens a dashboard for.
+
+**Latency.** Three histograms, in seconds. `kafkaman.relay.publish.duration` is
+broker-side only: the claim has committed and the mark has not run, so it is
+separable from queue delay. `kafkaman.dispatch.duration` spans the whole
+`dispatch_once` call — claim, handler, commit — because that is what one dispatch
+costs and so what sizes a dispatcher pool; isolating the handler would mean
+putting an OpenTelemetry dependency in the crate that owns the SQL, which is a
+worse trade. `kafkaman.outbox.time_to_publish` measures `occurred_at` to broker
+acknowledgement, and is the one instrument here no general-purpose messaging
+library would have: the outbox pattern's premise is that enqueue and publish are
+separated in time, that separation is the library's core latency, and only
+kafkaman can see both ends.
+
+**Depth.** Four observable gauges over `outbox_status_summary` and
+`received_status_summary` — already written, already integration-tested, already
+index-served, and until now reachable only by remembering to curl a route. A
+gauge callback is synchronous and cannot await a database round trip, so
+`run_queue_metrics` owns the queries on its own interval and the callbacks read
+the snapshot it maintains. The refresh interval is deliberately the loop's rather
+than the SDK's: scraping faster must not query harder. Empty statuses report an
+explicit zero so a draining queue draws a line to zero instead of stopping
+mid-chart, while `oldest_age` reports nothing for them, because the age of no
+rows is not zero.
+
+**Three things this slice found, all now amendments to the schema decision.**
+
+1. *Bucket boundaries are part of the compatibility surface.* The OpenTelemetry
+   defaults run 0 to 10,000 and are millisecond-scaled; against a `s` unit every
+   realistic observation lands in the first bucket. That is not a coarse
+   histogram, it is an empty one. Two explicit sets: 5ms–10s for work kafkaman
+   performs in one step, 50ms–15min for latency that includes queue time.
+
+2. *Semconv attributes belong on every series keyed by topic.* The schedule
+   listed `messaging.system`/`messaging.destination.name` only on
+   `kafkaman.kafka.publish.records`, while the decision states the rule
+   generally. Read as an oversight rather than an exception: a dashboard
+   grouping by `messaging.destination.name` would otherwise find kafkaman's
+   publish counts and miss its publish latency.
+
+3. *Gauge staleness cannot be a gap.* The decision asked callbacks to "report
+   staleness rather than hanging", which was implemented as: stop observing once
+   the snapshot is too old, so a stalled sampler shows as a hole rather than a
+   flat line at a number that quietly stopped being true. **It does not work.**
+   An asynchronous gauge under cumulative temporality republishes its last
+   recorded value every collection cycle whether or not the callback observed
+   anything. The test written to prove the gap proved the opposite, and it now
+   pins the real behavior. `kafkaman.queue.sample_age` is the answer instead: a
+   depth of 2 means nothing alone, a depth of 2 beside a sample age of 400
+   seconds says exactly how much to trust it. Temporality is the host's to choose
+   and a library must not force a view on it, so this is an added instrument
+   rather than a configuration demand. `stale_after` is gone from
+   `QueueMetricsConfig` — a knob that cannot do what it claims is worse than no
+   knob.
+
+**Tests, five binaries, one concern each.** `metrics_surface` asserts names,
+kinds, units, attribute keys and values from a real relay loop, restating the
+schedule literally rather than deriving it from the code under test.
+`single_cycle_silence` pins that calling the public `relay_once` helper records
+nothing — the separation that keeps a hand-driven cycle out of a deployment's
+series, one line from being undone by accident every time an instrument is added.
+`queue_gauges` covers depth, age, and the zero-fill. `queue_gauge_staleness`
+covers finding 3 above. `ingest_disjointness` runs a real Redpanda broker behind
+`--features redpanda` and asserts that the ingest outcome counters sum to exactly
+the records consumed — the invariant whose violation shipped the double-count
+defect, and which `debug_assert` guards in precisely the builds nobody runs.
+
+`relay_once` grew a private inner form taking the loop's instruments, because
+per-publish latency can only be measured inside it while the scheduler counters
+must stay out of it. `SchedulerMetrics` is now composed into `RelayMetrics` and
+`DispatchMetrics` rather than carrying relay-specific methods; the purger, which
+needs neither histogram, still uses it directly.
+
+The example wires the sampler beside the relay, but only when a telemetry
+endpoint is configured — without a pipeline the callbacks never run and the
+sampler would be querying Postgres on an interval for nobody.
+
+`opentelemetry-semantic-conventions` joins `kafkaman-worker` and
+`kafkaman-rdkafka` as an optional dependency of their `metrics` features. It is
+attribute-key constants only — no runtime, no SDK — so the ownership boundary
+stands. Its messaging keys sit behind `semconv_experimental` upstream, which is
+enabled; the constants are still better than hand-typed keys that drift.
+
+Evidence: `just lint` clean; `cargo test --workspace --all-features` (213 passed,
+4 ignored, up from 208).
+
+Pages affected:
+- `crates/kafkaman-worker/src/metrics.rs`, `queue_metrics.rs` (new), `relay.rs`,
+  `dispatcher.rs`, `lib.rs`, `Cargo.toml`
+- `crates/kafkaman-rdkafka/src/metrics.rs`, `Cargo.toml`
+- `apps/axum-outbox/src/main.rs`
+- `tests/observability/` — `src/lib.rs`, `Cargo.toml`, and the
+  `metrics_surface`, `queue_gauges`, `queue_gauge_staleness`,
+  `single_cycle_silence`, `ingest_disjointness` binaries
+- `Cargo.toml`, `Cargo.lock`
+- `wiki/decisions/metric-instrument-and-attribute-schema.decision.md`
+- `wiki/compatibility/m6-observability-operability-api.compat.md`
+- `wiki/plans/opentelemetry-completion.plan.md`
+- `wiki/index.md`, `wiki/log.md`
+
+## [2026-08-25] implementation | OTel Phase 0 step 5: the example installs a pipeline, and it reaches the wire
+
+Closes Phase 0 of `wiki/plans/opentelemetry-completion.plan.md`. The example was
+the phase's own warning made flesh: it installed a `tracing_subscriber` and no
+`MeterProvider`, then started a relay — precisely the ordering that binds every
+instrument to the no-op provider for the life of the process. Every adopter
+copying it inherited a silent metric surface.
+
+`apps/axum-outbox/src/telemetry.rs` is the host half of the pipeline: an OTLP/HTTP
+metrics exporter behind a `PeriodicReader` at a 15-second interval, installed as
+the global provider, tagged `service.name=axum-outbox`. `main` calls it above the
+pool, the migrations, and the relay, which is the ordering contract stated by
+placement as well as by comment. Metrics only — no traces, no logs, no compose
+changes; Phase 4 completes it.
+
+**Two judgment calls the plan did not settle.**
+
+*No endpoint means no provider.* With neither `OTEL_EXPORTER_OTLP_ENDPOINT` nor
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` set, `init_metrics` returns `Ok(None)` and
+installs nothing, rather than defaulting to `localhost:4318` as the OTel
+specification does. The example's telemetry backend is optional by design — it
+sits behind a compose profile — so the common case is running without one, and a
+pipeline aimed at a closed port reports a failed export every interval, forever.
+An example that logs an error every fifteen seconds out of the box teaches
+adopters to ignore export failures. The skip is logged, because "no metrics
+configured" and "metrics configured but invisible" are indistinguishable
+otherwise. A whitespace-only value counts as unset, which is what an unresolved
+`${VAR}` in a compose file produces.
+
+*Flush before propagating.* `main` holds the `serve` result rather than applying
+`?` to it, shuts the pipeline down, and only then returns the error. A process
+exiting because something failed is exactly the process whose last metrics window
+matters, and `?` would have discarded it. `SdkMeterProvider::shutdown` performs a
+final collect-and-export, so it is the flush as well as the teardown; failures
+there are logged, not returned, so a telemetry problem cannot replace the reason
+the process is actually exiting.
+
+**Proving it, without a backend.** `apps/axum-outbox/tests/telemetry_export.rs`
+binds a loopback socket, points the exporter at it, records through the global
+meter, and asserts the resulting `POST /v1/metrics` carries protobuf, the
+instrument name, and the service name. It runs in milliseconds and needs no
+container, because a socket is enough to prove the bytes left the process — and
+without it, "the example exports" would rest on the same kind of unobserved
+assertion that this entire plan exists to retire.
+
+Two unit tests sit beside it: endpoint precedence resolved through an injected
+lookup rather than by mutating a shared environment, and pipeline construction
+inside a Tokio runtime. The second is not ceremony. `main` is `#[tokio::main]`,
+and the default OTLP HTTP client is `reqwest`'s *blocking* client, which cannot be
+constructed on a thread already driving a runtime; `opentelemetry-otlp` sidesteps
+that by building it on a spawned thread. That is an implementation detail of a 0.x
+dependency on which the example's only startup path depends, so it is pinned.
+
+The workspace `opentelemetry_sdk` entry dropped the `testing` feature —
+`tests/observability` adds it locally now, so the example does not carry a
+test-only feature. `opentelemetry-otlp` joins the workspace with `http-proto` and
+`reqwest-blocking-client` only. All three are dependencies of `apps/axum-outbox`;
+no `crates/` manifest gained any of them.
+
+The example README, which still described the app as demonstrating M1 "without
+`kafkaman-axum`" after M6 mounted the admin routes, was corrected while
+documenting the telemetry surface and the ordering contract.
+
+Evidence: `just lint` clean (fmt, clippy `-D warnings`, rustdoc `-D warnings`,
+lib tests); `cargo test --workspace --all-features` (208 passed, 4 ignored, up
+from 205).
+
+Pages affected:
+- `apps/axum-outbox/src/telemetry.rs` (new)
+- `apps/axum-outbox/tests/telemetry_export.rs` (new)
+- `apps/axum-outbox/src/main.rs`, `src/lib.rs`, `Cargo.toml`, `README.md`
+- `Cargo.toml`, `Cargo.lock`, `tests/observability/Cargo.toml`
+- `wiki/plans/opentelemetry-completion.plan.md`
+- `wiki/compatibility/m6-observability-operability-api.compat.md`
+- `wiki/index.md`
+- `wiki/log.md`
+
+## [2026-08-25] implementation | OTel Phase 0: instruments owned by the loop, and a suite that can see them
+
+The first slice of `wiki/plans/opentelemetry-completion.plan.md`. Phase 0 steps
+1-4; step 5 (example wiring) follows separately.
+
+**The defect.** `worker_metrics()` and `kafka_metrics()` cached their counters in
+process-wide `OnceLock`s built from `global::meter("kafkaman")` at first use. An
+OpenTelemetry instrument binds to whichever `MeterProvider` is installed when it
+is *created* and cannot be rebound, so the provider present at the first record
+was the provider every later component reported to for the life of the process.
+A host that started a relay before finishing its telemetry pipeline got a
+permanently silent metric surface — no error, no warning, no diagnosis. It also
+made the surface untestable, because an integration test binary is one process
+with one global provider.
+
+**The fix.** Instruments are built by the component that owns them:
+`SchedulerMetrics` at run-loop start (relay, dispatcher, purger), `PublishMetrics`
+at `RdkafkaPublisher` construction, `IngestMetrics` at ingest-loop start. The
+`enabled`/`disabled` twins still live in one file each so the pair cannot drift,
+and every call site kept its shape — the free functions became methods on the
+owned struct, so `record_scheduler_cycle(&attrs)` is now `metrics.cycle()`.
+`SchedulerAttrs` was folded into `SchedulerMetrics` rather than kept beside it:
+the pre-built `[scheduler, message_type]` attribute array exists to keep the
+allocation off the hot path, and it has the same lifetime as the instruments now.
+
+The publisher binds earlier than the loops do, so the adopter contract is
+*install the provider before constructing kafkaman components or starting loops*,
+not merely before starting loops. Recorded in
+`wiki/compatibility/m6-observability-operability-api.compat.md`.
+
+**Units, since the instruments were open anyway.** Every counter now declares one
+(`{cycle}`, `{row}`, `{error}`, `{record}`, `{commit}`) — Phase 1 step 3, taken
+early because it is one line per instrument. No name or attribute changed.
+
+**`tests/observability/`**, a new workspace member mirroring `durable-send`'s
+layout: a shared `src/` harness plus one binary per concern. It brings its
+Postgres containers and message fixtures from `durable-send-tests` rather than
+copying them; if a third suite appears, that scaffolding should move into
+`kafkaman-test` instead of being depended on sideways. `MetricPipeline` installs
+an `SdkMeterProvider` over an `InMemoryMetricExporter` and holds both, because
+dropping the provider shuts the reader down and a flush after that collects
+nothing. `SignallingPublisher` acknowledges and announces, so loop tests wait on
+a message the loop itself sent rather than sleeping on a guess.
+
+The first binary, `provider_ordering`, reproduces the adopter's ordering exactly:
+run a relay, *then* install the SDK, run the relay again, assert the second run's
+`kafkaman.scheduler.cycles` reached the exporter. Against the old `OnceLock` it
+fails with an empty collection. It is worth a real database because what is under
+test is *where kafkaman constructs its instruments* — a property of the run loops,
+not of the OpenTelemetry API, which reproduces the underlying hazard in twenty
+lines without one.
+
+`opentelemetry_sdk = { version = "0.32", features = ["metrics", "testing"] }` is a
+workspace **dev-dependency**. No `crates/` manifest gained an SDK or exporter
+dependency; the host still owns the pipeline.
+
+Evidence: `cargo test --manifest-path tests/observability/Cargo.toml --tests`
+(1 passed), `cargo test --workspace --all-features` (205 passed, 4 ignored),
+`cargo check --workspace --all-features --all-targets` clean.
+
+Pages affected:
+- `crates/kafkaman-worker/src/metrics.rs`
+- `crates/kafkaman-worker/src/relay.rs`
+- `crates/kafkaman-worker/src/dispatcher.rs`
+- `crates/kafkaman-worker/src/purger.rs`
+- `crates/kafkaman-rdkafka/src/metrics.rs`
+- `crates/kafkaman-rdkafka/src/publisher.rs`
+- `crates/kafkaman-rdkafka/src/consumer.rs`
+- `crates/kafkaman-axum/src/lib.rs`
+- `tests/observability/` (new)
+- `Cargo.toml`, `Cargo.lock`
+- `wiki/compatibility/m6-observability-operability-api.compat.md`
+- `wiki/log.md`
+
+## [2026-08-25] review | external OpenTelemetry readiness review, and two plan corrections
+
+An external readiness review of the post-M6 OpenTelemetry state, scored 6.5/10,
+is filed at `wiki/reviews/m6-opentelemetry-readiness-review.reference.md`.
+
+**All twelve of its line citations were verified against `d9389d4` and every one
+resolves to exactly what it claims.** That is recorded because it determines how
+much of a review can be trusted without re-deriving it, and it is not the common
+case. Two further claims were checked past their citations: the four-live /
+three-reserved observability config split holds, and `LifecycleSampler` is
+genuinely wired into both loops (`relay.rs:103`, `dispatcher.rs:40`) rather than
+merely declared. All five of its gaps stand, and match an independent pass over
+the same code.
+
+Assessment recorded in the reference page: the review **understates** one thing —
+"likely inert unless the host wires an SDK" is conditional where the fact is not,
+since no SDK exists in the repository at all and no metric has ever been observed
+— and is **generous** in another, citing a decision page written the same day as
+evidence of established practice. Its 6.5 also averages two different
+measurements: a strong foundation and a near-zero working-OTel surface. The split
+is actionable where the average is not.
+
+**Two findings adopted, both gaps in the review's own coverage:**
+
+1. **Logs were absent from it.** Traces got a dedicated gap entry; logs appeared
+   once, inside its final step. For the Elastic target that is a third of the
+   value — trace-correlated records are the Kibana log→trace pivot and the reason
+   `sample_success` exists. The plan's sequencing now names three signals in a
+   table.
+
+   This surfaced **an error in the plan itself**, now corrected. An earlier
+   revision advised cutting Phase 3 before Phase 2 under pressure. That is
+   backwards: Phase 3 is cheap *because* Phase 2 has run, so cutting it afterward
+   forfeits most of the log-side value for a small saving. The correct cut is
+   Phases 2 and 3 together — traces without logs is a coherent product, logs
+   without traces is just the Filebeat path.
+
+2. **Example wiring moved from last to Phase 0.** The review scheduled it as step
+   7, which leaves the example without a `MeterProvider` through steps 3–6 —
+   every instrument added along the way verifiable only in tests, and a contract
+   about application startup never exercised by an application. A metrics-only
+   provider is now Phase 0 step 5; Phase 4 completes the pipeline.
+
+**Added independently of the review:** Phase 2 now flags that it holds the plan's
+only irreversible step. Persisting trace context is a migration on every per-type
+outbox table; everything else in the plan is additive code that can be revised,
+and a migration adopters have run cannot.
+
+The review's recommended order otherwise maps onto the filed phases exactly —
+two independent passes producing the same sequence, differing only on where
+example wiring belongs.
+
+Pages affected:
+- wiki/reviews/m6-opentelemetry-readiness-review.reference.md (new)
+- wiki/plans/opentelemetry-completion.plan.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-25] decide | telemetry pipeline direction and four decisions
+
+Documented the OpenTelemetry completion work ahead of implementation: one
+proposal, four decisions, a revised plan, and two corrections to existing pages.
+
+**Proposal 13** frames the question proposal 04 did not ask. Proposal 04 settled
+*what observability policy kafkaman should have* and M6 implemented it. Nobody
+had asked whether any of it reaches a backend. It does not: the workspace holds
+the `opentelemetry` API crate and no SDK, so every counter is inert by design of
+the OpenTelemetry API, in every build and every test.
+
+The four decisions:
+
+- **telemetry-pipeline-ownership** — host owns the SDK, kafkaman uses the API
+  only, no exporter under `crates/`. The substantive change is reversing M6's
+  process-wide `OnceLock` for instruments in favour of per-run-loop construction.
+  The `OnceLock` binds every instrument to whichever provider existed at first
+  record, so a host that starts a relay before building its pipeline gets a
+  permanently silent metric surface with no diagnostic — and a test binary, being
+  one process with one global provider, cannot observe metrics at all. That is
+  the mechanical reason no test here has ever asserted one.
+- **metric-instrument-and-attribute-schema** — the instrument schedule becomes a
+  public compatibility surface. Keep `kafkaman.*` names, add standard messaging
+  attributes beside our own so the series are joinable in a mixed deployment, add
+  latency histograms and queue-depth gauges, declare units, and pin the ingest
+  disjointness invariant with a real test. `kafkaman.outbox.time_to_publish` is
+  called out as the one instrument no general-purpose messaging library would
+  have: the enqueue-to-ack gap is the outbox's core latency and is invisible to
+  both the database and the broker.
+- **trace-context-propagation-and-w3c-headers** — the heaviest of the four,
+  because it amends a ratified decision. Detail below.
+- **telemetry-backend-and-example-topology** — Elastic as reference backend,
+  chosen because it takes all three signals natively over OTLP/HTTP and its APM
+  view is built on the trace-and-log correlation the plan produces. The example
+  exports direct with no collector; the collector is documented separately as the
+  production topology, because a compose file is the most-copied artifact in any
+  repository.
+
+**The amendment, and a correction to how it was previously described.** Earlier
+notes in this log and in the plan described the W3C header question as settling
+OQ5 "which M7 is scheduled to ratify". That was wrong in both halves. The roadmap
+records OQ5 as *already ratified* — opaque headers, reserved `kafkaman-*`
+namespace — and `message-identity-and-header-namespace.decision.md` is the
+Accepted decision fixing it at exactly two namespaces. So this work does not
+resolve an open question; it amends a ratified one, which is treated as heavier
+and kept as narrow as possible: a third namespace containing exactly
+`traceparent` and `tracestate`, every other rule untouched.
+
+**A contradiction found while checking that.** The roadmap simultaneously
+recorded OQ5 as ratified in its status section and listed "ratifying OQ5" as an
+M7 deliverable. Both cannot be true. Corrected: OQ5 is ratified, its amendment is
+noted, and nothing about it remains for M7.
+
+**A scope reduction found while writing the backend decision.** The two-service
+example already ships `examples/compose.yaml` with postgres, redpanda, console,
+product, and order, plus a Dockerfile, README, and smoke.sh. The Elastic work is
+adding two services to a working stack behind a profile, not building one.
+
+**One page deliberately not written.** A reference page documenting the Elastic
+deployment as a runnable procedure is deferred. The example it extends is
+mid-merge with unresolved conflicts, being reconciled against the same module
+refactor the M6 port was replayed onto, and cannot currently build. Run
+instructions written against it would be unverifiable. The design is captured in
+the backend decision; the procedure is filed once it has been executed.
+
+Pages affected:
+- wiki/proposals/13-telemetry-pipeline-completion.proposal.md (new)
+- wiki/decisions/telemetry-pipeline-ownership.decision.md (new)
+- wiki/decisions/metric-instrument-and-attribute-schema.decision.md (new)
+- wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md (new)
+- wiki/decisions/telemetry-backend-and-example-topology.decision.md (new)
+- wiki/decisions/message-identity-and-header-namespace.decision.md
+- wiki/plans/opentelemetry-completion.plan.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-25] plan | OpenTelemetry completion
+
+Filed `wiki/plans/opentelemetry-completion.plan.md` after establishing that M6
+shipped OpenTelemetry instrumentation without an OpenTelemetry pipeline.
+
+The finding that drives the plan: the workspace depends on `opentelemetry
+= "0.32"` — the API crate — and no `opentelemetry_sdk` exists anywhere in the
+repository. `global::meter("kafkaman")` therefore resolves to the no-op provider
+in every build and every test, so no metric M6 added has ever been observed.
+`apps/axum-outbox` installs a `tracing_subscriber` but no `MeterProvider`, so an
+adopter copying the example gets no metrics either. Traces, a log bridge, and
+trace-context propagation are absent entirely.
+
+Two defects the plan must fix, both found while scoping it:
+
+1. `OnceLock`-cached instruments bind to whatever meter provider exists at first
+   record. A host that starts a relay before building its OTel pipeline gets a
+   permanently silent telemetry surface with no error — and it makes the surface
+   untestable, since a test binary is one process with one global provider.
+2. `record_ingest_stats`'s disjointness invariant is a `debug_assert`, compiled
+   out of release. It is the only guard against a repeat of the double-count
+   defect found in the M6 review, which was caught by reading rather than by a
+   test.
+
+Two decisions the plan defers rather than pre-empts: whether to add standard
+messaging semantic-convention attributes alongside the `kafkaman.*` instrument
+names, and how W3C `traceparent` fits a header model that today has exactly two
+namespaces. The second is the same boundary question as OQ5, which the roadmap
+schedules M7 to ratify; resolving it in Phase 2 settles it with a concrete case.
+
+Verified while scoping: `opentelemetry_sdk` 0.32.1, `opentelemetry-otlp` 0.32.0,
+`tracing-opentelemetry` 0.33.0, `opentelemetry-appender-tracing` 0.32.0, and
+`opentelemetry-semantic-conventions` 0.32.1 are all published and version-aligned
+with the `opentelemetry` 0.32 already in the workspace. Elasticsearch ingests
+OTLP/HTTP natively — no collector required — which is what makes the ELK target
+reachable from this plan without a translation layer.
+
+The plan does not block the M6 merge on its own terms: M6's stated exit criterion
+is the queue-depth/DLQ/stuck surface, which is integration-tested against real
+Postgres. Phase 0 plus the `metrics_surface` test binary are the minimum that
+makes the spec's existing OpenTelemetry claim verifiable.
+
+Pages affected:
+- wiki/plans/opentelemetry-completion.plan.md (new)
+- wiki/index.md
+- wiki/log.md
+
+## [2026-08-25] correct | two rebase follow-ups closed
+
+The M6 rebase entry below left two items open. Both are now resolved against the
+code, and one of them was wrong.
+
+**The stale compatibility claim was real and is fixed.**
+`wiki/compatibility/m6-observability-operability-api.compat.md` credited M6 with
+the dynamic Redpanda host port and named the helper `start_redpanda`. On this
+base the change came from the module-and-test-separation refactor, and the
+helper is `redpanda()` (`tests/durable-send/src/containers.rs:81`), with
+`start_redpanda_on` binding and `available_host_port` picking. The described
+*behavior* was accurate; only the provenance and the name were wrong, so the
+section is rewritten with an explicit attribution correction rather than
+deleted. The page's `Sources` list was stale for the same reason — it still
+pointed at the five crate `lib.rs` roots the refactor dissolved — and now names
+the modules M6's code actually lives in.
+
+**The dropped-test finding was a false alarm and is retracted.** The refactor did
+not drop `migration_context_and_replay_guardrails_are_explicit`; it split it in
+two and kept every assertion:
+
+- `crates/kafkaman-sqlx/src/tests/changelog.rs:36`
+  `migration_context_selects_by_declared_context` keeps `with_context`,
+  `with_applied_by`, and `applied_by()`.
+- `crates/kafkaman-sqlx/src/tests/replay.rs:47`
+  `a_replay_without_a_row_cap_refuses_to_build` keeps `dry_run_preview`, the
+  `InvalidReplay` build rejection, and the `max_rows(0)` rejection verbatim.
+
+The only assertion not carried across literally is the direct `ctx.matches(..)`
+pair. That is not a coverage loss: `matches` is now `pub(crate)`
+(`crates/kafkaman-sqlx/src/changeset.rs:90`) and is exercised through
+`MigrationStepReport::context_skip`, which asserts the operator-visible skip
+report rather than the predicate underneath it. Testing through the reported
+behavior is stronger than testing the private predicate, so nothing is restored.
+
+Pages affected:
+- wiki/compatibility/m6-observability-operability-api.compat.md
+- wiki/log.md
+
+## [2026-08-25] rebase | M6 replayed onto the module-separation base
+
+`main` fast-forwarded from `332721a` to the module-and-test-separation branch
+(`e8c7e9a`), and M6 observability was replayed on top of it.
+
+A `git rebase` was not used. The refactor dissolved every file M6 built on —
+`kafkaman-sqlx/src/lib.rs` alone lost 4,456 lines to ~30 modules — so a 3-way
+merge would have had the monolith as base, a `mod` stub as one side, and
+monolith-plus-M6 as the other, with rename detection unable to bridge a 1-to-30
+split. M6 is 97% additive (+1,431/-45 across the five crate roots, four in-place
+modification sites in total), so the work was placing 47 hunks into named
+modules, not reconciling conflicts. Each hunk was routed by the enclosing scope
+its diff header names.
+
+Where M6's code now lives:
+
+- `kafkaman-core`: `lifecycle.rs` (new) for `LifecycleEmission`/`LifecycleSampler`;
+  `is_terminal` on `status.rs` as explicit impl blocks, since `sql_enum!`
+  generates no impl to extend; the `Option` timestamp adapter nested in `rfc9557`.
+- `kafkaman-config`: `observability.rs` (new), mirroring `retry.rs` and its
+  identical `Retry{Config,Policy,PolicyOverride}` shape; `ObservabilitySection`
+  with the other sections; the shared `string_enum` helper in `serde_enum.rs`.
+- `kafkaman-sqlx`: `operability.rs` (new) for the depth and stuck-row queries
+  with their row types; `redrive_received` in `replay.rs`, which owns the private
+  statement it reuses.
+- `kafkaman-worker` and `kafkaman-rdkafka`: `metrics.rs` each, holding both cfg
+  twins in one file because their purpose is that call sites read identically.
+
+Two M6 changes were dropped as redundant, both cases where the refactor had
+independently made the same improvement:
+
+1. M6 replaced `DlqMode`'s hand-written `Deserialize` visitor with a
+   `string_enum` call. The refactor had already replaced it with a
+   `rename_all = "lowercase"` derive. Both accept exactly `"table"`; the only
+   test on that path asserts `is_err()`.
+2. M6 replaced the hard-coded Redpanda port 19092 with a free-port pick and a
+   five-attempt retry. The refactor had already done this in the shared
+   `containers.rs` as `redpanda()`/`available_host_port()`.
+
+Two defects found and corrected while porting:
+
+- A doc comment M6 attached to `Replay::RUNTIME_VERSION` actually described
+  `received_descriptor`. Split correctly; no behaviour change.
+- `wiki/compatibility/m6-observability-operability-api.compat.md` claims M6
+  introduced dynamic Redpanda test ports and names `start_redpanda`. On this
+  base that came from the refactor and the helper is `redpanda()`. **Corrected
+  2026-08-25** — see the entry at the top of this log.
+
+One finding **not** caused by this rebase: the refactor dropped
+`migration_context_and_replay_guardrails_are_explicit`, which existed on
+`332721a` and covered `MigrationContext` context/`applied_by`/`matches` plus the
+`Replay` guardrails (`dry_run_preview`, `InvalidReplay`, `max_rows(0)`). It is
+absent from `main` independently of M6 and has not been restored here.
+**Retracted 2026-08-25 — this was a false alarm.** The refactor split the test
+rather than dropping it; every assertion survives. See the entry at the top of
+this log.
+
+Verification, on the rebased branch:
+- `cargo fmt --all -- --check` - clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` - clean.
+- `cargo test --workspace --all-features` - 204 passed, 0 failed, 4 ignored.
+- `cargo llvm-cov --workspace --all-features --fail-under-lines 80` - 82.40%.
+
+The count reconciles against both parents: the refactor's 172 passing, plus 19
+`kafkaman-axum`, 8 `kafkaman-core`, 2 `kafkaman-config`, 1 `durable_send`, and
+2 `durable_receive` from M6.
+
+Pages affected:
+- wiki/index.md
+- wiki/log.md
+
 ## [2026-08-25] update | external review follow-ups
 
 Five findings from an independent review of the staged refactor, all confirmed
@@ -107,6 +1413,155 @@ Pages affected:
 - wiki/index.md
 - wiki/log.md
 
+## [2026-08-24] remediate | M6 review remediation
+
+A line-by-line review of the M6 branch before merge found five defects that
+reach a running system, plus consistency and coverage gaps against conventions
+this repository already documents. All are fixed; the closeout documents are
+corrected to match.
+
+The defects:
+
+1. **Every admin timestamp serialized as a nine-integer array.** The workspace
+   enables `time` with `serde`/`formatting`/`parsing` but not
+   `serde-human-readable`, and the string branch of `impl Serialize for
+   OffsetDateTime` is gated on that feature. `axum` enables it only as a
+   dev-dependency, so feature unification does not rescue the build. Every
+   `OffsetDateTime` on the new response structs now carries
+   `kafkaman_core::rfc9557`; `rfc9557::option` was added for the nullable
+   columns. Enabling the upstream feature was rejected because it would also
+   change `ReceivedError`'s established wire format.
+2. **`kafkaman.kafka.ingest.records` counted every record twice.** `committed`
+   is `1` per consumed record *and* one of `inserted`/`duplicate`/`skipped` is
+   also `1`, so recording all four as outcomes of one counter doubled the total.
+   Commits moved to `kafkaman.kafka.ingest.commits`, and all recording now goes
+   through `record_ingest_stats`, which debug-asserts that the outcomes partition
+   `consumed`.
+3. **`received_stuck_rows` used the query shape this repository documents as
+   unindexable.** It filtered on `COALESCE(next_attempt_at, created_at)`, which
+   the received table's `(status, next_attempt_at, created_at)` index cannot
+   serve — the shape `create_outbox_retention_index_sql` records as measured
+   unservable in R14, and which `claim_received_row` splits per status for
+   exactly that reason. Rewritten to the split form; `due_at` remains a
+   projection driving `ORDER BY`.
+4. **`serve().with_runtime()` cancelled workers without draining them.** It
+   returned as soon as the listener closed, cutting in-flight publishes at
+   process exit. It now cancels, then awaits the tasks, bounded by
+   `DEFAULT_DRAIN_TIMEOUT`; a wedged task trips `RuntimeError::DrainTimeout`
+   rather than hanging. The no-task branch now cancels too, and stragglers are
+   aborted rather than leaked.
+5. **Six of seven observability knobs were inert while documented as live.**
+   `lifecycle` and `sample_success` now drive per-message success events through
+   `LifecycleEmission`/`LifecycleSampler` (deterministic every-`n`-th sampling,
+   carried across cycles). `max_queue_age` now sets `over_max_queue_age` on depth
+   summaries, suppressed for terminal statuses via new `is_terminal` helpers.
+   `level`, `payload`, and `headers` are relabelled **reserved** in the example
+   TOML, the field docs, and the spec.
+
+Also addressed: `RedriveRequest` gained `deny_unknown_fields` and a
+`MAX_REDRIVE_ROWS` cap; client-supplied correlation ids are bounded in length and
+charset; `admin_router` carries a security warning at the definition;
+`opentelemetry` moved behind a default-on `metrics` feature; metric attributes
+are built once per loop instead of per record; `ingest.errors` gained a `reason`
+label distinguishing the fatal breaker trip from transient failures; unused
+`kafkaman-config` and `http-body-util` dependencies removed; `axum-outbox`
+switched to the workspace `tower`; dead `Replay::message_type` removed;
+`Replay::RUNTIME_VERSION` replaces the magic `0`; per-message config errors no
+longer duplicate a bad default once per inheriting message type; `DlqMode`'s
+hand-rolled visitor now reuses `string_enum`; every new public item in
+`kafkaman-sqlx` and `kafkaman-axum` is documented; and `start_redpanda` retries
+on a fresh port to close the bind race.
+
+`apps/axum-outbox` now exercises the M6 surface end to end: it mounts
+`admin_router` under `/internal/kafkaman`, applies `CorrelationLayer`, resolves
+its relay lifecycle policy from `[observability]`, and replaces its hand-rolled
+supervision with `serve().with_runtime()`.
+
+Test coverage went from 146 to 173 passing. `kafkaman-axum` went from one unit
+test to nineteen, including RFC 3339 assertions on every response struct — the
+gap that let defect 1 ship — and five supervision tests covering the drain.
+
+Verification:
+- `rtk cargo check --workspace --all-features --all-targets`
+- `rtk cargo test --workspace --all-features` - 173 passed, 4 ignored.
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` -
+  no issues found.
+- `rtk cargo fmt --all -- --check`
+- `rtk cargo check -p kafkaman-worker --no-default-features` and
+  `rtk cargo check -p kafkaman-rdkafka --no-default-features`
+
+Pages affected:
+- wiki/specs/m6-observability-operability.spec.md
+- wiki/decisions/observability-operability-policy.decision.md
+- wiki/compatibility/m6-observability-operability-api.compat.md
+- wiki/log.md
+
+Code affected:
+- Cargo.toml
+- kafkaman.example.toml
+- apps/axum-outbox/ (Cargo.toml, src/main.rs)
+- crates/kafkaman/Cargo.toml
+- crates/kafkaman-axum/ (Cargo.toml, src/lib.rs)
+- crates/kafkaman-config/src/lib.rs
+- crates/kafkaman-core/src/lib.rs
+- crates/kafkaman-rdkafka/ (Cargo.toml, src/lib.rs)
+- crates/kafkaman-sqlx/src/lib.rs
+- crates/kafkaman-worker/ (Cargo.toml, src/lib.rs)
+- tests/durable-send/tests/durable_send.rs
+- tests/durable-send/tests/durable_receive.rs
+- tests/durable-send/tests/redpanda_full_loop.rs
+
+## [2026-08-24] promote | M6 observability and operability closeout
+
+Promoted validated M6 behavior to an active spec and accepted observability
+decision. The closeout records runtime observability config with per-message
+overrides, direct OpenTelemetry metrics through the global `kafkaman` meter, SQL
+queue depth/age/stuck inspection APIs, sanitized `kafkaman-axum` admin/health
+routes, `CorrelationLayer`, runtime task supervision via
+`serve().with_runtime()`, and descriptor-driven received DLQ redrive.
+
+The implementation deliberately keeps payload bodies and arbitrary user headers
+out of admin responses. Admin DLQ summaries expose identifiers, source
+coordinates, timestamps, attempts, and structured failure summaries only. Host
+applications still own tracing subscribers, OpenTelemetry exporters, and access
+control around mounted admin routes.
+
+The all-features gate initially failed because the existing Redpanda full-loop
+test helper hard-coded host port `19092`, which was already occupied by the
+local example Redpanda container. The helper now allocates a free host port and
+advertises that same port, so the full-loop suite can coexist with local example
+infrastructure.
+
+Verification:
+- `rtk cargo check --workspace --all-features`
+- `rtk cargo test --workspace --all-features` - 146 passed, 3 ignored.
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` -
+  no issues found.
+- `rtk cargo fmt --all -- --check`
+
+Pages affected:
+- wiki/decisions/observability-operability-policy.decision.md (new)
+- wiki/specs/m6-observability-operability.spec.md (new)
+- wiki/compatibility/m6-observability-operability-api.compat.md (new)
+- wiki/proposals/04-observability-logging-policy.proposal.md
+- wiki/roadmaps/path-to-v1.roadmap.md
+- wiki/index.md
+- wiki/log.md
+
+Code affected:
+- Cargo.toml
+- Cargo.lock
+- kafkaman.example.toml
+- crates/kafkaman/src/lib.rs
+- crates/kafkaman-axum/
+- crates/kafkaman-config/src/lib.rs
+- crates/kafkaman-rdkafka/src/lib.rs
+- crates/kafkaman-sqlx/src/lib.rs
+- crates/kafkaman-worker/src/lib.rs
+- tests/durable-send/tests/durable_send.rs
+- tests/durable-send/tests/durable_receive.rs
+- tests/durable-send/tests/redpanda_full_loop.rs
+
 ## [2026-08-24] update | module and test separation refactor
 
 Split large production crate roots into focused modules and split the large
@@ -130,6 +1585,112 @@ Pages affected:
 - wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
 - wiki/index.md
 - wiki/log.md
+
+## [2026-08-25] update | rebase onto main; reconcile the M5 closeout
+
+Rebased the topic-convergence work onto `332721a` (the M5 closeout) and restored
+the two-service example from stash. Only `wiki/log.md` conflicted, in both
+operations — the log is newest-first, so every prepended entry lands on the same
+anchor. That will recur on every rebase; it is a property of the format.
+
+The mechanical rebase was the easy half. Main's closeout rewrote the
+documentation of behaviour this branch then changed in code, and **none of those
+files conflicted** — they applied clean and silently became wrong. Reconciled on
+the principle that a spec describes what is true now while a compatibility note
+records what one release shipped:
+
+- `wiki/specs/entity-first-propagation.spec.md` **amended**. It enumerated only
+  `Applied` and `Ignored`, said a topic or partition mismatch is reported as
+  `CacheOriginMismatch` and is never a normal ignored record, and listed broker
+  topic validation as unimplemented. All three are now false in part. It carries
+  the four-case outcome table, and states that topic validation exists as a
+  library capability but is not yet called from any boot sequence — landed rather
+  than delivered.
+- `wiki/roadmaps/path-to-v1.roadmap.md` **amended**, because a roadmap is live
+  orchestration rather than history and its post-M5 deferral list named an item
+  that has since landed.
+- The three M5 compatibility notes and the now-Completed entity-first plan were
+  **left alone** as release records, even though they contain statements this
+  branch supersedes. `m5-code-audit-remediation.compat.md` is the one to watch: it
+  still tells operators to treat `CacheOriginMismatch` as the signal to
+  re-bootstrap, which stays correct for an in-place repartition and is wrong for a
+  rebuilt topic.
+
+Corrections to this branch's own documents, which mattered more than main's:
+
+- Proposal 13 and the topic-convergence decision **misquoted** the entity-first
+  plan. They cited "Boot-time broker topic validation remains pending"; the
+  closeout rewrote that to "remains deferred after M5". The 2026-08-24 `create`
+  entry below carries the same misquote and is left as written, since this log is
+  append-only.
+- Both leaned on a Deferred bullet — "Topic/partition mismatch invalidation path"
+  — that the closeout deleted, having reframed that behaviour as shipped. The
+  proposal's main premise survives, because boot-time validation is still Deferred
+  in both notes; what changed is that this work *supersedes* a closed M5 behaviour
+  rather than *completing* an open deferral.
+- Three documents listed `Replay::outbox` **rejection** as deferred. It was
+  already implemented at the merge base — `Replay::outbox` returns
+  `Err(UnsafeOutboxReplay)` unconditionally. What is actually missing is the
+  positive resync surface. That error predated the rebase and was ours.
+- `wiki/index.md` still showed the topic-convergence plan as `Draft` with phases
+  1-4 landed.
+Pages affected: `wiki/specs/entity-first-propagation.spec.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`,
+`wiki/proposals/13-topic-convergence-and-environment-provisioning.proposal.md`,
+`wiki/decisions/topic-convergence-and-rebuild.decision.md`,
+`wiki/plans/topic-convergence.plan.md`,
+`wiki/compatibility/topic-convergence-api.compat.md`, `wiki/index.md`,
+`wiki/log.md`.
+
+## [2026-08-24] implement | topic convergence phases 1-4
+
+Landed the declaration, config, verify/create, and cache-origin invalidation
+slices of the topic-convergence plan. `TopicSpec`, `CleanupPolicy`, `TopicMode`
+and the pure `reconcile` decision live in `kafkaman-core`; `[topics] mode` in
+`kafkaman-config`; `TopicAdmin` and `converge_topics` in `kafkaman-rdkafka`; the
+authorized migration in `kafkaman-sqlx`. Workspace green at 177 passing, clippy
+clean.
+
+`reconcile` is deliberately pure and takes the broker's answer as an argument, so
+the branches that are awkward to provoke against a real broker — an ACL-denied
+create, a compacted-but-wrongly-partitioned topic, an unknown cleanup policy —
+are unit-tested without one.
+
+**The invalidation rule as decided was too permissive, and an existing test caught
+it.** Authorizing any origin change that arrived on the declared topic would also
+have blessed an in-place partition change, which is exactly the operation the
+rebuild decision forbids; `cache_apply_halts_when_an_entity_changes_partition`
+failed. The rule now authorizes migration only across a *topic* change, and adds
+a fourth case the decision had missed: a straggler from a topic the cache has
+already migrated off is stale, not broken, so it is ignored rather than failed —
+otherwise a cutover fills the error table with its own drainage. The decision was
+amended to match rather than the test being adjusted to fit.
+
+One implementation detail worth recording: `TopicAdmin` sets
+`allow.auto.create.topics=false` and reads whole-cluster metadata instead of
+naming a topic, because a metadata request that names a topic is itself enough to
+make a broker create it — with the `delete` policy this code exists to detect.
+
+Both live-broker gates were demonstrated rather than assumed. Disabling the
+policy comparison failed the new `topic_convergence` tests; so did swapping the
+metadata strategy for the naive one, on `verifying a topic must not create it` —
+with auto-creation enabled, asking whether a topic is compacted is itself enough
+to create it with the `delete` default.
+
+Phase 5 (the `examples/provision` binary) is blocked on the example services
+being stashed out of the tree. Still uncovered: the ACL-denied create path
+(dev-container mode has no ACLs to deny with) and the decision's bounded broker
+retry at boot, which is not implemented.
+Pages affected: `crates/kafkaman-core/src/topics.rs`,
+`crates/kafkaman-core/src/lib.rs`, `crates/kafkaman-config/src/lib.rs`,
+`crates/kafkaman-rdkafka/src/topics.rs`, `crates/kafkaman-rdkafka/src/lib.rs`,
+`crates/kafkaman-sqlx/src/lib.rs`,
+`tests/durable-send/tests/entity_first_propagation.rs`,
+`tests/durable-send/tests/topic_convergence.rs`,
+`wiki/compatibility/topic-convergence-api.compat.md`,
+`wiki/decisions/topic-convergence-and-rebuild.decision.md`,
+`wiki/proposals/13-topic-convergence-and-environment-provisioning.proposal.md`,
+`wiki/plans/topic-convergence.plan.md`, `wiki/index.md`, `wiki/log.md`.
 
 ## [2026-08-24] create | topic convergence, rebuild over repartitioning
 
@@ -174,6 +1735,73 @@ Pages affected: `wiki/proposals/13-topic-convergence-and-environment-provisionin
 `wiki/decisions/topic-convergence-and-rebuild.decision.md`,
 `wiki/plans/topic-convergence.plan.md`, `wiki/index.md`, `wiki/log.md`.
 
+## [2026-08-24] implementation | two-service distributed cache example
+
+Shipped the plan. `apps/` is now `examples/`, holding `contracts` (the two
+snapshot types and nothing else), `product`, and `order`; `tests/distributed-cache`
+drives both services over HTTP and never touches a database. Workspace suite green
+at 153 passing — the 141 that existed, minus the 3 deleted `axum-outbox` HTTP tests,
+plus 15 new — with `just lint` clean and coverage at 91.2% lines.
+
+The verification that mattered was demonstrated rather than assumed: **both wiring
+breaks fail the new test and nothing else in the workspace notices either.** Removing
+`order`'s dispatcher spawn fails at the convergence deadline; removing
+`CreateCacheTable` from its changelog fails in three seconds on a 500 from the cache
+read. That is the entire justification for the test tier existing.
+
+The library documentation gap is closed: `dispatch_once` and
+`MessageRouter::handler` now state that the handler runs *before* the cache upsert,
+so a handler deriving from its own cache sees that entity one version stale. No
+public API changed, so no compatibility note.
+
+Redpanda's ephemeral-port approach worked, so F16 is fixed — `redpanda_full_loop.rs`
+reserves a port from the OS per container instead of hardcoding `19092`. Its
+process-global mutex stayed, with the comment corrected: it never protected against
+a second test *binary*, and what it still buys is not starting a dozen brokers at
+once.
+
+Two deliberate deviations, both recorded in the plan. Snapshot idempotency keys are
+derived from a per-entity `version` column rather than from the payload, because a
+payload digest would break the example's own cancellation step: restoring
+availability to a previously published value would re-derive a key the consumer has
+already seen, and the restoring snapshot would be dropped as a duplicate. This is an
+idempotency identity, not a convergence ordinal — the ordinal is still the Kafka
+offset — so the entity-first decision's argument against producer-stamped versions
+does not apply. And the availability-only rejection runs *before* discontinuation,
+since after it the status check fires first and the assertion would prove nothing.
+
+One consequence the plan did not anticipate, recorded rather than reversed: the
+rename undoes a deliberate 2026-06-21 move. The example was put in `apps/`
+*because* `cargo llvm-cov` excludes `examples/`, so it would count toward the
+workspace total. It no longer does, and the coverage number across this change is
+not comparable — 91.2% now measures `crates/` alone. Kept anyway, because the
+gate should describe the library rather than be propped up by demonstration code,
+and the library test strategy already treats coverage % as a signal rather than
+the gate. Noted in the M1 plan where the original reasoning lives.
+
+Also worth recording: the domain status enums carry a catch-all `Unrecognized`
+variant, on the same reasoning the entity-first decision applies to origin intent —
+a new variant at an un-redeployed consumer is a deterministic ingest skip, and
+enough of them trip the breaker topic-wide. And `.gitignore` matched
+`kafkaman.toml` at every level, which is what made the original example unrunnable;
+`!examples/*/kafkaman.toml` is now an explicit exception.
+
+Pages affected:
+- wiki/plans/two-service-distributed-cache-example.plan.md
+- wiki/index.md
+- wiki/log.md
+- `examples/contracts/`, `examples/order/`, `examples/product/` (new; `order`
+  renamed from `apps/axum-outbox`)
+- `tests/distributed-cache/` (new)
+- `crates/kafkaman-sqlx/src/lib.rs` (rustdoc only)
+- `tests/durable-send/tests/redpanda_full_loop.rs`
+- `Cargo.toml`, `.gitignore`, `README.md`, `kafkaman.example.toml`
+- wiki/plans/m1-durable-send-implementation.plan.md (coverage note reversed)
+- wiki/specs/m1-durable-send.spec.md (example path)
+- wiki/compatibility/typed-idempotency-identity-api.compat.md (example path and
+  idempotency derivation)
+- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md (example
+  path; outbox retention has since shipped)
 ## [2026-08-24] promote | M5 entity-first propagation closeout
 
 Promoted validated M5 behavior to an active spec and closed the execution plan.
@@ -212,8 +1840,6 @@ Pages affected:
 - wiki/roadmaps/path-to-v1.roadmap.md
 - wiki/index.md
 - wiki/log.md
-||||||| parent of b53f80d (docs: record topic convergence decision)
-
 
 ## [2026-08-24] plan | the example app cannot start; two-service example planned
 

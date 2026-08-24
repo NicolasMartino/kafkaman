@@ -14,15 +14,23 @@ pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 mod config;
 mod duration;
 mod error;
+mod observability;
 mod retry;
 mod schema;
 mod sections;
+mod serde_enum;
 
 pub use config::{Config, FromConfigValue};
 pub use error::{ConfigError, ConfigErrors, ConfigIssue};
+pub use observability::{
+    HeaderLogging, LifecycleLogging, ObservabilityConfig, ObservabilityLevel, ObservabilityPolicy,
+    ObservabilityPolicyOverride, PayloadLogging,
+};
 pub use retry::{DlqMode, RetryConfig, RetryPolicy, RetryPolicyOverride};
 pub use schema::ConfigSchema;
-pub use sections::{RelaySection, RetentionSection, RetrySection};
+pub use sections::{
+    ObservabilitySection, RelaySection, RetentionSection, RetrySection, TopicsSection,
+};
 
 #[cfg(test)]
 mod tests;

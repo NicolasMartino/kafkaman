@@ -1,0 +1,38 @@
+[package]
+name = "example-product"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "product"
+path = "src/main.rs"
+
+[lib]
+name = "example_product"
+path = "src/lib.rs"
+
+[dependencies]
+axum.workspace = true
+example-contracts = { path = "../contracts" }
+# One kafkaman dependency, not two: the transport comes through the facade.
+kafkaman = { path = "../../crates/kafkaman", features = ["axum", "rdkafka"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+testcontainers.workspace = true
+time.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

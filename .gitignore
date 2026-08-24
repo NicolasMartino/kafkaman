@@ -12,6 +12,12 @@ Cargo.lock.orig
 # the resolved file. The example (dummy values, documents the keys) stays tracked.
 kafkaman.toml
 !kafkaman.example.toml
+# The example services' configs are tracked too. They carry no secrets — the
+# connection string and broker list are environment variables, not kafkaman keys
+# — and they are loaded by `Config::discover()` in tests, which is the only thing
+# that keeps a config file from rotting. A missing one is exactly the bug that
+# left the previous example unable to start.
+!examples/*/kafkaman.toml
 
 # OS / editor
 .DS_Store

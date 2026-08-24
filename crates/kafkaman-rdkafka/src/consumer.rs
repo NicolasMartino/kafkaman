@@ -14,10 +14,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 #[cfg(feature = "internal-hooks")]
 use crate::hooks::{IngestCommitEvent, PostDurableWriteObserver};
-use crate::ingest_record::{ingest_failure_record, record_envelope};
+use crate::ingest_record::{ingest_failure_record, record_envelope, record_trace_context};
+use crate::metrics::IngestMetrics;
 use crate::{Error, IngestLoopStats, IngestStats, Result};
 
 /// Where a record sits in the log.
@@ -126,8 +128,10 @@ impl RdkafkaConsumer {
         let at = RecordLocation::of(&message);
 
         match record_envelope::<P, _>(&message) {
-            Ok((envelope, key)) => {
-                self.store::<P>(pool, cfg, &message, at, &envelope, key)
+            Ok(record) => {
+                let span = ingest_span::<P>(&at, record.producer_trace.as_ref());
+                self.store::<P>(pool, cfg, &message, at, &record.envelope, record.key)
+                    .instrument(span)
                     .await
             }
             Err(err) => match err.ingest_failure_kind() {
@@ -135,7 +139,9 @@ impl RdkafkaConsumer {
                 // acknowledged, so the partition advances past it instead of
                 // every later record queueing behind one that will never parse.
                 Some(kind) => {
+                    let span = ingest_span::<P>(&at, record_trace_context(&message).as_ref());
                     self.quarantine::<P>(pool, cfg, &message, at, kind, err.to_string())
+                        .instrument(span)
                         .await
                 }
                 None => Err(err),
@@ -281,6 +287,11 @@ impl RdkafkaConsumer {
         P: KafkaMessage + DeserializeOwned + Serialize,
     {
         let mut loop_stats = IngestLoopStats::default();
+        // Resolved at loop start, not at first record: an instrument binds to
+        // whichever meter provider is installed when it is built. Building it
+        // here means a host that installs its pipeline before starting the
+        // ingester is reported, regardless of what else the process did first.
+        let metrics = IngestMetrics::new(P::MESSAGE_TYPE);
 
         loop {
             let result = tokio::select! {
@@ -291,6 +302,7 @@ impl RdkafkaConsumer {
 
             match result {
                 Ok(stats) => {
+                    metrics.stats(&stats);
                     if stats.skipped > 0 {
                         tracing::warn!(
                             partition = stats.partition,
@@ -312,11 +324,13 @@ impl RdkafkaConsumer {
                     loop_stats.record_cycle(&stats);
                 }
                 Err(err @ Error::ConsecutiveSkipLimitExceeded { .. }) => {
+                    metrics.error("consecutive_skip_limit");
                     tracing::error!(error = %err, "Kafka ingest stopped after consecutive skips");
                     return Err(err);
                 }
                 Err(err) => {
                     loop_stats.transient_errors += 1;
+                    metrics.error("transient");
                     tracing::error!(
                         error = %err,
                         retry_delay_ms = retry_delay.as_millis() as u64,
@@ -339,4 +353,35 @@ impl RdkafkaConsumer {
         }
         Ok(())
     }
+}
+
+/// The span one consumed record is processed in.
+///
+/// It **links** to the producer rather than descending from it. A consumer polls
+/// a batch that may hold records from many unrelated traces, so parenting would
+/// attach whatever else was in the batch to whichever trace happened to be
+/// first; messaging semantic conventions prescribe a link for exactly this
+/// shape. Without a producer context it is simply a root span, which is what an
+/// uninstrumented producer should yield.
+///
+/// The receive row written inside this span stores *this* span's context, not
+/// the producer's, so the dispatch that runs later descends from the ingest that
+/// stored it.
+fn ingest_span<P: KafkaMessage>(
+    at: &RecordLocation,
+    producer_trace: Option<&kafkaman_core::TraceContext>,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        "kafkaman.ingest",
+        message_type = P::MESSAGE_TYPE,
+        messaging.system = "kafka",
+        messaging.destination.name = P::TOPIC,
+        messaging.operation.name = "receive",
+        messaging.kafka.partition = at.partition,
+        messaging.kafka.offset = at.offset,
+    );
+    if let Some(trace) = producer_trace {
+        kafkaman_core::add_link(&span, trace);
+    }
+    span
 }

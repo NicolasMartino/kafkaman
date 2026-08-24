@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-use kafkaman_config::{Config, ConfigErrors, ConfigIssue, ConfigSchema, RetryConfig};
-use kafkaman_core::{KafkaMessage, MessageDescriptor, RelayConfig, SqlIdentifier};
+use kafkaman_config::{
+    Config, ConfigErrors, ConfigIssue, ConfigSchema, ObservabilityConfig, RetryConfig,
+};
+use kafkaman_core::{KafkaMessage, MessageDescriptor, RelayConfig, SqlIdentifier, TopicMode};
 
 use crate::{Error, Result};
 
@@ -16,6 +18,16 @@ pub struct ResolvedConfig {
     pub schema: SqlIdentifier,
     pub relay: RelayConfig,
     pub retry: RetryConfig,
+    pub observability: ObservabilityConfig,
+    /// What boot may do about the topics the registered types declare.
+    ///
+    /// Resolved here rather than read from the file at the call site so that a
+    /// mistyped mode is reported alongside every other config problem, in the
+    /// one error this crate promises to raise before a pool is opened. The
+    /// transport crate consumes it — `kafkaman_rdkafka::converge_topics` takes
+    /// this and [`Self::messages`] — but the *decision to check* is
+    /// configuration, and configuration resolves in one place.
+    pub topics: TopicMode,
     messages: Vec<MessageDescriptor>,
 }
 
@@ -25,6 +37,8 @@ impl ResolvedConfig {
             schema,
             relay: RelayConfig::default(),
             retry: RetryConfig::default(),
+            observability: ObservabilityConfig::default(),
+            topics: TopicMode::default(),
             messages: Vec::new(),
         }
     }
@@ -100,6 +114,33 @@ impl ResolvedConfig {
             Some(RetryConfig::default())
         };
 
+        // Absent is not the same as off: `topics()` supplies `verify` for a
+        // missing section, and only an unparseable one lands here as an issue.
+        let topics = match cfg.topics() {
+            Ok(section) => Some(section.mode),
+            Err(err) => {
+                issues.push(err.into());
+                None
+            }
+        };
+
+        // No `contains` guard, unlike `[relay]` and `[retry]` above:
+        // `observability_config` defaults the absent section itself, so the
+        // section is optional in one place instead of in each caller.
+        let observability = {
+            let registered = messages
+                .iter()
+                .map(|descriptor| descriptor.message_type.as_str().to_owned())
+                .collect::<Vec<_>>();
+            match cfg.observability_config(registered) {
+                Ok(observability) => Some(observability),
+                Err(observability_errors) => {
+                    issues.extend(observability_errors.into_issues());
+                    None
+                }
+            }
+        };
+
         if !issues.is_empty() {
             return Err(Error::ConfigErrors(ConfigErrors::new(issues)));
         }
@@ -116,7 +157,9 @@ impl ResolvedConfig {
         let schema = SqlIdentifier::new(schema.ok_or_else(|| missing("database.schema"))?)?;
         let mut resolved = Self::new(schema)
             .with_relay(relay.ok_or_else(|| missing("relay"))?)
-            .with_retry(retry.ok_or_else(|| missing("retry"))?);
+            .with_retry(retry.ok_or_else(|| missing("retry"))?)
+            .with_observability(observability.ok_or_else(|| missing("observability"))?)
+            .with_topics(topics.ok_or_else(|| missing("topics"))?);
         for message in messages {
             // Fallible on purpose. A `message_type` re-registered under a
             // different topic is a misconfiguration, not a duplicate: keeping the
@@ -180,6 +223,16 @@ impl ResolvedConfig {
 
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    pub fn with_topics(mut self, topics: TopicMode) -> Self {
+        self.topics = topics;
+        self
+    }
+
+    pub fn with_observability(mut self, observability: ObservabilityConfig) -> Self {
+        self.observability = observability;
         self
     }
 

@@ -1,10 +1,12 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use kafkaman_sqlx::{dispatch_once, MessageRouter, ReceivedTable};
+use kafkaman_core::LifecycleEmission;
+use kafkaman_sqlx::{dispatch_once, DispatchStats, MessageRouter, ReceivedTable};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::DispatchMetrics;
 use crate::run_loop::sleep_or_shutdown;
 use crate::{Error, Result};
 
@@ -22,6 +24,7 @@ pub async fn run_dispatcher(
     table: ReceivedTable,
     router: MessageRouter,
     poll_interval: Duration,
+    lifecycle: LifecycleEmission,
     shutdown: CancellationToken,
 ) -> Result<()> {
     if poll_interval.is_zero() {
@@ -31,6 +34,9 @@ pub async fn run_dispatcher(
         });
     }
 
+    let metrics = DispatchMetrics::new(table.descriptor.message_type.as_str());
+    let mut lifecycle = lifecycle.sampler();
+
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -39,8 +45,22 @@ pub async fn run_dispatcher(
         // A failed cycle is treated as "nothing claimed" rather than propagated:
         // a transient database error must not stop a dispatcher, and the sleep
         // that follows is also the backoff.
+        let started = Instant::now();
         let claimed = match dispatch_once(&pool, &table, &router, OffsetDateTime::now_utc()).await {
             Ok(stats) => {
+                metrics.cycle();
+                metrics.rows("claimed", stats.claimed);
+                metrics.rows("processed", stats.processed);
+                metrics.rows("failed", stats.failed);
+                if stats.claimed > 0 {
+                    metrics.dispatched(dispatch_outcome(&stats), started.elapsed());
+                }
+                for _ in 0..lifecycle.take(stats.processed) {
+                    tracing::info!(
+                        message_type = table.descriptor.message_type.as_str(),
+                        "received message processed"
+                    );
+                }
                 if stats.claimed > 0 {
                     tracing::debug!(
                         claimed = stats.claimed,
@@ -52,6 +72,7 @@ pub async fn run_dispatcher(
                 stats.claimed
             }
             Err(err) => {
+                metrics.error();
                 tracing::error!(
                     error = %err,
                     "receive dispatch cycle failed; retrying after poll interval"
@@ -70,4 +91,21 @@ pub async fn run_dispatcher(
     }
 
     Ok(())
+}
+
+/// How a dispatch that claimed a row ended, as the `outcome` attribute.
+///
+/// `dispatch_once` handles exactly one row per call, so these are mutually
+/// exclusive rather than a summary. A claim that is neither processed nor failed
+/// lost its lease to another worker mid-flight — the row is not lost, but this
+/// dispatch did not complete it, and lumping that in with success would hide a
+/// lease that is too short for the handler it covers.
+fn dispatch_outcome(stats: &DispatchStats) -> &'static str {
+    if stats.processed > 0 {
+        "processed"
+    } else if stats.failed > 0 {
+        "failed"
+    } else {
+        "stale"
+    }
 }

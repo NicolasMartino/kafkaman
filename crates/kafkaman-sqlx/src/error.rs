@@ -108,4 +108,27 @@ pub enum Error {
 
     #[error("handler failed: {0}")]
     Handler(String),
+
+    #[error(
+        "message type `{message_type}` is already declared as `{existing}` and cannot also be \
+         declared as `{added}`: one message type gets one handler position, and \
+         `handle_before` plus `handle` is the only legal pair"
+    )]
+    ConflictingRole {
+        message_type: String,
+        existing: &'static str,
+        added: &'static str,
+    },
+
+    #[error(
+        "generated changeset band {band} is claimed by both `{first}` and `{second}`: this is a \
+         hash collision in kafkaman's changeset numbering, not a mistake in your roles — please \
+         report it, and work around it by moving one of the two message types onto a \
+         hand-written changelog"
+    )]
+    ChangesetBandCollision {
+        band: i64,
+        first: String,
+        second: String,
+    },
 }

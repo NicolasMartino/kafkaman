@@ -477,6 +477,11 @@ were resolved after the initial completion. Outcome:
 - **Coverage:** workspace line coverage is gated at 80% via `cargo llvm-cov`
   (`just test coverage`); the example now lives in `apps/` so it counts toward the
   total. See the compatibility note for schema/API impact.
+  **Reversed 2026-08-24.** `apps/` was renamed back to `examples/` by the
+  [two-service distributed cache example](two-service-distributed-cache-example.plan.md),
+  which `cargo llvm-cov` excludes — so the coverage total now measures `crates/`
+  alone. Deliberate: the gate should describe the library, not be propped up by
+  demonstration code.
 
 Schema and API impact is recorded in
 [compatibility/m1-durable-send-schema-and-api-changes.compatibility.md](../compatibility/m1-durable-send-schema-and-api-changes.compatibility.md).

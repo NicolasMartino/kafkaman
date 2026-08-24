@@ -31,3 +31,23 @@ sql_enum! {
     }
     invalid = Error::InvalidReceiveStatus;
 }
+
+impl OutboxStatus {
+    /// Whether no worker will ever act on a row in this status again.
+    ///
+    /// Retention's delete predicate and the queue-age warning both need this
+    /// split, and they must agree: a status the purger treats as reclaimable is
+    /// by definition not queued work, so its age must never raise a backlog
+    /// warning.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Published | Self::Superseded | Self::Failed)
+    }
+}
+
+impl ReceiveStatus {
+    /// Whether no dispatcher will pick this row up again without an operator
+    /// redrive. `Failed` counts: a DLQ row waits for a human, not the queue.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Processed | Self::Failed)
+    }
+}

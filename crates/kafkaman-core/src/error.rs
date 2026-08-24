@@ -37,4 +37,30 @@ pub enum Error {
         field: &'static str,
         reason: &'static str,
     },
+
+    #[error("invalid topic spec: {field} {reason}")]
+    InvalidTopicSpec {
+        field: &'static str,
+        reason: &'static str,
+    },
+
+    #[error(
+        "topic `{topic}` must be configured `cleanup.policy={expected}` but the broker reports \
+         `{found}`: an entity snapshot topic that is not compacted cannot rebuild an entity from \
+         the log"
+    )]
+    TopicPolicyMismatch {
+        topic: String,
+        expected: String,
+        found: String,
+    },
+
+    #[error("topic `{topic}` does not exist")]
+    TopicMissing { topic: String },
+
+    #[error(
+        "creating topic `{topic}` requires an explicit partition count: kafkaman will not guess \
+         one, because changing it later means republishing every entity onto a new topic"
+    )]
+    TopicPartitionsUndeclared { topic: String },
 }

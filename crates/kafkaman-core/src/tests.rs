@@ -6,9 +6,11 @@
 mod failure_kind;
 mod idempotency;
 mod identifier;
+mod lifecycle;
 mod message;
 mod purge_config;
 mod relay_config;
 mod rfc9557;
 mod rows;
 mod status;
+mod topics;

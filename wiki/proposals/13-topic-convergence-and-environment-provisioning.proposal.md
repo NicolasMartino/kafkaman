@@ -35,13 +35,21 @@ Nothing in the codebase creates topics — there is no `AdminClient`,
 `describe_configs`, or `cleanup.policy` reference anywhere in `crates/` — so the
 topics are auto-created by the broker and its default wins.
 
-This is not a new discovery. It is recorded under **Deferred** in
+This is not a new discovery. It is recorded under **Deferred** in both
 `m5-entity-first-cache-api.compat.md` and
 `m5-entity-first-outbox-supersede.compat.md`, is listed In Scope in
-`entity-first-propagation.plan.md`, and that plan's 2026-08-13 progress note says
-plainly: *"Boot-time broker topic validation remains pending."* What is new is
+`entity-first-propagation.plan.md`, and that plan states plainly that
+*"Boot-time broker topic validation remains deferred after M5."* What is new is
 only the evidence that the gap is load-bearing in practice rather than
 theoretical.
+
+**Amended 2026-08-25.** This proposal was written against the pre-closeout
+wording of those documents. The M5 closeout (`332721a`) removed a second bullet
+this proposal originally leaned on — *"Topic/partition mismatch invalidation
+path"* — and reframed that behaviour as shipped rather than deferred. The
+argument below is unaffected on its main point, because boot-time topic
+validation is still Deferred in both notes; what changed is that §3 now
+*supersedes* a closed M5 behaviour instead of *completing* an open deferral.
 
 **Why it matters.** A `delete`-retention topic silently breaks the property the
 entity-first model rests on. Full snapshots make a compacted topic self-healing
@@ -156,20 +164,31 @@ comment notes that otherwise the row *"would freeze forever with no error and no
 metric"* — and raises `Error::CacheOriginMismatch`, which
 `received_failure_disposition` classifies as **terminal**, per-row rather than
 tripping a breaker. So a v2 republish today makes every entity's first v2 record
-fail terminally into the error table. Detection landed; the resolution is exactly
-the *"Topic/partition mismatch invalidation path"* still sitting in Deferred.
+fail terminally into the error table. Detection landed; the resolution did not.
+
+The M5 closeout recorded that outcome as finished — *"A topic or partition
+mismatch now fails as `Error::CacheOriginMismatch` instead of being silently
+ignored"* — which is true, and is precisely the wall. Failing loudly is the right
+answer for a misconfigured consumer and the wrong one for a rebuilt topic, and
+nothing distinguished them.
 
 **The declared topic is the authorization for that path.** Invalidation must not
 be automatic — "accept any new origin" would mean a consumer misconfigured onto
 the wrong topic silently resets its cache. But once §1 gives kafkaman a declared
 topic per type, the two cases separate cleanly:
 
-- cache origin differs from the record's topic, **and the record's topic is the
-  declared one** → authorized migration: reset the guard, accept the new origin;
-- any other origin change → stays terminal, exactly as today.
+- the record's topic differs from the cached one **and is the declared topic** →
+  authorized migration: reset the guard, accept the new origin;
+- same topic, different partition → **terminal**, unchanged. A declaration says
+  which topic is authoritative, not which partition an entity sits on, so an
+  in-place repartition — the operation §3 exists to avoid — is not blessed by it;
+- a record from a topic the cache has already migrated *off* → ignored as stale,
+  so a cutover does not fill the error table with its own stragglers;
+- any other origin change → terminal, exactly as today.
 
-Two deferred items thus resolve each other: topic convergence is what makes the
-invalidation path safe.
+Topic convergence is therefore what makes the invalidation path safe: the
+declaration is the only thing in the system that can tell a rebuild from a
+mistake.
 
 ### 4. A provisioner for the example environment
 
@@ -261,14 +280,17 @@ deployment keeps the same silent failure.
    after a fresh live write. Key-serialized outbound supersede should cover it
    *provided* the republish goes through the same outbox path rather than around
    it — needs confirming against the supersede implementation.
-3. **`Replay::outbox` rejection is a third deferred item** and belongs to the same
-   story: a rebuild must read current state, never replay stale outbox rows as
-   truth.
+3. **A positive state-sourced republish API does not exist.** The negative half
+   already shipped — `Replay::outbox` returns `Err(UnsafeOutboxReplay)`
+   unconditionally — but a rebuild needs a supported way to re-read current
+   domain state and enqueue it through the normal supersede path, and that
+   surface is still deferred. (An earlier draft of this proposal wrongly listed
+   the *rejection* as deferred; it is not.)
 
 ## Verification
 
 - The example topics report `cleanup.policy=compact` in Redpanda Console after
-  `just demo`, where they currently report `delete`.
+  `just examples demo`, where they currently report `delete`.
 - **Deliberately misconfigure and confirm the failure.** Pre-create `products`
   with `cleanup.policy=delete`, then boot `order` in `verify` mode: it must refuse
   to start, naming the topic and the offending policy. Catching this is the entire

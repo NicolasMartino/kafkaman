@@ -55,6 +55,7 @@ async fn dispatcher_loop_processes_due_rows_and_stops_on_cancellation() -> TestR
         table.clone(),
         router,
         Duration::from_secs(60),
+        LifecycleEmission::default(),
         worker_shutdown,
     ));
 
@@ -144,6 +145,7 @@ async fn dispatcher_loop_finishes_in_flight_dispatch_before_shutdown() -> TestRe
         table.clone(),
         router,
         Duration::from_millis(10),
+        LifecycleEmission::default(),
         worker_shutdown,
     ));
 

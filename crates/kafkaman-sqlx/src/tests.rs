@@ -14,11 +14,13 @@ use crate::ReceivedTable;
 
 mod changelog;
 mod dispatch_cache;
+mod generated_changelog;
 mod lock_keys;
 mod migration_runner;
 mod replay;
 mod resolved_config;
 mod retry_backoff;
+mod roles;
 mod schema_sql;
 mod tables;
 
@@ -88,6 +90,7 @@ pub(crate) fn received_row_fixture() -> ReceivedRow {
         headers: BTreeMap::new(),
         payload: serde_json::json!({}),
         correlation_id: None,
+        trace: None,
         causation_id: None,
         occurred_at: OffsetDateTime::UNIX_EPOCH,
         created_at: OffsetDateTime::UNIX_EPOCH,

@@ -1,8 +1,12 @@
+use std::time::Instant;
+
 use kafkaman_core::{MarkOutcome, RelayConfig, RelayStats};
 use kafkaman_sqlx::{claim_batch, mark_publish_failed, mark_published, OutboxTable};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
+use crate::metrics::RelayMetrics;
 use crate::run_loop::sleep_or_shutdown;
 use crate::{Publisher, Result};
 
@@ -17,6 +21,23 @@ pub async fn relay_once<P: Publisher>(
     publisher: &P,
     table: &OutboxTable,
     cfg: &RelayConfig,
+) -> Result<RelayStats> {
+    relay_once_inner(pool, publisher, table, cfg, None).await
+}
+
+/// The body of [`relay_once`], with the loop's instruments threaded in.
+///
+/// `metrics` is `None` when the public helper is called directly, which is how
+/// the scheduler counters stay out of a deployment's series when a test drives
+/// one cycle by hand — the same reason `relay_stats` lives on the loop rather
+/// than here. The per-publish latencies can only be measured inside this
+/// function, so they travel the same way rather than getting a second mechanism.
+async fn relay_once_inner<P: Publisher>(
+    pool: &PgPool,
+    publisher: &P,
+    table: &OutboxTable,
+    cfg: &RelayConfig,
+    metrics: Option<&RelayMetrics>,
 ) -> Result<RelayStats> {
     cfg.validate()?;
 
@@ -37,9 +58,43 @@ pub async fn relay_once<P: Publisher>(
     };
 
     for row in claimed {
+        // The span the consumer will link to, and the one that closes the gap
+        // the outbox opens: parented from the context stored at enqueue, so a
+        // publish minutes later still belongs to the transaction that caused it.
+        // Without a stored context it is a root span, which is what an
+        // uninstrumented enqueue should produce.
+        let span = tracing::info_span!(
+            "kafkaman.relay.publish",
+            message_type = table.descriptor.message_type.as_str(),
+            messaging.system = "kafka",
+            messaging.destination.name = row.row.topic.as_str(),
+            messaging.operation.name = "send",
+            messaging.message.id = %row.message_id(),
+        );
+        if let Some(trace) = &row.row.trace {
+            kafkaman_core::set_parent(&span, trace);
+        }
+
+        let started = Instant::now();
+        // Instrumented rather than entered: the publish awaits, and a span guard
+        // held across an await attributes whatever else the runtime schedules on
+        // this thread to this message.
+        let published = publisher.publish(&row).instrument(span).await;
+        if let Some(metrics) = metrics {
+            let outcome = if published.is_ok() {
+                "published"
+            } else {
+                "failed"
+            };
+            metrics.publish(&row.row.topic, outcome, started.elapsed());
+            if published.is_ok() {
+                metrics.published(row.row.occurred_at);
+            }
+        }
+
         // A mark that finds no claim is not an error: the lease expired and
         // another worker owns the row now. Counted, not failed.
-        let outcome = match publisher.publish(&row).await {
+        let outcome = match published {
             Ok(_) => {
                 let outcome = mark_published(pool, table, row.message_id(), row.claim_id).await?;
                 if outcome == MarkOutcome::Updated {
@@ -98,6 +153,9 @@ pub async fn run<P: Publisher>(
     // interval span the loop at full speed while logging an error each pass.
     cfg.validate()?;
 
+    let metrics = RelayMetrics::new(table.descriptor.message_type.as_str());
+    let mut lifecycle = cfg.lifecycle.sampler();
+
     loop {
         // Checked before the cycle, not only after it. Without this a relay
         // handed an already-cancelled token still claims and publishes one
@@ -108,20 +166,37 @@ pub async fn run<P: Publisher>(
             break;
         }
 
-        match relay_once(&pool, &publisher, &table, &cfg).await {
-            Ok(stats) if stats.claimed > 0 => tracing::debug!(
-                claimed = stats.claimed,
-                published = stats.published,
-                failed = stats.failed,
-                stale = stats.stale,
-                missing = stats.missing,
-                "relay cycle complete"
-            ),
-            Ok(_) => {}
-            Err(err) => tracing::error!(
-                error = %err,
-                "relay cycle failed; retrying after poll interval"
-            ),
+        match relay_once_inner(&pool, &publisher, &table, &cfg, Some(&metrics)).await {
+            Ok(stats) => {
+                metrics.relay_stats(&stats);
+                if stats.claimed > 0 {
+                    tracing::debug!(
+                        claimed = stats.claimed,
+                        published = stats.published,
+                        failed = stats.failed,
+                        stale = stats.stale,
+                        missing = stats.missing,
+                        "relay cycle complete"
+                    );
+                }
+                // Per-message success events are opt-in and sampled: a healthy
+                // relay publishes continuously, so emitting one line per message
+                // is the difference between a log an operator reads and a log
+                // that costs more than the messages.
+                for _ in 0..lifecycle.take(stats.published) {
+                    tracing::info!(
+                        message_type = table.descriptor.message_type.as_str(),
+                        "outbox message published"
+                    );
+                }
+            }
+            Err(err) => {
+                metrics.error();
+                tracing::error!(
+                    error = %err,
+                    "relay cycle failed; retrying after poll interval"
+                );
+            }
         }
 
         if !sleep_or_shutdown(cfg.poll_interval, &shutdown).await {

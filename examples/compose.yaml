@@ -1,0 +1,258 @@
+# The example stack, in two halves.
+#
+#   docker compose -f examples/compose.yaml up -d --wait
+#       Postgres and Redpanda only. Seconds to start, no Rust build. This is
+#       what you want behind `cargo run` while iterating on the services.
+#
+#   docker compose -f examples/compose.yaml --profile services up -d --wait
+#       The above plus the provisioner and both services, built from
+#       examples/Dockerfile. One command, nothing else installed.
+#
+# `just examples up`, `just examples demo`, and `just examples down` wrap these.
+#
+# The `services` profile carries a one-shot `provision` container that both
+# services gate on. It is in that profile rather than the default one so the
+# first form keeps its promise of starting in seconds with no Rust build; the
+# host-side flow provisions with `cargo run -p example-provision` instead, which
+# `just examples up` does for you.
+
+name: kafkaman-examples
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      # Overridable because 5432 is often already taken by a local Postgres.
+      # Only the host side moves; everything inside the network uses 5432.
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      # `-h 127.0.0.1` is load-bearing. The entrypoint brings up a *temporary*
+      # server that listens on the Unix socket only while it initialises the
+      # data directory, so a socket-based pg_isready reports ready during a
+      # window in which nothing outside the container can connect. Forcing TCP
+      # means this can only pass once the real server is listening.
+      #
+      # There is no /docker-entrypoint-initdb.d mount any more: the databases
+      # are created by the `provision` service, in Rust, alongside the topics.
+      # Splitting them meant "the environment" was half a SQL file and half a
+      # binary, and only the SQL half ran on the host-side flow.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      # Two named listeners, because the broker has to be reachable under two
+      # different names depending on which half of this file you are using:
+      # `redpanda:9092` from inside the compose network when the services run
+      # as containers, and `127.0.0.1:19092` from the host when they run under
+      # `cargo run`. (127.0.0.1 rather than localhost, matching
+      # tests/distributed-cache: on macOS `localhost` resolves ::1 first while
+      # Docker publishes on IPv4.)
+      #
+      # One listener cannot serve both. A Kafka client connects to the
+      # bootstrap address, is told the *advertised* address, and reconnects to
+      # that — so an advertised `localhost:19092` is unreachable from inside a
+      # container, and an advertised `redpanda:9092` is unresolvable from the
+      # host. Hence one of each.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+      # Once the Kafka listeners are named, pin the RPC listener rather than
+      # leaving it on defaults. This is the shape Redpanda's own compose uses.
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      # The host and container port numbers must match, because `127.0.0.1:19092`
+      # is precisely what the broker hands back to clients — remap it and every
+      # client redirects itself into a void.
+      #
+      # The internal listener stays off the host deliberately: a host client
+      # bootstrapping on 9092 would be told to reconnect to `redpanda:9092` and
+      # fail with a DNS error that reads like a broker fault.
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -qE 'Healthy:[[:space:]]+true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  # Redpanda Console: a browser view of the topics, the actual message payloads,
+  # and consumer-group lag.
+  #
+  # Behind its own profile because it is an observability convenience, not part
+  # of the system being demonstrated — `just examples up` and
+  # `just examples demo` stay as lean as they were. Bring it up alongside either
+  # with `just examples ui`.
+  #
+  # This is the fastest way to see what the two services are actually saying to
+  # each other: the `products` and `orders` topics, one compacted record per
+  # entity key, and the offsets that `GET /products/{id}` reports as
+  # `applied_offset`.
+  console:
+    profiles: ["ui"]
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    # The image expects a config file rather than plain env vars, so the
+    # canonical pattern is to write one from an env var at startup. `$$` escapes
+    # to a single `$` — compose interpolates the file before the shell sees it.
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      # The internal listener, because Console runs inside the compose network.
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - "${CONSOLE_PORT:-8080}:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # Builds what the services boot into: one database each, and the entity
+  # topics they exchange.
+  #
+  # Runs to completion and exits; `product` and `order` wait for that exit with
+  # `condition: service_completed_successfully`. That ordering is a requirement
+  # rather than tidiness. Both services verify their topics at boot and refuse
+  # to start on one that is missing or not `cleanup.policy=compact`, because a
+  # broker left to auto-create would produce a `delete` topic and an entity
+  # topic that ages records out cannot rebuild the entities on it — which is the
+  # bug this stack shipped with until the topics were provisioned deliberately.
+  #
+  # Safe to re-run, and it is re-run: compose restarts an exited one-shot on
+  # every `up`. Creating a database that exists and converging a topic that is
+  # already correct are both no-ops.
+  provision:
+    profiles: ["services"]
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile
+      target: provision
+    environment:
+      # The server's own `postgres` database, not a service's. `CREATE DATABASE`
+      # needs a session and it cannot be on the database being created.
+      ADMIN_DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+      KAFKA_BROKERS: redpanda:9092
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    # Explicit next to two neighbours that say `on-failure:3`. A provisioner
+    # that failed should stay failed and hold the services back, rather than
+    # retrying its way past a real misconfiguration.
+    restart: "no"
+
+  product:
+    profiles: ["services"]
+    build:
+      # The workspace root, since the build needs crates/ and examples/contracts.
+      context: ..
+      dockerfile: examples/Dockerfile
+      target: product
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/product_service
+      KAFKA_BROKERS: redpanda:9092
+      # Both of these already default correctly for a container. Naming them is
+      # the difference between reading this file and reading main.rs — and the
+      # consumer group in particular is a footgun worth spelling out: if you also
+      # run this service on the host against the same broker, both processes join
+      # this group, the single partition goes to one of them, and the other
+      # silently idles while still reporting healthy.
+      BIND_ADDR: 0.0.0.0:3002
+      KAFKA_CONSUMER_GROUP: product-service
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "3002:3002"
+    depends_on:
+      # Not postgres/redpanda: `provision` already waits for both, and this
+      # service needs the database and the topics it creates, not merely a
+      # server that is listening.
+      provision:
+        condition: service_completed_successfully
+    healthcheck:
+      # /health returns 204 and checks nothing, so this is a "process is
+      # serving" signal rather than a readiness probe. It is still worth
+      # gating on: the listener binds only after migrations have applied and
+      # all three kafkaman loops are spawned. `curl -f` fails on >=400, so a
+      # 204 counts as success.
+      #
+      # If you drop curl from the runtime image, this is the zero-dependency
+      # equivalent — bash is Essential in debian-slim, and the listener binding
+      # last is exactly what makes a bare TCP connect meaningful:
+      #   test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3002"]
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:3002/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      # First boot applies migrations under an advisory lock the two services
+      # contend for, on a cold Postgres. 30s + 45 tries gives the same overall
+      # budget the convergence test allows itself.
+      start_period: 30s
+    # `start()` is deliberately fail-fast: the process exits if any of its loops
+    # dies. Bounded on purpose — an unbounded restart plus `up --wait` means a
+    # genuinely broken service hangs the terminal instead of reporting.
+    restart: on-failure:3
+    # The binaries install a SIGINT handler (tokio::signal::ctrl_c) and nothing
+    # else. Docker sends SIGTERM, and Linux ignores default-disposition signals
+    # for PID 1 — so without this, every teardown waits out the grace period and
+    # then SIGKILLs, and the graceful-shutdown path this example exists to
+    # demonstrate never runs at all.
+    stop_signal: SIGINT
+    stop_grace_period: 15s
+
+  order:
+    profiles: ["services"]
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile
+      target: order
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/order_service
+      KAFKA_BROKERS: redpanda:9092
+      # Both of these already default correctly for a container. Naming them is
+      # the difference between reading this file and reading main.rs — and the
+      # consumer group in particular is a footgun worth spelling out: if you also
+      # run this service on the host against the same broker, both processes join
+      # this group, the single partition goes to one of them, and the other
+      # silently idles while still reporting healthy.
+      BIND_ADDR: 0.0.0.0:3001
+      KAFKA_CONSUMER_GROUP: order-service
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "3001:3001"
+    depends_on:
+      # Not postgres/redpanda: `provision` already waits for both, and this
+      # service needs the database and the topics it creates, not merely a
+      # server that is listening.
+      provision:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:3001/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 30s
+    restart: on-failure:3
+    stop_signal: SIGINT
+    stop_grace_period: 15s
+
+# No named volumes. The stack is disposable, and leaving the data in anonymous
+# volumes means `down -v` genuinely resets it — both the Postgres data directory
+# and Redpanda's log, so the next `up` reprovisions from nothing.

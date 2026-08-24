@@ -9,6 +9,39 @@ use kafkaman_core::{OutboxStatus, ReceiveStatus, ReceivedFailureKind, SqlIdentif
 use crate::tables::qualified_name;
 use crate::{CacheTable, OutboxTable, ReceivedTable, ResolvedConfig, Result};
 
+// # Template versions
+//
+// **A shipped table template is never edited in place. Add an upgrade changeset
+// and bump the version below.**
+//
+// This is not a style preference, it is the only thing standing between an
+// edited template and silent schema drift. A changeset's identity is its
+// `checksum_material`, which is `version;name;message_type;topic` — it does not
+// include one byte of the SQL. So editing `create_outbox_table_sql` changes what
+// a *fresh* database gets and changes nothing about an existing one: the version
+// is already in `changelog_history`, the checksum still matches, and the
+// migration engine reports success while the two databases diverge forever.
+//
+// The evidence that this happens is in this very file. `create_outbox_table_sql`
+// already declares `idempotency_key`, `idempotency_source`, and `entity_key` —
+// the exact columns `AddIdempotencyKey`, `AddIdempotencySource`, and
+// `AddOutboxEntityKey` exist to add to databases created before them. Those
+// alters are the repair for three in-place template edits.
+//
+// The template version is the intra-band slot of a generated changeset (see
+// `generated_changelog`), so a bump always sorts after that table's create and
+// never disturbs any other table's identity. Bumping means: write the upgrade
+// changeset, register it in `generated_changelog::upgrades`, then bump.
+
+/// Slot of the current outbox table template. See the note above before bumping.
+pub const OUTBOX_TEMPLATE_VERSION: i64 = 0;
+
+/// Slot of the current received table template. See the note above before bumping.
+pub const RECEIVED_TEMPLATE_VERSION: i64 = 0;
+
+/// Slot of the current cache table template. See the note above before bumping.
+pub const CACHE_TEMPLATE_VERSION: i64 = 0;
+
 pub fn create_outbox_table_sql(table: &OutboxTable) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {name} (
@@ -27,6 +60,8 @@ pub fn create_outbox_table_sql(table: &OutboxTable) -> String {
             entity_key TEXT,
             correlation_id UUID NOT NULL,
             causation_id UUID,
+            traceparent TEXT,
+            tracestate TEXT,
             headers JSONB NOT NULL DEFAULT '{{}}',
             payload JSONB NOT NULL,
             occurred_at TIMESTAMPTZ NOT NULL,
@@ -117,6 +152,8 @@ pub fn create_received_table_sql(table: &ReceivedTable) -> String {
             payload JSONB NOT NULL,
             correlation_id UUID,
             causation_id UUID,
+            traceparent TEXT,
+            tracestate TEXT,
             occurred_at TIMESTAMPTZ NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             processed_at TIMESTAMPTZ
@@ -171,6 +208,28 @@ pub fn add_idempotency_source_sql(table: &OutboxTable) -> String {
         "ALTER TABLE {} ADD COLUMN IF NOT EXISTS idempotency_source JSONB",
         table.qualified_name()
     )
+}
+
+/// The two W3C trace-context columns, on an outbox table.
+///
+/// Nullable and unindexed: absent context is the normal case, and nothing
+/// queries by trace id — the value is read alongside the row it belongs to, and
+/// a backend does the searching.
+pub fn add_outbox_trace_context_sql(table: &OutboxTable) -> [String; 2] {
+    add_trace_context_sql(&table.qualified_name())
+}
+
+/// The same pair on a received table, so a dispatch can descend from the ingest
+/// that stored the row.
+pub fn add_received_trace_context_sql(table: &ReceivedTable) -> [String; 2] {
+    add_trace_context_sql(&table.qualified_name())
+}
+
+fn add_trace_context_sql(qualified_name: &str) -> [String; 2] {
+    [
+        format!("ALTER TABLE {qualified_name} ADD COLUMN IF NOT EXISTS traceparent TEXT"),
+        format!("ALTER TABLE {qualified_name} ADD COLUMN IF NOT EXISTS tracestate TEXT"),
+    ]
 }
 
 pub fn add_outbox_entity_key_sql(table: &OutboxTable) -> String {

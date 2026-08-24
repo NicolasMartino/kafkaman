@@ -6,16 +6,42 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["metrics", "traces"]
+# Reusable Axum admin/health routes and request correlation middleware.
+axum = ["dep:kafkaman-axum"]
 # Links librdkafka; opt in when the application publishes or consumes.
+#
+# `RuntimeBuilder` lives behind this feature rather than beside it: assembling a
+# runtime means constructing a publisher, a consumer, and a topic admin, so a
+# builder without the transport would be a builder that cannot build anything.
 rdkafka = ["dep:kafkaman-rdkafka"]
+# OpenTelemetry counters from the worker loops and Kafka transport. On by
+# default; opt out to build without an `opentelemetry` dependency.
+metrics = ["kafkaman-worker/metrics", "kafkaman-rdkafka?/metrics"]
+# W3C trace context capture and span parenting. On by default; opt out to build
+# without an `opentelemetry` dependency at all. Stored context is still read and
+# forwarded either way, so turning this off stops this process from producing
+# trace context without breaking propagation for the services around it.
+traces = [
+    "kafkaman-core/traces",
+    "kafkaman-sqlx/traces",
+    "kafkaman-worker/traces",
+    "kafkaman-rdkafka?/traces",
+]
 
 [dependencies]
+kafkaman-axum = { path = "../kafkaman-axum", optional = true }
 kafkaman-config = { path = "../kafkaman-config" }
-kafkaman-core = { path = "../kafkaman-core" }
-kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true }
-kafkaman-sqlx = { path = "../kafkaman-sqlx" }
-kafkaman-worker = { path = "../kafkaman-worker" }
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
+kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true, default-features = false }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
+kafkaman-worker = { path = "../kafkaman-worker", default-features = false }
+serde.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

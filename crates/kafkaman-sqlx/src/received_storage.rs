@@ -59,16 +59,17 @@ where
     // headers, so a header-sourced entity key does not survive a broker round
     // trip.
     let entity_key = evt.payload.entity_key();
+    let trace = kafkaman_core::capture_trace_context();
 
     let sql = format!(
         "INSERT INTO {name} (
             message_id, idempotency_key, idempotency_source, status, attempts, next_attempt_at, errors,
             source_topic, source_partition, source_offset, key, entity_key, message_type, message_version,
-            headers, payload, correlation_id, causation_id, occurred_at
+            headers, payload, correlation_id, causation_id, traceparent, tracestate, occurred_at
         ) VALUES (
             $1, $2, $3, {pending}, 0, NULL, '[]'::jsonb,
             $4, $5, $6, $7, $8, $9, 1,
-            $10, $11, $12, $13, $14
+            $10, $11, $12, $13, $14, $15, $16
         ) ON CONFLICT DO NOTHING",
         name = table.qualified_name(),
         pending = ReceiveStatus::Pending.sql_literal(),
@@ -88,6 +89,15 @@ where
         .bind(payload)
         .bind(evt.correlation_id)
         .bind(evt.causation_id)
+        // Captured from the ambient span, which at this point is the ingest span
+        // that consumed the record. Dispatch descends from it later, across the
+        // durable gap that separates storing a record from acting on it.
+        .bind(trace.as_ref().map(|trace| trace.traceparent().to_owned()))
+        .bind(
+            trace
+                .as_ref()
+                .and_then(|trace| trace.tracestate().map(ToOwned::to_owned)),
+        )
         .bind(evt.occurred_at)
         .execute(&mut **tx)
         .await?;

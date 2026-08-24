@@ -13,10 +13,34 @@
   - wiki/decisions/message-identity-and-header-namespace.decision.md
   - wiki/decisions/retry-backoff-dlq-policy.decision.md
 - Related:
+  - wiki/decisions/dispatch-handler-ordering.decision.md
+  - wiki/decisions/runtime-builder-and-axum-composition.decision.md
   - wiki/decisions/runtime-composition-and-topology.decision.md
   - wiki/decisions/schema-and-change-management.decision.md
   - wiki/proposals/01-kafkaman-objectives.proposal.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
+
+## Amendments
+
+- **2026-08-26, handler ordering.** Point 6 below places the handler inside the
+  received-row transaction but does not fix its position relative to the cache
+  upsert. `wiki/decisions/dispatch-handler-ordering.decision.md` now does: the
+  handler runs *after* the upsert, `handle_before` is the pre-image opt-in, and
+  the dispatch savepoint opens before the upsert so a failed handler still
+  unwinds it. Nothing else in this decision changes — the two-scheduler split,
+  dedup-as-log, and the failure model are untouched.
+- **2026-08-26, `kafkaman_axum`.** The wiring sketch in point 7 calls
+  `kafkaman_axum::serve(...)`. That crate is not being built:
+  `wiki/decisions/runtime-builder-and-axum-composition.decision.md` ships the
+  composition as `kafkaman::axum` behind an `axum` feature, for consistency with
+  how the facade already gates `rdkafka`. Read step 5 of the sketch as
+  `kafkaman::axum::serve(...)`. The sketch is otherwise still the intended
+  shape.
+- **Standing, not an amendment: the Tower surface below is still unbuilt.**
+  `MessageRouter` exposes `new` and `handler` only. The `.layer(..)` in step 3
+  of the sketch, and the extractor model in the *Why*, remain the future design
+  space this decision's reconciliation already calls them. The runtime builder
+  deliberately does not build them, and deliberately does not foreclose them.
 
 ## Accepted Reconciliation
 

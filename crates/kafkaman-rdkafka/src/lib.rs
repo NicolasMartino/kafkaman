@@ -15,8 +15,10 @@ mod error;
 #[cfg(feature = "internal-hooks")]
 mod hooks;
 mod ingest_record;
+mod metrics;
 mod publisher;
 mod stats;
+mod topics;
 
 pub use consumer::RdkafkaConsumer;
 pub use error::Error;
@@ -24,6 +26,7 @@ pub use error::Error;
 pub use hooks::IngestCommitEvent;
 pub use publisher::RdkafkaPublisher;
 pub use stats::{IngestLoopStats, IngestStats};
+pub use topics::{converge_topics, TopicAdmin};
 
 #[cfg(test)]
 mod tests;

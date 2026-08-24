@@ -40,3 +40,37 @@ where
     let raw = String::deserialize(deserializer)?;
     parse(&raw).map_err(D::Error::custom)
 }
+
+/// The same format for `Option<OffsetDateTime>` fields.
+///
+/// `serde(with = ...)` dispatches on the field's declared type, so an
+/// optional timestamp cannot reuse the scalar adapter above: it needs its
+/// own pair that maps `None` to `null`. Nullable operational columns —
+/// `claim_expires_at`, `next_attempt_at`, `processed_at` — all need this.
+pub mod option {
+    use super::{parse, render};
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::OffsetDateTime;
+
+    pub fn serialize<S>(value: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_str(&render(*value).map_err(S::Error::custom)?),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Option::<String>::deserialize(deserializer)? {
+            Some(raw) => parse(&raw).map(Some).map_err(D::Error::custom),
+            None => Ok(None),
+        }
+    }
+}

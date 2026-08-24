@@ -186,3 +186,186 @@ async fn received_failed_filter_narrows_by_kind_and_since() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn received_inspection_reports_depth_stuck_rows_and_redrives_dlq() -> TestResult {
+    let _test_guard = receive_test_lock().lock().await;
+    let schema = durable_send_tests::unique_schema("kafkaman_observe_receive");
+    // Two attempts, so the first failure lands in `Retryable` with a scheduled
+    // `next_attempt_at` — the branch the stuck-row query indexes separately from
+    // `Pending` — and the second exhausts the budget into the DLQ.
+    let (_postgres, harness) = start_harness_with_config(retry_test_config(&schema, 2, 20)).await?;
+    let table = harness.received_table::<OrderCreated>().await?;
+
+    let event = Envelope::new(OrderCreated {
+        order_id: "order-observe-receive".to_owned(),
+    })
+    .with_idempotency_key("idem-order-observe-receive");
+    assert!(
+        harness
+            .insert_received(&event, 0, 7, Some(b"order-observe-receive"))
+            .await?
+    );
+
+    // A freshly inserted row is queued work, so an aggressive threshold must
+    // flag it — and a terminal bucket must never be flagged, however old.
+    let summary = received_status_summary(
+        harness.pool(),
+        &table,
+        OffsetDateTime::now_utc(),
+        Duration::from_millis(1),
+    )
+    .await?;
+    let pending = summary
+        .iter()
+        .find(|entry| entry.status == ReceiveStatus::Pending)
+        .expect("pending receive rows should be summarized");
+    assert_eq!(pending.message_type, OrderCreated::MESSAGE_TYPE);
+    assert_eq!(pending.count, 1);
+    assert!(
+        pending.over_max_queue_age,
+        "a pending row older than a 1ms max_queue_age is a backlog"
+    );
+
+    // With a threshold longer than the row has existed, nothing is a backlog.
+    let quiet = received_status_summary(
+        harness.pool(),
+        &table,
+        OffsetDateTime::now_utc(),
+        Duration::from_secs(3600),
+    )
+    .await?;
+    assert!(
+        quiet.iter().all(|entry| !entry.over_max_queue_age),
+        "no bucket should breach an hour-long max_queue_age"
+    );
+
+    let stuck = received_stuck_rows(
+        harness.pool(),
+        &table,
+        OffsetDateTime::now_utc() + time::Duration::seconds(1),
+        Duration::from_millis(1),
+        10,
+    )
+    .await?;
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0].status, ReceiveStatus::Pending);
+    // A Pending row carries no `next_attempt_at`, so it is due from creation.
+    assert!(stuck[0].next_attempt_at.is_none());
+    assert_eq!(stuck[0].due_at, stuck[0].created_at);
+
+    let router = MessageRouter::new().handler::<OrderCreated>(|_conn, _meta, _msg| {
+        Box::pin(async move { Err(kafkaman_sqlx::Error::Handler("boom".to_owned())) })
+    });
+
+    // First failure leaves a retry budget, so the row lands in Retryable with a
+    // scheduled `next_attempt_at`. That is the branch the stuck query indexes on
+    // separately from Pending, and it must not report a row inside its backoff.
+    let retryable =
+        dispatch_once(harness.pool(), &table, &router, OffsetDateTime::now_utc()).await?;
+    assert_eq!(retryable.failed, 1);
+    let row = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-receive")
+        .await?;
+    assert_eq!(row.status, ReceiveStatus::Retryable);
+    let scheduled = row
+        .next_attempt_at
+        .expect("a retryable row must carry a scheduled next attempt");
+
+    let not_yet_due = received_stuck_rows(
+        harness.pool(),
+        &table,
+        scheduled - time::Duration::seconds(1),
+        Duration::from_millis(1),
+        10,
+    )
+    .await?;
+    assert!(
+        not_yet_due.is_empty(),
+        "a row still inside its backoff window is waiting, not stuck"
+    );
+
+    let overdue = received_stuck_rows(
+        harness.pool(),
+        &table,
+        scheduled + time::Duration::seconds(60),
+        Duration::from_millis(1),
+        10,
+    )
+    .await?;
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(overdue[0].status, ReceiveStatus::Retryable);
+    assert_eq!(overdue[0].next_attempt_at, Some(scheduled));
+    assert_eq!(overdue[0].due_at, scheduled);
+    assert!(overdue[0].age_ms >= 60_000);
+
+    // Exhaust the retry budget so the row reaches the DLQ.
+    let mut attempts = row.attempts;
+    while harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-receive")
+        .await?
+        .status
+        != ReceiveStatus::Failed
+    {
+        let due = harness
+            .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-receive")
+            .await?
+            .next_attempt_at
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        dispatch_once(
+            harness.pool(),
+            &table,
+            &router,
+            due + time::Duration::seconds(1),
+        )
+        .await?;
+        attempts += 1;
+        assert!(
+            attempts < 10,
+            "retry budget should exhaust well before this"
+        );
+    }
+    let failed_row = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-receive")
+        .await?;
+    assert!(
+        !failed_row.errors.is_empty(),
+        "a dead-lettered row must carry its failure history"
+    );
+    let recorded_attempts = failed_row.attempts;
+    let recorded_errors = failed_row.errors.len();
+
+    // The descriptor path is what the admin route uses: it must resolve the same
+    // retry policy and drive the same redrive as the typed path.
+    let descriptor_table =
+        ReceivedTable::for_descriptor(&harness.config(), OrderCreated::descriptor()?)?;
+    assert_eq!(
+        descriptor_table.retry.max_attempts,
+        table.retry.max_attempts
+    );
+
+    let replay = Replay::received_descriptor(Replay::RUNTIME_VERSION, OrderCreated::descriptor()?)
+        .max_rows(10);
+    let redriven = redrive_received(harness.pool(), &harness.config(), &replay).await?;
+    assert_eq!(redriven, 1);
+    let row = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-order-observe-receive")
+        .await?;
+    assert_eq!(row.status, ReceiveStatus::Pending);
+    // Default redrive preserves triage history — that is the documented guarantee.
+    assert_eq!(row.attempts, recorded_attempts);
+    assert_eq!(row.errors.len(), recorded_errors);
+    assert!(row.next_attempt_at.is_none());
+
+    // An unbounded redrive is rejected rather than silently replaying everything.
+    let unbounded =
+        Replay::received_descriptor(Replay::RUNTIME_VERSION, OrderCreated::descriptor()?);
+    assert!(
+        redrive_received(harness.pool(), &harness.config(), &unbounded)
+            .await
+            .is_err(),
+        "redrive without max_rows must fail"
+    );
+
+    Ok(())
+}

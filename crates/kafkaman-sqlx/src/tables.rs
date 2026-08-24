@@ -74,6 +74,12 @@ impl ReceivedTable {
 
     pub fn for_message<P: KafkaMessage>(cfg: &ResolvedConfig) -> Result<Self> {
         let descriptor = cfg.descriptor_for::<P>()?;
+        Self::for_descriptor(cfg, descriptor)
+    }
+
+    /// The same table, from a descriptor resolved at runtime rather than from
+    /// a `KafkaMessage` type parameter.
+    pub fn for_descriptor(cfg: &ResolvedConfig, descriptor: MessageDescriptor) -> Result<Self> {
         let retry = cfg.retry.policy_for(descriptor.message_type.as_str());
         Self::new_with_retry(cfg.schema.clone(), descriptor, retry)
     }

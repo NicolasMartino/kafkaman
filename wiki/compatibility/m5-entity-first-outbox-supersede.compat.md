@@ -57,8 +57,11 @@
 
 ## Deferred
 
-- Boot-time broker topic validation that entity topics use
-  `cleanup.policy=compact` alone.
+- ~~Boot-time broker topic validation that entity topics use
+  `cleanup.policy=compact` alone.~~ **Delivered 2026-08-25**, outside M5, by
+  [topic-convergence-api.compat.md](topic-convergence-api.compat.md): checked at
+  boot under `[topics] mode`, before any loop is spawned. Struck here rather
+  than deleted because this note is a release record.
 - A positive state-sourced republish API. `Replay::outbox` is now rejected for
   all message types; the replacement resync surface is not implemented.
 - Broker topic-lifecycle invalidation and forced re-bootstrap hooks. A received

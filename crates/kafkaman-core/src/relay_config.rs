@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Error, Result};
+use crate::{Error, LifecycleEmission, Result};
 
 /// How the outbox relay claims and publishes.
 #[derive(Clone, Debug)]
@@ -13,6 +13,8 @@ pub struct RelayConfig {
     pub lease_for: Duration,
     pub retry_after: Duration,
     pub poll_interval: Duration,
+    /// Per-message success event policy. Defaults to silent.
+    pub lifecycle: LifecycleEmission,
 }
 
 impl Default for RelayConfig {
@@ -23,6 +25,7 @@ impl Default for RelayConfig {
             lease_for: Duration::from_secs(30),
             retry_after: Duration::from_secs(1),
             poll_interval: Duration::from_millis(250),
+            lifecycle: LifecycleEmission::default(),
         }
     }
 }

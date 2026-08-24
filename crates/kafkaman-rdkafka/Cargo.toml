@@ -6,13 +6,24 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["metrics", "traces"]
 internal-hooks = []
+# OpenTelemetry counters for publish and ingest. On by default; opt out to drop
+# the `opentelemetry` dependency entirely.
+metrics = ["dep:opentelemetry", "dep:opentelemetry-semantic-conventions", "kafkaman-worker/metrics"]
+# W3C trace context capture and span parenting. On by default; opt out to build
+# without an `opentelemetry` dependency at all. Stored context is still read and
+# forwarded either way, so turning this off stops this process from producing
+# trace context without breaking propagation for the services around it.
+traces = ["kafkaman-core/traces", "kafkaman-sqlx/traces", "kafkaman-worker/traces"]
 
 [dependencies]
 async-trait.workspace = true
-kafkaman-core = { path = "../kafkaman-core" }
-kafkaman-sqlx = { path = "../kafkaman-sqlx" }
-kafkaman-worker = { path = "../kafkaman-worker" }
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
+kafkaman-worker = { path = "../kafkaman-worker", default-features = false }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
 rdkafka.workspace = true
 serde.workspace = true
 serde_json.workspace = true

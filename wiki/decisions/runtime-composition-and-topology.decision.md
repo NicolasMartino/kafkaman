@@ -12,7 +12,52 @@
 - Related:
   - wiki/proposals/01-kafkaman-objectives.proposal.md
   - wiki/decisions/messaging-scope-and-receive-model.decision.md
+  - wiki/decisions/runtime-builder-and-axum-composition.decision.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
+
+
+## Amendment, 2026-08-26: `kafkaman-axum` is not being built as a crate
+
+This decision plans a separate `kafkaman-axum` crate and refers to it throughout
+— request-scoped pieces, the `axum-sqlx-tx` coupling, the setup guide, the
+version-compatibility surface. `wiki/decisions/runtime-builder-and-axum-composition.decision.md`
+supersedes the packaging: the composition ships as `kafkaman::axum` behind an
+`axum` feature on the facade, because that facade already gates `rdkafka` — a
+C-linking dependency — behind a feature "so an application never has to name a
+second kafkaman crate", and a pure-Rust optional dependency does not warrant
+weaker treatment.
+
+Read every `kafkaman-axum` below as `kafkaman::axum`. The *boundary* this
+decision draws is unchanged and is the reason the later decision holds: core
+kafkaman stays HTTP-free, background loops stay separable from the request path,
+and worker-role binaries remain first-class. Only the crate boundary became a
+module boundary.
+
+### What actually shipped, 2026-08-26
+
+The module is much narrower than this decision plans, and the difference matters
+enough to state rather than leave a reader to infer from a name substitution.
+
+`kafkaman::axum` is `serve(listener, app).with_runtime(runtime)` and a handle
+with `addr`, `wait`, and `shutdown`. It binds no socket, owns no router, defines
+no state, and installs no signal handler. Its one idea is that the HTTP server
+becomes *one more supervised loop* in the runtime's `JoinSet`, sharing the
+cancellation token with the relay, the ingester, and the dispatcher — so the
+first kafkaman loop to die stops the service accepting traffic without anything
+having to watch for it.
+
+**Point 5 below was not built, and the substitution rule does not apply to it.**
+`kafkaman::axum` takes no `axum-sqlx-tx` dependency, and there is no `Sender`
+extractor, no ambient-`Tx` coupling, and no `send_non_transactional` escape
+hatch. The send-side request UX described there remains unbuilt design space.
+The transactional property it exists to provide is already available without any
+of it: `enqueue` takes the caller's `&mut Transaction`, so an outbox row and the
+business write it accompanies commit together by construction —
+`examples/order/src/http.rs` does exactly that with a plain Axum handler and an
+ordinary sqlx transaction.
+
+Consequently the `axum-sqlx-tx` version-compatibility surface listed under
+*Consequences* does not exist either, because the dependency does not.
 
 ## Decision
 

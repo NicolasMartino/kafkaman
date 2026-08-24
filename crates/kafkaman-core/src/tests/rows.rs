@@ -86,6 +86,7 @@ fn outbox_row_fixture() -> OutboxRow {
         entity_key: Some("product-1".to_owned()),
         correlation_id: Uuid::nil(),
         causation_id: None,
+        trace: None,
         headers: BTreeMap::new(),
         payload: serde_json::Value::Null,
         occurred_at: OffsetDateTime::UNIX_EPOCH,

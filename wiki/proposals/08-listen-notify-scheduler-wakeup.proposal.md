@@ -12,7 +12,31 @@
   - wiki/specs/m3-durable-receive.spec.md
 - Related:
   - wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md
+  - wiki/proposals/15-dispatch-concurrency-and-middleware.proposal.md
   - wiki/decisions/runtime-composition-and-topology.decision.md
+
+## Note 2026-08-26: wanted for the next iteration, and it pairs with concurrency
+
+Selected *for the next planning round*, not accepted. Status stays `Proposed`:
+the defaults, the config surface and the fallback behaviour below are all still
+open, and nothing here promotes them. What changed is only that this page is now
+in scope for the developer-UX increment following the runtime-builder
+workstream. Two things are worth recording without disturbing what is below.
+
+**It pairs with `max_in_flight`.**
+[15-dispatch-concurrency-and-middleware](15-dispatch-concurrency-and-middleware.proposal.md)
+proposes opt-in concurrent dispatch, and the two are complementary rather than
+alternatives: `NOTIFY` decides *when* a dispatcher wakes, `max_in_flight` decides
+*how many* rows are in flight once it has. Both change `run_dispatcher`, so they
+should be sequenced together rather than colliding.
+
+**The framing below should survive implementation.** This page calls itself "an
+efficiency proposal, not a latency proposal, and it should be ranked
+accordingly", and that self-demotion is easy to quietly drop once someone is
+building it. It should not be. The measurable win is idle database load that
+currently scales with `types × replicas × poll frequency`; the latency
+improvement is real but bounded by the sweep, which remains the correctness path
+— a row becoming *due* for retry generates no `NOTIFY` at all.
 
 ## Context
 

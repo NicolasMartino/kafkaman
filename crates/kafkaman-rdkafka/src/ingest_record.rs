@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use kafkaman_core::{
     Envelope, IdempotencyIdentity, IdempotencyKey, IdempotencySource, KafkaMessage,
-    ReceivedIngestFailureKind, RESERVED_HEADER_PREFIX,
+    ReceivedIngestFailureKind, TraceContext, RESERVED_HEADER_PREFIX,
 };
 use kafkaman_sqlx::ReceivedIngestFailure;
 use rdkafka::message::{Headers, Message};
@@ -71,7 +71,18 @@ fn all_headers<H: Headers>(headers: Option<&H>) -> serde_json::Value {
     )
 }
 
-pub(crate) fn record_envelope<P, M>(message: &M) -> Result<(Envelope<P>, Option<Vec<u8>>)>
+/// One consumed record, decoded.
+///
+/// A struct rather than a tuple because the third member is easy to misread: the
+/// trace context here is the *producer's*, used to link the ingest span, and not
+/// the context stored on the received row — that one is ingest's own.
+pub(crate) struct DecodedRecord<P> {
+    pub envelope: Envelope<P>,
+    pub key: Option<Vec<u8>>,
+    pub producer_trace: Option<TraceContext>,
+}
+
+pub(crate) fn record_envelope<P, M>(message: &M) -> Result<DecodedRecord<P>>
 where
     P: KafkaMessage + DeserializeOwned,
     M: Message,
@@ -132,7 +143,20 @@ where
         envelope.causation_id = Some(parse_uuid_header("kafkaman-causation-id", causation_id)?);
     }
 
-    Ok((envelope, key))
+    Ok(DecodedRecord {
+        envelope,
+        key,
+        producer_trace: headers.trace_context(),
+    })
+}
+
+/// The producer's trace context, for a record that could not be decoded.
+///
+/// The happy path gets this from [`record_envelope`] without a second pass over
+/// the headers; a quarantine is rare enough that one more pass costs nothing,
+/// and a poison record still deserves to appear in the trace that produced it.
+pub(crate) fn record_trace_context<M: Message>(message: &M) -> Option<TraceContext> {
+    RecordHeaders::of(message).trace_context()
 }
 
 /// A record's headers, decoded and split by namespace in one pass.
@@ -141,8 +165,8 @@ where
 /// list once per lookup made that five passes over every record on the ingest
 /// hot path, so this decodes once and indexes.
 ///
-/// The two maps are kept apart rather than filtered on demand because they are
-/// treated differently in three ways that must not be mixed up. Reserved keys are
+/// The maps are kept apart rather than filtered on demand because they are
+/// treated differently in ways that must not be mixed up. Reserved keys are
 /// matched ASCII case-insensitively and stored lowercased, so a producer writing
 /// `Kafkaman-Message-Id` cannot slip a reserved key past the strip by changing
 /// its case. User keys keep the case the producer wrote, because they are opaque
@@ -154,12 +178,21 @@ struct RecordHeaders {
     user: BTreeMap<String, String>,
     /// Reserved `kafkaman-` headers, keys lowercased for lookup.
     reserved: BTreeMap<String, String>,
+    /// W3C trace headers — exactly `traceparent` and `tracestate` — lowercased.
+    ///
+    /// A third namespace rather than a corner of either existing one. They are
+    /// not `kafkaman-` prefixed, because the whole point of the standard is that
+    /// anyone can read them; and they are not user headers, because a producer
+    /// did not set them, a tracing SDK did. Handing them to application code as
+    /// though the producer had sent them would misrepresent both.
+    trace: BTreeMap<String, String>,
 }
 
 impl RecordHeaders {
     fn of<M: Message>(message: &M) -> Self {
         let mut user = BTreeMap::new();
         let mut reserved = BTreeMap::new();
+        let mut trace = BTreeMap::new();
 
         if let Some(headers) = message.headers() {
             for header in headers.iter() {
@@ -184,7 +217,13 @@ impl RecordHeaders {
                 // either end of a duplicate run — but silently swapping which
                 // copy is stored changes what lands in a received row's
                 // `headers` column, so it stays as it was.
-                if lowercased.starts_with(RESERVED_HEADER_PREFIX) {
+                // Trace: first occurrence wins, matching the reserved treatment
+                // rather than the user one. A duplicated `traceparent` is either
+                // a mistake or an attempt to redirect the trace, and neither
+                // deserves the later copy.
+                if crate::publisher::is_trace_header(&lowercased) {
+                    trace.entry(lowercased).or_insert(value);
+                } else if lowercased.starts_with(RESERVED_HEADER_PREFIX) {
                     reserved.entry(lowercased).or_insert(value);
                 } else {
                     user.insert(header.key.to_owned(), value);
@@ -192,7 +231,23 @@ impl RecordHeaders {
             }
         }
 
-        Self { user, reserved }
+        Self {
+            user,
+            reserved,
+            trace,
+        }
+    }
+
+    /// The producer's trace context, if the record carries a usable one.
+    ///
+    /// Never an error. A record from an uninstrumented producer has none, a
+    /// malformed value is dropped, and ingest proceeds identically either way —
+    /// trace context is never required for a message to be correct.
+    fn trace_context(&self) -> Option<TraceContext> {
+        TraceContext::from_parts(
+            self.trace.get("traceparent").cloned(),
+            self.trace.get("tracestate").cloned(),
+        )
     }
 
     /// A reserved `kafkaman-` header's value, if the record carries it.
@@ -204,10 +259,14 @@ impl RecordHeaders {
         self.reserved.get(name).map(String::as_str)
     }
 
-    /// The headers the producer set, with the whole reserved namespace removed.
+    /// The headers the producer set, with the reserved and trace namespaces
+    /// removed.
     ///
     /// Stripping rather than trusting is what stops a foreign producer from
-    /// spoofing kafkaman metadata by setting `kafkaman-message-id` itself.
+    /// spoofing kafkaman metadata by setting `kafkaman-message-id` itself. The
+    /// trace keys are removed for a different reason: a handler that received a
+    /// `traceparent` among its user headers would reasonably conclude the
+    /// producer had sent it as application data.
     fn user_headers(&self) -> BTreeMap<String, String> {
         self.user.clone()
     }

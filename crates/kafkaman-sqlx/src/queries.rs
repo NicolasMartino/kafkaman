@@ -175,6 +175,10 @@ pub(crate) fn received_row_from_pg(row: PgRow) -> Result<ReceivedRow> {
         payload: row.try_get("payload")?,
         correlation_id: row.try_get("correlation_id")?,
         causation_id: row.try_get("causation_id")?,
+        trace: kafkaman_core::TraceContext::from_parts(
+            row.try_get("traceparent")?,
+            row.try_get("tracestate")?,
+        ),
         occurred_at: row.try_get("occurred_at")?,
         created_at: row.try_get("created_at")?,
         processed_at: row.try_get("processed_at")?,

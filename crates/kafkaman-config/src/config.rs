@@ -6,8 +6,8 @@ use serde::de::DeserializeOwned;
 
 use crate::duration::parse_duration;
 use crate::{
-    ConfigError, ConfigErrors, ConfigSchema, RelaySection, Result, RetentionSection, RetryConfig,
-    RetrySection,
+    ConfigError, ConfigErrors, ConfigSchema, ObservabilityConfig, ObservabilitySection,
+    RelaySection, Result, RetentionSection, RetryConfig, RetrySection, TopicsSection,
 };
 
 /// A parsed `kafkaman.toml`.
@@ -95,6 +95,28 @@ impl Config {
         self.required_section("retry")
     }
 
+    /// How boot should reconcile entity topics with the broker.
+    ///
+    /// Absent means [`kafkaman_core::TopicMode::Verify`], not "skip". A service that publishes
+    /// entity snapshots onto a topic that is not compacted is silently unable to
+    /// rebuild those entities, and a default that stayed quiet about it would
+    /// preserve exactly the failure this section exists to catch. Opting out is
+    /// possible, but has to be written down.
+    pub fn topics(&self) -> Result<TopicsSection> {
+        Ok(self.section("topics")?.unwrap_or_default())
+    }
+
+    /// The `[observability]` section, if present.
+    ///
+    /// Optional, like `[retention]` and unlike `[relay]`: every field in it has
+    /// a quiet production default, so an absent section is a complete policy
+    /// rather than an incomplete one. Callers that want the resolved policy
+    /// should use [`Config::observability_config`], which applies those
+    /// defaults.
+    pub fn observability(&self) -> Result<Option<ObservabilitySection>> {
+        self.section("observability")
+    }
+
     /// Deserialize a top-level section, or `None` when it is absent.
     fn section<T: DeserializeOwned>(&self, key: &'static str) -> Result<Option<T>> {
         let Some(value) = self.value_at(key).cloned() else {
@@ -136,6 +158,28 @@ impl Config {
         };
 
         retry.resolve(&registered)
+    }
+
+    /// Resolve `[observability]` against the message types actually registered.
+    pub fn observability_config<I, S>(
+        &self,
+        registered_messages: I,
+    ) -> std::result::Result<ObservabilityConfig, ConfigErrors>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let registered = registered_messages
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
+
+        let observability = match self.observability() {
+            Ok(observability) => observability.unwrap_or_default(),
+            Err(err) => return Err(ConfigErrors::new(vec![err.into()])),
+        };
+
+        observability.resolve(&registered)
     }
 
     /// Check every key the schema requires, reporting all problems at once.

@@ -1,5 +1,5 @@
 use kafkaman_core::{KafkaMessage, MessageDescriptor, ReceiveStatus, ReceivedFailureKind};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -59,6 +59,29 @@ impl Replay {
             failure_kind: None,
             clear_history: false,
         })
+    }
+
+    /// Version stamp for a replay that is executed directly rather than applied
+    /// as a changeset, where the changelog never sees it.
+    pub const RUNTIME_VERSION: i64 = 0;
+
+    /// A replay built from a descriptor resolved at runtime rather than from a
+    /// `KafkaMessage` type parameter, for callers — admin routes — that only
+    /// know the message type as a string.
+    ///
+    /// `version` is only meaningful when the replay is applied as a changeset.
+    /// [`redrive_received`] never touches the changelog, so a runtime redrive
+    /// should pass [`Replay::RUNTIME_VERSION`].
+    pub fn received_descriptor(version: i64, descriptor: MessageDescriptor) -> Self {
+        Self {
+            version,
+            descriptor,
+            occurred_after: None,
+            max_rows: None,
+            contexts: Vec::new(),
+            failure_kind: None,
+            clear_history: false,
+        }
     }
 
     pub fn since(mut self, occurred_after: OffsetDateTime) -> Self {
@@ -266,4 +289,21 @@ pub(crate) fn replay_received_filter_sql(replay: &Replay) -> Result<String> {
         filter.push_str(&latest_failure_kind_clause(kind));
     }
     Ok(filter)
+}
+
+/// Runs a received-row replay at runtime instead of as a migration changeset.
+///
+/// This is the same guarded statement [`Replay`] applies through the change
+/// engine — terminal rows only, history preserved unless `clear_history` is set
+/// — executed directly so an admin route can redrive a DLQ without writing to
+/// the changelog. Operational redrive is not a schema change and must not
+/// consume a changeset version.
+///
+/// `replay` must carry `max_rows`; an unbounded operational redrive would let a
+/// single request re-enqueue an entire DLQ.
+pub async fn redrive_received(pool: &PgPool, cfg: &ResolvedConfig, replay: &Replay) -> Result<u64> {
+    let table = ReceivedTable::new(cfg.schema.clone(), replay.descriptor.clone())?;
+    let sql = replay_received_update_sql(&table, replay)?;
+    let result = sqlx::query(&sql).execute(pool).await?;
+    Ok(result.rows_affected())
 }

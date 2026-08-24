@@ -123,10 +123,18 @@ feed replay checksums.
 
 ## Example Application
 
-`apps/axum-outbox` now derives an explicit idempotency identity from the order
-id under a versioned namespace. Callers that construct an `Envelope` without an
-identity no longer enqueue successfully; this is the intended uniform contract
-from review finding F1.
+`examples/order` (renamed from `apps/axum-outbox` on 2026-08-24) derives an
+explicit idempotency identity under a versioned namespace. Callers that construct
+an `Envelope` without an identity no longer enqueue successfully; this is the
+intended uniform contract from review finding F1.
+
+**Amended 2026-08-24.** The example now derives from `(order_id, version)` rather
+than from the order id alone, because an entity publishes a snapshot per state
+change and a key derived from identity alone would deduplicate every state after
+the first. Deriving from the payload has the same failure in a subtler form: an
+entity returning to a previously published state re-derives a key the consumer
+has already seen, and the snapshot is silently dropped. The version is an
+idempotency identity only — the convergence ordinal is still the Kafka offset.
 
 ## Verification Status
 

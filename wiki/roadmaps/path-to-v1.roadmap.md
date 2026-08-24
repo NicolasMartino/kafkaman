@@ -29,6 +29,13 @@ retry/DLQ, roadmap execution, and entity-first propagation. Objectives open
 questions OQ1-OQ4 are resolved, and OQ5 (host-context boundary) is ratified as
 opaque headers with a reserved `kafkaman-*` namespace.
 
+**Amended 2026-08-25.** OQ5's two-namespace answer gains one narrow exception:
+W3C `traceparent`/`tracestate` are recognized as a third namespace, because they
+can carry neither the `kafkaman-` prefix (other consumers must read them) nor
+user-header semantics (the producer did not set them). See
+[trace-context-propagation-and-w3c-headers](../decisions/trace-context-propagation-and-w3c-headers.decision.md).
+Everything else in the ratified model is unchanged.
+
 M1 through M5 are implemented on `main` and their validated behavior is promoted
 to specs. All five M3/M4 pre-merge review findings are closed.
 
@@ -53,6 +60,12 @@ surface is removed in the same-day follow-up.
 The two-service distributed-cache example remains active as a parallel wiring
 proof, while M6 observability/operability can proceed against the post-M5 table
 shape.
+
+**Updated 2026-08-24 (M6 closeout):** M6 observability/operability is completed
+and promoted to
+[m6-observability-operability.spec.md](../specs/m6-observability-operability.spec.md).
+M7 hardening is the remaining V1 milestone; the two-service example remains an
+active parallel wiring proof.
 
 ## Milestones
 
@@ -146,6 +159,20 @@ soft-delete workflow/reclamation, the two-service distributed-cache example
 remaining restore/schema boundaries
 ([proposal 11](../proposals/11-restore-retention-and-schema-boundaries.proposal.md)).
 
+**Updated 2026-08-25 — two of those deferrals are resolved.** Boot-time broker
+topic validation is delivered, not merely landed: both example services check
+their topics after config resolution and before any loop is spawned, and
+`examples/provision` creates them first, because a check that refuses an absent
+topic and forbids broker auto-creation requires something else to provision. The
+topic-lifecycle story also changed shape — a cross-topic origin change onto the
+declared topic now migrates the cache instead of needing a re-bootstrap hook.
+Both are recorded by
+[decision](../decisions/topic-convergence-and-rebuild.decision.md) and
+[plan](../plans/topic-convergence.plan.md), which sit after M5 rather than inside
+it, and the plan is now `Complete`. Still open from that workstream: an
+ACL-denied `CreateTopics` path, bounded broker retry at boot, cutover tooling,
+and a positive state-sourced republish API.
+
 **M5's shape is resolved by accepted
 [proposal 12](../proposals/12-entity-only-message-model.proposal.md).** Every
 in-purview kafkaman type is a compact entity-cache message. This changes the
@@ -154,21 +181,29 @@ state-sourced republish — without changing the milestone's position or its
 convergence exit criterion.
 
 ### M6 — Observability & operability
-- **Status:** Active. Safe to run in parallel with the two-service example.
+- **Status:** Completed 2026-08-24. Validated behavior is promoted to
+  [m6-observability-operability.spec.md](../specs/m6-observability-operability.spec.md).
 - **Goal:** make it operable.
-- **Delivers:** tracing spans + the `CorrelationLayer`, metrics, lag/age/stuck-job
-  detection, DLQ inspection, the `kafkaman-axum` admin/health routes, the
+- **Delivers:** runtime observability config with per-message overrides,
+  `tracing` spans/events, direct OpenTelemetry metrics, queue depth/age
+  inspection, stuck-row detection, sanitized DLQ inspection and bounded redrive,
+  the `kafkaman-axum` admin/health routes, `CorrelationLayer`, and the
   `serve().with_runtime()` shutdown helper.
 - **Realizes:** runtime-composition (request-path layers/routes + shutdown helper).
-- **Exit:** an operator can see queue depth/age, inspect/redrive the DLQ, and a
-  stuck job is detectable.
+- **Exit:** completed. An operator can see queue depth/age, inspect/redrive the
+  received DLQ, and detect expired outbox claims or overdue received rows.
 
 ### M7 — V1 hardening
+- **Status:** Active.
 - **Goal:** ship-quality.
 - **Delivers:** remaining storage-growth policy outside outbox retention,
   graceful-shutdown ordering, worker-role topology polish, the full
-  `testcontainers` full-loop suite, docs/examples, and **ratifying OQ5** (the
-  opaque-headers host-context boundary) at envelope finalization.
+  `testcontainers` full-loop suite, and docs/examples.
+
+  **Corrected 2026-08-25:** this entry previously listed "ratifying OQ5" as an
+  M7 deliverable, contradicting the status section above, which has recorded OQ5
+  as already ratified since this roadmap was written. OQ5 is ratified; its one
+  amendment is noted above. Nothing about it remains for M7.
 - **Exit:** the V1 acceptance bar — durable send + durable receive + reliability +
   observability, documented, with the full test pyramid green.
 

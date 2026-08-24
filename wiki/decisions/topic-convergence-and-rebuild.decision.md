@@ -54,10 +54,27 @@
    count, create a new topic at the new count, republish every entity from the
    owner's state, cut consumers over, drop the old topic.
 
-9. **The declared topic authorizes cache-origin invalidation.** When a record's
-   origin differs from the cache's `applied_topic` / `applied_partition` *and the
-   record's topic is the declared one*, that is a migration: reset the guard and
-   accept the new origin. Any other origin change stays terminal, as today.
+9. **The declared topic authorizes cache-origin invalidation, and only across a
+   topic change.** Four cases hide behind a guarded upsert that wrote nothing:
+
+   | Cached origin | Incoming record | Outcome |
+   |---|---|---|
+   | same topic, same partition | — | `Ignored`, the guard working |
+   | same topic, different partition | — | **terminal**, as before |
+   | different topic | on the declared topic | **migrate**: reset the guard |
+   | different topic | not on the declared topic | `Ignored` if the cache is already on the declared topic, otherwise terminal |
+
+   **Refined 2026-08-24 during implementation.** The first form of this decision
+   said any origin change authorized by the declared topic was a migration, which
+   would also have blessed an *in-place* partition change — the one operation
+   decision 8 exists to forbid. A declaration says which topic is authoritative,
+   not which partition an entity belongs on, so a same-topic partition move stays
+   terminal and `cache_apply_halts_when_an_entity_changes_partition` still holds.
+
+   The fourth row is a cutover detail the first form missed: once a cache has
+   moved to the rebuilt topic, records still draining out of the received table
+   from the retired one are merely stale. Failing them would fill the error table
+   for the length of the migration.
 
 10. **Provisioning covers environment, never schema.** Databases and topics are
     environment and may be provisioned externally; tables are schema, owned by the
@@ -82,12 +99,13 @@ That turns partition count from an irreversible choice into a recoverable one,
 and it is a property an event-sourced log cannot offer.
 
 Decision 9 exists because the guarded upsert compares `applied_topic` and
-`applied_partition`, so a topic move otherwise wedges the row permanently.
-`classify_skipped_cache_apply` already detects this and raises
-`Error::CacheOriginMismatch` — terminal, per-row — precisely so it cannot freeze
-"with no error and no metric". What was missing was a safe way to *resolve* it,
-and the declared topic from decision 1 supplies the authorization that makes
-automatic invalidation safe rather than reckless.
+`applied_partition`, so a topic move otherwise wedges the row permanently. As M5
+shipped, `classify_skipped_cache_apply` detected this and raised
+`Error::CacheOriginMismatch` — terminal, per-row — precisely so it could not
+freeze "with no error and no metric". That is the right answer for a
+misconfigured consumer and the wrong one for a rebuilt topic. What was missing
+was a way to tell them apart, and the declared topic from decision 1 supplies
+it, which is what makes automatic invalidation safe rather than reckless.
 
 Decision 10 draws the line where the existing design already draws it: changelogs
 are per-service and asymmetric (`order` declares
@@ -133,12 +151,12 @@ orders     cleanupPolicy=delete   partitions=1
 products   cleanupPolicy=delete   partitions=1
 ```
 
-No `AdminClient`, `describe_configs`, or `cleanup.policy` reference exists
-anywhere in `crates/`. The gap was already recorded under **Deferred** in
-`m5-entity-first-cache-api.compat.md` and
+At the time of that reading no `AdminClient`, `describe_configs`, or
+`cleanup.policy` reference existed anywhere in `crates/`. The gap was already
+recorded under **Deferred** in both `m5-entity-first-cache-api.compat.md` and
 `m5-entity-first-outbox-supersede.compat.md`, and
-`entity-first-propagation.plan.md` records "Boot-time broker topic validation
-remains pending" as of 2026-08-13.
+`entity-first-propagation.plan.md` records that "Boot-time broker topic
+validation remains deferred after M5."
 
 Execution and verification gates are in
 [plans/topic-convergence.plan.md](../plans/topic-convergence.plan.md).

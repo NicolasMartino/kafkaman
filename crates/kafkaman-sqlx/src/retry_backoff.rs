@@ -90,7 +90,7 @@ pub(crate) fn jittered<R: rand::Rng>(base: Duration, rng: &mut R) -> Duration {
     half + rng.gen_range(Duration::ZERO..=half)
 }
 
-fn duration_to_time(duration: Duration) -> time::Duration {
+pub(crate) fn duration_to_time(duration: Duration) -> time::Duration {
     time::Duration::new(
         duration.as_secs().min(i64::MAX as u64) as i64,
         duration.subsec_nanos() as i32,

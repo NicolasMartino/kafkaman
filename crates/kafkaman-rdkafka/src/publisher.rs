@@ -6,11 +6,13 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 
+use crate::metrics::PublishMetrics;
 use crate::{Error, Result};
 
 #[derive(Clone)]
 pub struct RdkafkaPublisher {
     producer: FutureProducer,
+    metrics: PublishMetrics,
 }
 
 impl std::fmt::Debug for RdkafkaPublisher {
@@ -23,7 +25,13 @@ impl std::fmt::Debug for RdkafkaPublisher {
 
 impl RdkafkaPublisher {
     pub fn new(producer: FutureProducer) -> Self {
-        Self { producer }
+        Self {
+            producer,
+            // Resolved here rather than at first publish: an instrument binds to
+            // whichever provider is installed when it is built, so the host must
+            // install its pipeline before constructing the publisher.
+            metrics: PublishMetrics::new(),
+        }
     }
 
     pub fn from_brokers(brokers: &str) -> Result<Self> {
@@ -51,6 +59,21 @@ impl RdkafkaPublisher {
         // about keeping the managed block contiguous and easy to read on the
         // wire.
         for (key, value) in &row.row.headers {
+            // The W3C trace keys are the one exception, and they are dropped
+            // rather than rejected. Enqueue does not refuse them the way it
+            // refuses `kafkaman-*`, because an application forwarding an
+            // incoming request's headers wholesale is doing something ordinary,
+            // not something wrong. But they are protocol context rather than
+            // application data: publishing the caller's copy would put a stale
+            // `traceparent` on the wire ahead of the one this publish belongs
+            // to, and ingest resolves duplicates first-wins.
+            if is_trace_header(key) {
+                tracing::debug!(
+                    header = key.as_str(),
+                    "dropping a W3C trace header from user headers; kafkaman sets its own"
+                );
+                continue;
+            }
             headers = headers.insert(Header {
                 key: key.as_str(),
                 value: Some(value.as_str()),
@@ -76,18 +99,38 @@ impl RdkafkaPublisher {
         }
 
         match self.producer.send(record, Timeout::Never).await {
-            Ok((partition, offset)) => Ok(PublishAck {
-                topic: row.row.topic.clone(),
-                partition,
-                offset,
-            }),
-            Err((error, _message)) => Err(Error::Delivery(error.to_string())),
+            Ok((partition, offset)) => {
+                self.metrics.record(&row.row.topic, "acknowledged");
+                Ok(PublishAck {
+                    topic: row.row.topic.clone(),
+                    partition,
+                    offset,
+                })
+            }
+            Err((error, _message)) => {
+                self.metrics.record(&row.row.topic, "failed");
+                Err(Error::Delivery(error.to_string()))
+            }
         }
     }
 }
 
-/// The `kafkaman-` headers this row publishes, owned so every value outlives the
-/// borrow `OwnedHeaders` takes.
+/// Whether a header key is one of the two W3C trace keys, case-insensitively.
+///
+/// Kafka header keys are case-sensitive, but the comparison is not: a producer
+/// writing `TraceParent` means the standard header, and treating it as an
+/// unrelated user header would be a way around every rule that governs the real
+/// one.
+pub(crate) fn is_trace_header(key: &str) -> bool {
+    key.eq_ignore_ascii_case("traceparent") || key.eq_ignore_ascii_case("tracestate")
+}
+
+/// The headers kafkaman itself sets on a published record, owned so every value
+/// outlives the borrow `OwnedHeaders` takes.
+///
+/// Two namespaces: the reserved `kafkaman-` keys, and the W3C trace keys, which
+/// deliberately carry no prefix. See
+/// `wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`.
 fn managed_headers(row: &ClaimedOutboxRow) -> Result<Vec<(&'static str, String)>> {
     let mut managed = vec![
         ("kafkaman-message-id", row.row.message_id.to_string()),
@@ -119,6 +162,20 @@ fn managed_headers(row: &ClaimedOutboxRow) -> Result<Vec<(&'static str, String)>
     }
     if let Some(id) = row.row.causation_id {
         managed.push(("kafkaman-causation-id", id.to_string()));
+    }
+
+    // W3C trace context, from the span this publish is running in — which the
+    // relay parented from the context stored at enqueue. It carries no
+    // `kafkaman-` prefix on purpose: the entire value of the standard is that a
+    // consumer which has never heard of kafkaman still recognizes it.
+    //
+    // Captured here rather than read from the row, because the consumer links to
+    // *this publish*, not to the enqueue that preceded it.
+    if let Some(trace) = kafkaman_core::capture_trace_context() {
+        managed.push(("traceparent", trace.traceparent().to_owned()));
+        if let Some(state) = trace.tracestate() {
+            managed.push(("tracestate", state.to_owned()));
+        }
     }
 
     Ok(managed)

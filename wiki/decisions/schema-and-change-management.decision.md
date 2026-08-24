@@ -12,7 +12,32 @@
 - Related:
   - wiki/proposals/01-kafkaman-objectives.proposal.md
   - wiki/decisions/messaging-scope-and-receive-model.decision.md
+  - wiki/decisions/runtime-builder-and-axum-composition.decision.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
+
+## Amendment, 2026-08-26: never edit a table template in place
+
+`wiki/decisions/runtime-builder-and-axum-composition.decision.md` adds a
+standing rule this decision does not currently carry, and it belongs here
+because it constrains every future schema change:
+
+> Never edit an existing table template. Add an upgrade changeset and bump that
+> template's `template_version`.
+
+The reason is a gap in the migration engine rather than a style preference.
+`descriptor_changeset!`'s `checksum_material` is
+`version;name;message_type;topic` — it does not cover the DDL at all. An
+in-place template edit is therefore invisible: existing databases keep the old
+shape, fresh ones get the new shape, and the checksum matches either way. That
+has already happened — `create_outbox_table_sql` contains `idempotency_key`,
+`idempotency_source`, and `entity_key`, which is exactly what
+`AddIdempotencyKey`, `AddIdempotencySource`, and `AddOutboxEntityKey` exist to
+catch up. A fresh database replaying create-then-alter costs a few extra
+statements and is always correct.
+
+Generated changelogs additionally identify changesets by
+`(role, message_type, template_version)` rather than registration order, since
+the version is a durable primary key in the history table.
 
 ## Decision
 

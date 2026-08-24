@@ -5,12 +5,22 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["traces"]
+# W3C trace context capture and span parenting/linking. On by default; opt out to
+# drop the `opentelemetry` and `tracing-opentelemetry` dependencies. Reading and
+# forwarding stored context works either way — see `trace.rs`.
+traces = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
 [dependencies]
+opentelemetry = { workspace = true, optional = true, features = ["trace"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
 uuid.workspace = true
 
 [lints]

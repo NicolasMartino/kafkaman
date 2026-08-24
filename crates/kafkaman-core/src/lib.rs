@@ -21,11 +21,14 @@ mod error;
 mod failure_kind;
 mod idempotency;
 mod identifier;
+mod lifecycle;
 mod message;
 mod purge_config;
 mod relay_config;
 mod rows;
 mod status;
+mod topics;
+mod trace;
 
 /// Serde support for [`ReceivedFailureKind`] as an RFC 9457 `type` URI. Named in
 /// `#[serde(with = "crate::problem_type")]` attributes rather than called
@@ -42,6 +45,7 @@ pub use idempotency::{
     LEGACY_STRING_IDEMPOTENCY_NAMESPACE,
 };
 pub use identifier::SqlIdentifier;
+pub use lifecycle::{LifecycleEmission, LifecycleSampler};
 pub use message::{reserved_header, KafkaMessage, MessageDescriptor, RESERVED_HEADER_PREFIX};
 pub use purge_config::{PurgeConfig, PurgeStats};
 pub use relay_config::{RelayConfig, RelayStats};
@@ -50,6 +54,11 @@ pub use rows::{
     ReceivedMeta, ReceivedRow,
 };
 pub use status::{OutboxStatus, ReceiveStatus};
+pub use topics::{
+    reconcile, CleanupPolicy, ObservedTopic, PartitionDrift, TopicAction, TopicMode, TopicOutcome,
+    TopicSpec,
+};
+pub use trace::{add_link, capture_trace_context, set_parent, TraceContext};
 
 #[cfg(test)]
 mod tests;

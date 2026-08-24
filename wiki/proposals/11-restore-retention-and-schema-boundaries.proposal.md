@@ -211,8 +211,16 @@ where a double-fire is irreversible and expensive.
 **Added 2026-08-24.** Open Question 1 names storage growth of the *topic's* key
 space. The equivalent problem in Postgres was never named, and is worse because it
 has no compaction analogue: **nothing purges any kafkaman table.** There is no
-`DELETE` anywhere in `crates/` or `apps/`, so `Published` outbox rows, `Processed`
-received rows, and quarantine rows all accumulate for the life of the application.
+`DELETE` anywhere in `crates/` or the example services, so `Published` outbox rows,
+`Processed` received rows, and quarantine rows all accumulate for the life of the
+application.
+
+**Partly closed since.** Outbox retention shipped — `purge_outbox_once` and
+`run_purger` reclaim terminal outbox rows under a `[retention]` section, per
+[outbox-retention-policy.decision.md](../decisions/outbox-retention-policy.decision.md).
+Received tables and quarantine rows are still unbounded, which is the deliberate
+part of that decision: a received table's dedupe window *is* its retention window.
+(`apps/` was renamed to `examples/` on 2026-08-24.)
 
 The three-way split above already determines the answer per table, which is the
 point worth recording — this needs no new policy, only the existing directive

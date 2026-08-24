@@ -1,0 +1,45 @@
+[package]
+name = "observability-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Opt-in, like the durable-send suite's gate of the same name: the ingest
+# instruments can only be observed against a real broker, because there is no
+# ingest cycle without one.
+redpanda = ["durable-send-tests/redpanda", "dep:kafkaman-rdkafka", "dep:rdkafka"]
+
+[dependencies]
+kafkaman-core = { path = "../../crates/kafkaman-core" }
+kafkaman-rdkafka = { path = "../../crates/kafkaman-rdkafka", optional = true }
+kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
+kafkaman-test = { path = "../../crates/kafkaman-test" }
+kafkaman-worker = { path = "../../crates/kafkaman-worker" }
+# The container scaffolding and message fixtures are shared with the durable-send
+# suite rather than duplicated. `postgres_for_suite` takes a suite label for
+# exactly this reason, so a stray container still points at the binary that
+# started it. If a third suite appears, this scaffolding should move to
+# `kafkaman-test` instead of being depended on sideways.
+durable-send-tests = { path = "../durable-send" }
+async-trait.workspace = true
+opentelemetry.workspace = true
+rdkafka = { workspace = true, optional = true }
+# `testing` on top of the workspace features: `InMemoryMetricExporter` lives
+# there, and no non-test member should carry it.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

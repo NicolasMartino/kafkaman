@@ -3,7 +3,8 @@ use kafkaman_core::MessageDescriptor;
 use crate::changeset::{ChangeBuilder, Changeset};
 use crate::schema_sql::{
     add_idempotency_key_sql, add_idempotency_source_sql, add_outbox_entity_key_sql,
-    add_received_entity_key_sql, create_cache_table_sql, create_outbox_entity_state_index_sql,
+    add_outbox_trace_context_sql, add_received_entity_key_sql, add_received_trace_context_sql,
+    create_cache_table_sql, create_outbox_entity_state_index_sql,
     create_outbox_retention_index_sql, create_outbox_state_index_sql, create_outbox_table_sql,
     create_received_idempotency_index_sql, create_received_state_index_sql,
     create_received_table_sql,
@@ -194,5 +195,39 @@ descriptor_changeset! {
     |cfg, descriptor, builder| {
         let table = OutboxTable::new(cfg.schema.clone(), descriptor)?;
         builder.push(create_outbox_retention_index_sql(&table));
+    }
+}
+
+descriptor_changeset! {
+    /// Additive changeset adding W3C trace-context columns to an outbox table
+    /// created before distributed tracing. Fresh tables already have them from
+    /// [`create_outbox_table_sql`], so the `ADD COLUMN IF NOT EXISTS` statements
+    /// are no-ops there; include it in a changelog only to upgrade pre-existing
+    /// tables.
+    ///
+    /// Both columns are nullable and existing rows keep `NULL`, which the
+    /// runtime already treats as the ordinary case: a row enqueued outside any
+    /// span publishes and dispatches exactly as before. The change is additive
+    /// in the strict sense — nothing reads these columns expecting a value, and
+    /// a deployment that applies it and rolls back keeps working.
+    AddOutboxTraceContext => "add_outbox_trace_context",
+    |cfg, descriptor, builder| {
+        let table = OutboxTable::new(cfg.schema.clone(), descriptor)?;
+        for statement in add_outbox_trace_context_sql(&table) {
+            builder.push(statement);
+        }
+    }
+}
+
+descriptor_changeset! {
+    /// The received-table half of [`AddOutboxTraceContext`], carrying the
+    /// context of the ingest that stored a row so its later dispatch descends
+    /// from it rather than starting a trace of its own.
+    AddReceivedTraceContext => "add_received_trace_context",
+    |cfg, descriptor, builder| {
+        let table = ReceivedTable::new(cfg.schema.clone(), descriptor)?;
+        for statement in add_received_trace_context_sql(&table) {
+            builder.push(statement);
+        }
     }
 }

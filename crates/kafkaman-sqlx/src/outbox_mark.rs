@@ -153,6 +153,10 @@ pub(crate) fn row_from_pg(row: PgRow) -> Result<OutboxRow> {
         entity_key: row.try_get("entity_key")?,
         correlation_id: row.try_get("correlation_id")?,
         causation_id: row.try_get("causation_id")?,
+        trace: kafkaman_core::TraceContext::from_parts(
+            row.try_get("traceparent")?,
+            row.try_get("tracestate")?,
+        ),
         headers,
         payload: row.try_get("payload")?,
         occurred_at: row.try_get("occurred_at")?,

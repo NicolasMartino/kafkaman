@@ -1,0 +1,31 @@
+[package]
+name = "example-provision"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "provision"
+path = "src/main.rs"
+
+[lib]
+name = "example_provision"
+path = "src/lib.rs"
+
+[dependencies]
+# The contracts, because the topics to provision are the ones the message types
+# declare. Reading them from the same place the services do is what stops this
+# binary creating a topic no service publishes to.
+example-contracts = { path = "../contracts" }
+# `rdkafka`, because provisioning is the one job that needs the admin client.
+kafkaman = { path = "../../crates/kafkaman", features = ["rdkafka"] }
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

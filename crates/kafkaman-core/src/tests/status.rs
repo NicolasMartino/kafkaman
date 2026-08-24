@@ -47,3 +47,21 @@ fn status_names_are_the_serde_representation() {
         assert_eq!(json, format!("\"{}\"", status.as_str()));
     }
 }
+
+#[test]
+fn status_terminality_matches_the_retention_predicate() {
+    // The purge predicate and the queue-age warning must agree on which
+    // statuses are finished work, or the warning fires on rows retention is
+    // already free to delete.
+    assert!(!OutboxStatus::Pending.is_terminal());
+    assert!(!OutboxStatus::Publishing.is_terminal());
+    assert!(OutboxStatus::Published.is_terminal());
+    assert!(OutboxStatus::Superseded.is_terminal());
+    assert!(OutboxStatus::Failed.is_terminal());
+
+    assert!(!ReceiveStatus::Pending.is_terminal());
+    assert!(!ReceiveStatus::Retryable.is_terminal());
+    assert!(ReceiveStatus::Processed.is_terminal());
+    // A DLQ row waits for an operator, not for the dispatcher.
+    assert!(ReceiveStatus::Failed.is_terminal());
+}

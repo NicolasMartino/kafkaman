@@ -14,14 +14,15 @@
 [database]
 schema = "kafkaman"                 # Postgres schema owning kafkaman's tables, migration history, and advisory lock. Must be a valid lowercase SQL identifier.
 #
-# `url` is host-owned sample context, NOT consumed by kafkaman. The example app
-# (apps/axum-outbox) reads its Postgres connection string from the DATABASE_URL
-# environment variable, so this value is ignored if you set it here.
+# `url` is host-owned sample context, NOT consumed by kafkaman. The example
+# services (examples/order, examples/product) read their Postgres connection
+# string from the DATABASE_URL environment variable, so this value is ignored if
+# you set it here.
 # url = "postgres://user:password@localhost:5432/app"
 
-# `[kafka].brokers` is likewise host-owned: the example app reads KAFKA_BROKERS
-# from the environment. Kept here only to document the expected shape; it is not
-# part of kafkaman's config contract and is ignored if set.
+# `[kafka].brokers` is likewise host-owned: the example services read
+# KAFKA_BROKERS from the environment. Kept here only to document the expected
+# shape; it is not part of kafkaman's config contract and is ignored if set.
 # [kafka]
 # brokers = "localhost:9092"
 
@@ -48,13 +49,52 @@ dlq = "table"                       # Where exhausted rows land. Only "table" is
 # Every key is optional — omit one to inherit. The message type must be registered
 # with `ResolvedConfig`, or boot fails; this catches a renamed type whose retry
 # policy would otherwise be silently ignored.
-[retry.messages.order_created]
+[retry.messages.order_snapshot]
 max_attempts = 8                    # Overrides retry.defaults.max_attempts for this type only.
 initial_backoff = "250ms"           # Overrides retry.defaults.initial_backoff for this type only.
 max_backoff = "60s"                 # Overrides retry.defaults.max_backoff for this type only.
 multiplier = 1.5                    # Overrides retry.defaults.multiplier for this type only.
 errors_limit = 32                   # Overrides retry.defaults.errors_limit for this type only.
 dlq = "table"                       # Overrides retry.defaults.dlq for this type only.
+
+# OPTIONAL. Governs kafkaman's tracing events, OpenTelemetry metric warning
+# thresholds, and admin-route stuck/age detection. Omit the whole section to use
+# quiet production defaults. The host application still owns the tracing
+# subscriber and OpenTelemetry exporter; kafkaman only emits telemetry.
+[observability.defaults]
+# RESERVED. Parsed and validated, but nothing reads it yet: kafkaman emits through
+# `tracing` and your subscriber owns filtering, so use an EnvFilter directive on the
+# `kafkaman` targets today. Accepted: error, warn, info, debug, trace. Default warn.
+level = "warn"
+# LIVE. "summary" logs once per scheduler cycle. "per-message" additionally emits one
+# event per successful message, at the `sample_success` rate below. Default summary.
+lifecycle = "summary"
+# RESERVED. No kafkaman code path emits payload bodies, so this is "off" in effect
+# whatever you set. Accepted now so adding a redaction hook is not a breaking config
+# change. Accepted: off, redacted, sampled, full. Default off.
+payload = "off"
+# RESERVED. Same status as `payload`: no code path emits arbitrary user headers today.
+# Accepted: off, kafkaman-only, all. Default kafkaman-only.
+headers = "kafkaman-only"
+# LIVE, and only meaningful with lifecycle = "per-message". Fraction of successes that
+# get an event; sampling is deterministic (every Nth success), not random. Must be
+# 0.0..=1.0. Default 0.0, which is silent.
+sample_success = 0.0
+# LIVE. How long an expired claim or overdue received row must stay overdue before the
+# stuck-row route reports it. Must be > 0. Default 60s.
+stuck_after = "60s"
+# LIVE. Age at which queued work sets `over_max_queue_age` on a depth summary. Terminal
+# rows never set it — a published row awaiting retention is not a backlog. Must be > 0.
+# Default 5m.
+max_queue_age = "5m"
+
+# OPTIONAL, repeatable. Per-message-type overrides, merged over
+# `[observability.defaults]`. The message type must be registered with
+# `ResolvedConfig`, or boot fails.
+[observability.messages.order_created]
+lifecycle = "per-message"           # Emit an event per successful message for this type only.
+sample_success = 0.05               # ...one in every twenty of them.
+stuck_after = "30s"                 # A high-value stream should be reported overdue sooner.
 
 # OPTIONAL. Reclaims terminal outbox rows. Omit the section and nothing is ever
 # deleted — the outbox grows for the life of the application, which is the

@@ -16,9 +16,50 @@ synchronous service-to-service calls.
   entity is published;
 - Kafka ingest into durable received tables before committing offsets;
 - guarded cache upsert from Kafka metadata, using topic, partition, and offset;
+- boot-time verification that entity topics really are `cleanup.policy=compact`,
+  under `[topics] mode`, before any loop is spawned — a broker left to
+  auto-create makes them `delete`, which quietly breaks rebuild-from-log;
 - retry, backoff, DLQ, and redrive as reliability plumbing for the entity-cache
   pipeline;
-- state-sourced republish for repair, never replaying stale outbox rows as truth.
+- state-sourced republish for repair, never replaying stale outbox rows as truth;
+- assembly of all of the above from declared roles, so a service says what it
+  publishes and caches rather than wiring up the tables and loops those imply.
+
+## Assembling a Service
+
+```rust
+let runtime = kafkaman::RuntimeBuilder::new()
+    .config(config)          // parsed kafkaman.toml; there is no discovery fallback
+    .pool(pool.clone())      // the host owns pool sizing
+    .brokers(&brokers)
+    .consumer_group("order-service")
+    .publish::<OrderSnapshot>()      // outbox table + relay
+    .cache::<ProductSnapshot>()      // received + cache tables, ingester + dispatcher
+    .build()                 // validate, converge topics, migrate — start nothing
+    .await?;
+
+runtime.run(shutdown).await?;        // start the loops, supervise, drain
+```
+
+`publish`, `cache`, `handle`, and `handle_before` are the whole vocabulary.
+kafkaman derives the changelog and its version numbers, the tables, topic
+convergence, the loops, and the shutdown wiring from them.
+
+What stays with the host is deliberate and enumerated: the Tokio runtime, the
+pool, business schema, signal handling, process exit, telemetry installation,
+config discovery, database creation, and the *authority* over topic creation.
+`build()` converges topics in exactly the mode the config selects and never
+defaults to or upgrades to `create`.
+
+HTTP composition lives in `kafkaman::axum` behind a feature, which makes the
+server one more supervised loop — so the first kafkaman loop to die stops the
+service accepting traffic.
+
+Every low-level primitive stays public and supported: `migrate`,
+`converge_topics`, the table handles, the worker loops, the publishers and
+consumers. `examples/product/src/service_manual.rs` boots entirely through them,
+and the end-to-end suite runs against that path as well as the builder's, so the
+escape hatch is a tested claim rather than a documented intention.
 
 ## What kafkaman Does Not Own
 
@@ -29,6 +70,25 @@ the library's purview.
 
 Applications may still need those systems, but they should live outside
 kafkaman.
+
+## Seeing It Work
+
+[`examples/`](examples) holds two services that share no database and never call
+each other, yet each serves data the other owns: `product` publishes product
+snapshots, `order` caches them and admits orders from that cache alone, and
+`product` recomputes availability from its own converged cache of orders.
+
+[`tests/distributed-cache`](tests/distributed-cache) drives both of them over
+HTTP and nothing else, which is the only tier at which a wiring mistake — a
+dispatcher never spawned, a cache table missing from a changelog — is visible.
+It runs the whole lifecycle against the builder path and a hand-wired one.
+
+To watch it happen rather than read about it, `just examples demo` builds both services,
+starts them against Postgres and Redpanda, and walks the lifecycle: an order is
+fulfilled on one service and availability drops on the other, two hops away,
+with no call between them. Each service serves a Swagger UI describing its own
+endpoints, and `just examples ui` adds Redpanda Console for reading the
+snapshots actually on the wire.
 
 ## Current Status
 

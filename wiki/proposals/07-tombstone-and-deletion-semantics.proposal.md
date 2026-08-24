@@ -12,6 +12,7 @@
   - wiki/specs/m3-durable-receive.spec.md
   - wiki/decisions/ingest-poison-quarantine-policy.decision.md
 - Related:
+  - wiki/decisions/dispatch-handler-ordering.decision.md
   - wiki/proposals/09-entity-first-propagation.proposal.md
   - wiki/proposals/06-typed-idempotency-identity-and-error-row-symmetry.proposal.md
   - wiki/proposals/08-listen-notify-scheduler-wakeup.proposal.md
@@ -138,6 +139,37 @@ The deletion flag should travel in `ReceivedMeta` rather than by changing the
 shape of `P`. Handlers for tombstone-bearing types branch on metadata, which
 avoids forcing every payload type into an enum wrapper and keeps the M3 handler
 signature stable.
+
+**2026-08-26: settled — the flag travels in `ReceivedMeta`, and it is now
+implemented as a reserved field.** `wiki/decisions/dispatch-handler-ordering.decision.md`
+accepts that the handler signature must be able to carry a tombstone *before* it
+is published, because absence cannot be retrofitted into `T` without a breaking
+change — and the runtime builder is what publishes it. Phase 0 of
+`wiki/plans/runtime-builder-and-axum-composition.plan.md` weighed this section's
+direction against an `Option<T>`-style payload and kept this one.
+
+The deciding argument against `Option<T>` is that it prices a feature nobody has
+into every handler. kafkaman emits soft deletes as full entity states, so on any
+topic kafkaman produces the payload is *never* absent; `Option<T>` would make
+every handler in every service match on a `None` that its own producer cannot
+emit, to accommodate foreign producers such as Debezium that most services never
+consume. Metadata is where a per-delivery fact that most handlers ignore belongs.
+
+What landed in `crates/kafkaman-core/src/rows.rs`:
+
+- `ReceivedMeta` is now `#[non_exhaustive]`. It was a plain struct with sixteen
+  public fields, so *adding* the flag later would itself have been the breaking
+  change the decision forbids deferring. This is the part that had to happen
+  before first publication; the rest is additive.
+- It carries `deleted: bool`, `#[serde(default)]`, read through
+  `ReceivedMeta::is_deleted()`. `impl From<&ReceivedRow>` sets it to `false`
+  unconditionally, and the doc comments say so.
+
+Nothing else here changes. Ingestion, ordering, and identity remain Proposed and
+unimplemented; nothing writes `true`; and the cache table's `deleted` column
+stays reserved and unwritten. A handler that branches on `is_deleted()` today is
+writing dead but forward-compatible code, which is the point — when ingestion
+lands it keeps compiling and starts seeing `true`.
 
 ### Identity
 

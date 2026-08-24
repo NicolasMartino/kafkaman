@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::trace::TraceContext;
 use crate::{IdempotencyKey, OutboxStatus, ReceiveStatus, ReceivedFailureKind};
 
 /// One failure in a receive row's audit trail, shaped as an RFC 9457 problem
@@ -76,6 +77,12 @@ pub struct ReceivedRow {
     pub payload: serde_json::Value,
     pub correlation_id: Option<Uuid>,
     pub causation_id: Option<Uuid>,
+    /// W3C trace context of the ingest that stored this row, restored when it is
+    /// dispatched. `None` when nothing was tracing at ingest.
+    ///
+    /// The ingest span's own context rather than the producer's: ingest links to
+    /// the producer, dispatch descends from ingest.
+    pub trace: Option<TraceContext>,
     pub occurred_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
     pub processed_at: Option<OffsetDateTime>,
@@ -86,7 +93,15 @@ pub struct ReceivedRow {
 /// persisted on [`ReceivedRow`] so handlers can correlate, trace, and inspect
 /// delivery state without re-querying the received table. `attempts` reflects
 /// the count at claim time, i.e. the number of prior failed dispatches.
+///
+/// This type is the declared carrier for entity deletion. A tombstone has no
+/// payload bytes, so absence has to be representable somewhere in the handler
+/// signature, and putting it here rather than in `P` avoids forcing every
+/// payload type into an enum wrapper. Deletion is not implemented — see
+/// [`ReceivedMeta::is_deleted`] — but the struct is `#[non_exhaustive]` so the
+/// field can start being written without a breaking change.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReceivedMeta {
     pub message_id: Uuid,
     pub idempotency_key: IdempotencyKey,
@@ -105,6 +120,25 @@ pub struct ReceivedMeta {
     pub causation_id: Option<Uuid>,
     pub occurred_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
+    /// Whether this record withdraws the entity rather than restating it.
+    ///
+    /// Reserved and always `false`: kafkaman emits soft deletes as full entity
+    /// states, and real tombstone *ingestion* is still unimplemented. Read it
+    /// through [`ReceivedMeta::is_deleted`].
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl ReceivedMeta {
+    /// Whether this record withdraws the entity rather than restating it.
+    ///
+    /// Always `false` today. Branching on it now is correct and forward
+    /// compatible: when tombstone ingestion lands, a handler written against
+    /// this accessor keeps compiling and starts seeing `true`.
+    #[must_use]
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
 }
 
 impl From<&ReceivedRow> for ReceivedMeta {
@@ -126,6 +160,8 @@ impl From<&ReceivedRow> for ReceivedMeta {
             causation_id: row.causation_id,
             occurred_at: row.occurred_at,
             created_at: row.created_at,
+            // Reserved: nothing writes a tombstone yet.
+            deleted: false,
         }
     }
 }
@@ -149,6 +185,14 @@ pub struct OutboxRow {
     pub entity_key: Option<String>,
     pub correlation_id: Uuid,
     pub causation_id: Option<Uuid>,
+    /// W3C trace context captured when the row was enqueued, restored when it is
+    /// published. `None` for a row enqueued outside any span, which is normal
+    /// and never an error.
+    ///
+    /// This is the same journey `correlation_id` makes, for the same reason: the
+    /// outbox separates enqueue from publish in time, and no in-memory context
+    /// survives that gap.
+    pub trace: Option<TraceContext>,
     pub headers: BTreeMap<String, String>,
     pub payload: serde_json::Value,
     pub occurred_at: OffsetDateTime,

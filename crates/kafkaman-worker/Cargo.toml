@@ -5,10 +5,24 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["metrics", "traces"]
+# OpenTelemetry counters for the scheduler loops. On by default because an
+# operator almost always wants them; opt out to drop the `opentelemetry`
+# dependency entirely.
+metrics = ["dep:opentelemetry", "dep:opentelemetry-semantic-conventions"]
+# W3C trace context capture and span parenting. On by default; opt out to build
+# without an `opentelemetry` dependency at all. Stored context is still read and
+# forwarded either way, so turning this off stops this process from producing
+# trace context without breaking propagation for the services around it.
+traces = ["kafkaman-core/traces", "kafkaman-sqlx/traces"]
+
 [dependencies]
 async-trait.workspace = true
-kafkaman-core = { path = "../kafkaman-core" }
-kafkaman-sqlx = { path = "../kafkaman-sqlx" }
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-semantic-conventions = { workspace = true, optional = true }
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true

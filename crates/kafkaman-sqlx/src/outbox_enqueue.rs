@@ -1,7 +1,8 @@
-use kafkaman_core::{Envelope, KafkaMessage, OutboxStatus};
+use kafkaman_core::{Envelope, KafkaMessage, OutboxStatus, TraceContext};
 use serde::Serialize;
 use sqlx::{Connection, PgConnection, Postgres, Transaction};
 use time::OffsetDateTime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::lock_keys::outbox_entity_lock_key;
@@ -40,6 +41,28 @@ pub async fn enqueue_on_connection<P>(
 where
     P: KafkaMessage + Serialize,
 {
+    // The span is opened here rather than inside, because the trace context
+    // persisted on the row is captured *from* it: the relay's publish span
+    // becomes a child of this one, minutes or hours later, which is the causal
+    // link the outbox pattern otherwise breaks.
+    let span = tracing::info_span!(
+        "kafkaman.enqueue",
+        message_type = P::MESSAGE_TYPE,
+        messaging.system = "kafka",
+        messaging.destination.name = P::TOPIC,
+        messaging.operation.name = "create",
+    );
+    enqueue_inner(conn, cfg, evt).instrument(span).await
+}
+
+async fn enqueue_inner<P>(
+    conn: &mut PgConnection,
+    cfg: &ResolvedConfig,
+    evt: &Envelope<P>,
+) -> Result<()>
+where
+    P: KafkaMessage + Serialize,
+{
     let table = OutboxTable::for_message::<P>(cfg)?;
     if let Some(reserved) = kafkaman_core::reserved_header(&evt.headers) {
         return Err(Error::ReservedHeader(reserved.to_owned()));
@@ -71,6 +94,7 @@ where
         partition_key,
         correlation_id: evt.correlation_id,
         causation_id: evt.causation_id,
+        trace: kafkaman_core::capture_trace_context(),
         headers,
         payload,
         occurred_at: evt.occurred_at,
@@ -112,6 +136,7 @@ struct InsertOutboxRow<'a> {
     partition_key: Option<String>,
     correlation_id: Uuid,
     causation_id: Option<Uuid>,
+    trace: Option<TraceContext>,
     headers: serde_json::Value,
     payload: serde_json::Value,
     occurred_at: OffsetDateTime,
@@ -130,9 +155,11 @@ impl InsertOutboxRow<'_> {
         let sql = format!(
             "INSERT INTO {name} (
                 message_id, idempotency_key, idempotency_source, status, attempts, next_attempt_at,
-                last_error, topic, partition_key, entity_key, correlation_id, causation_id, headers,
-                payload, occurred_at
-            ) VALUES ($1, $2, $3, {status}, 0, now(), $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                last_error, topic, partition_key, entity_key, correlation_id, causation_id,
+                traceparent, tracestate, headers, payload, occurred_at
+            ) VALUES (
+                $1, $2, $3, {status}, 0, now(), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+            )",
             name = self.table.qualified_name(),
             status = status.sql_literal(),
         );
@@ -147,6 +174,16 @@ impl InsertOutboxRow<'_> {
             .bind(self.entity_key)
             .bind(self.correlation_id)
             .bind(self.causation_id)
+            .bind(
+                self.trace
+                    .as_ref()
+                    .map(|trace| trace.traceparent().to_owned()),
+            )
+            .bind(
+                self.trace
+                    .as_ref()
+                    .and_then(|trace| trace.tracestate().map(ToOwned::to_owned)),
+            )
             .bind(self.headers)
             .bind(self.payload)
             .bind(self.occurred_at)
