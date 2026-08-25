@@ -58,7 +58,7 @@ pub use topics::{
     reconcile, CleanupPolicy, ObservedTopic, PartitionDrift, TopicAction, TopicMode, TopicOutcome,
     TopicSpec,
 };
-pub use trace::{add_link, capture_trace_context, set_parent, TraceContext};
+pub use trace::{add_link, attach, capture_trace_context, set_parent, TraceContext, TraceScope};
 
 #[cfg(test)]
 mod tests;

@@ -13,6 +13,7 @@ publish = false
 redpanda = ["durable-send-tests/redpanda", "dep:kafkaman-rdkafka", "dep:rdkafka"]
 
 [dependencies]
+kafkaman-axum = { path = "../../crates/kafkaman-axum" }
 kafkaman-core = { path = "../../crates/kafkaman-core" }
 kafkaman-rdkafka = { path = "../../crates/kafkaman-rdkafka", optional = true }
 kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
@@ -30,6 +31,12 @@ rdkafka = { workspace = true, optional = true }
 # `testing` on top of the workspace features: `InMemoryMetricExporter` lives
 # there, and no non-test member should carry it.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Exporters live in `apps/` and `tests/` and nowhere else, per
+# wiki/decisions/telemetry-pipeline-ownership.decision.md. This suite is the
+# `tests/` half: it is where "kafkaman's telemetry reaches the wire" is proved,
+# independent of whichever example currently ships.
+opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -38,6 +45,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+# An HTTP client, because the point of `admin_http` is the hop the router-level
+# tests skip. Already in the tree behind the OTLP exporter, so it costs nothing
+# to compile.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde_json.workspace = true
 uuid.workspace = true
 

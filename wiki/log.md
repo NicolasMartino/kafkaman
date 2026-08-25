@@ -635,6 +635,97 @@ Pages affected: `wiki/specs/entity-first-propagation.spec.md`,
 `wiki/plans/topic-convergence.plan.md`,
 `wiki/compatibility/topic-convergence-api.compat.md`, `wiki/index.md`,
 `wiki/log.md`.
+## [2026-08-26] implementation | OTel Phases 5 and 6, and the example wiring taken back out
+
+Closes the OpenTelemetry completion plan except for the compose profile, which is
+deferred deliberately.
+
+**`apps/axum-outbox` is back to its `main` state, exactly, and the branch history
+was rewritten so it never left it.** The example is being replaced wholesale by
+the one under construction in a separate worktree, so telemetry wiring written
+against it would be written twice — and a capability demonstration belongs in the
+example that survives. The revert is total: the branch's `apps/` tree is
+byte-identical to `main`, including the M6-era admin wiring, because the whole
+directory is going. The four commits on this branch touch `crates/`, `tests/`,
+`wiki/`, and the workspace manifest, and nothing else.
+
+That cost one thing worth keeping, so it was moved rather than lost.
+`telemetry_export` proved that OTLP bytes actually leave a process, which is the
+one property an in-memory exporter cannot show — an exporter that never posts
+looks exactly like a silent instrument from inside the process. It now lives in
+`tests/observability/otlp_wire`, where the ownership decision already permits
+exporter dependencies, and it got stronger in the move: it runs a real relay loop
+against a real database and asserts kafkaman's *own* instrument names, span
+names, and log lines on the wire, rather than a synthetic probe metric in an
+example.
+
+**Phase 5 is complete**, at twelve binaries. The plan named six; the extra six
+each exist because building the feature turned up a property that needed pinning
+— `single_cycle_silence`, `queue_gauge_staleness`, `trace_absent`,
+`trace_root_enqueue`, `ingest_disjointness`, `otlp_wire`. The one binary the plan
+named that does not exist is `metrics_disabled`: a test binary cannot assert a
+`--no-default-features` build from inside a default build, so `just lint` now
+runs `cargo check -p kafkaman --no-default-features` and the no-op twins are
+compiled by the same gate as everything else.
+
+**`lifecycle_events` found a real defect, which is why it exists.** The sampled
+success events were emitted from the relay loop after each cycle, outside any
+span — so they reached the log signal with no `trace_id`, and the log-to-trace
+pivot that `sample_success` exists to provide did not work. The test was written
+to assert the pivot and failed on it.
+
+The cause is an ecosystem detail worth recording, because it is invisible from
+either side alone: `opentelemetry-appender-tracing` stamps a log record from the
+*OpenTelemetry* context current at emission and never reads the `tracing` span
+stack, while `tracing-opentelemetry` bridges spans without attaching them to the
+OpenTelemetry context. The two stacks simply do not meet. Version 0.32 of the
+appender has no feature to make them.
+
+So success events now emit per row, inside that row's `kafkaman.relay.publish`
+span, with the span's context attached for the duration of the emission —
+`kafkaman_core::attach`, whose guard is scoped so it never crosses an `await`.
+The sampling rate is unchanged and still carries across cycles; what changed is
+that each event is attributable to the message it describes. The receive-side
+event is still uncorrelated, which is recorded rather than hidden: the dispatch
+span closes inside `dispatch_once` before the loop sees the stats, and closing
+that gap means either moving the sampler into `kafkaman-sqlx` or widening
+`DispatchStats` — neither worth doing before someone wants it.
+
+**`admin_http`** covers every operator route over a real socket: health,
+readiness, both depth summaries, stuck rows, DLQ, redrive with its 404 for an
+unregistered type and its 400 for an unbounded request, and the correlation
+header round trip in both directions. The existing coverage called handlers
+through an in-process `Router`, which skips status codes, decodable JSON,
+router-resolved path parameters, and the correlation hop entirely — and that
+surface is the one that answers an operator's questions with no telemetry backend
+at all.
+
+**Phase 6.** The M6 spec now records that M6 shipped instrumentation rather than
+a pipeline, and names the two statements in it that became wrong rather than
+merely partial: instruments are no longer cached process-wide, and the ingest
+partition is no longer guarded only by a `debug_assert` that release builds
+delete. The compatibility note carries the metric schedule, the queue metrics
+loop, the trace-context schema, API and wire format, and the lifecycle emission
+change. The three reserved `[observability]` fields were re-examined now that the
+log signal exists and **left reserved**, with the reasoning recorded so it is not
+re-opened: `level` would duplicate and fight the host subscriber's filter, and
+`payload`/`headers` still have nothing to govern — the metric-schema decision
+forbids deriving any attribute from message content, which makes reserved the
+permanent answer on that surface.
+
+Evidence: `just lint` clean, including the disabled-twin check; `cargo test
+--workspace --all-features` (225 passed, 4 ignored).
+
+Pages affected:
+- `crates/kafkaman-core/src/trace.rs`, `lib.rs`
+- `crates/kafkaman-worker/src/relay.rs`
+- `tests/observability/` — `Cargo.toml`, and the `otlp_wire`,
+  `lifecycle_events`, `admin_http` binaries
+- `wiki/specs/m6-observability-operability.spec.md`
+- `wiki/compatibility/m6-observability-operability-api.compat.md`
+- `wiki/plans/opentelemetry-completion.plan.md`
+- `wiki/index.md`, `wiki/log.md`
+
 ## [2026-08-25] implementation | OTel Phases 2 and 3: traces across both durable gaps, and logs that point at them
 
 The half M6 did not build. Metrics answer "how much"; a trace answers "what
@@ -672,7 +763,10 @@ stripped from the user headers a handler sees. A producer sending them is the
 normal case, not an error.
 
 **Logs** are `opentelemetry-appender-tracing`, stamping every record with the
-ids of the span it was emitted in. That stamping is the whole feature and the
+ids of the span it was emitted in. The appender is a host-side crate, so this
+half was demonstrated in the example and reverted with the rest of the example
+wiring on 2026-08-26; `tests/observability/otlp_wire` and `lifecycle_events`
+carry the proof instead. That stamping is the whole feature and the
 reason logs had to follow traces rather than precede them: the lifecycle events
 `LifecycleSampler` already emits become trace-correlated records with no further
 work, which is what `sample_success` was for.
@@ -731,13 +825,11 @@ Evidence: `just lint` clean; `cargo test --workspace --all-features` (223 passed
 
 **Phase 4 is deliberately incomplete.** The Elasticsearch/Kibana compose profile
 is not built. It was specified as an extension of the two-service example's
-compose file, which is not on this branch, and the `apps/axum-outbox` example
-that currently carries the host wiring is being replaced by the example under
-construction in a separate worktree. Writing it here would be writing it twice.
-The wiring in `apps/axum-outbox/src/telemetry.rs` — three signals, installed
-before any kafkaman component, flushed on the drain path, proved end to end
-against a socket by `tests/telemetry_export.rs` — stands as the reference for
-that port.
+compose file, which is not on this branch, and `apps/axum-outbox` is being
+replaced by the example under construction in a separate worktree. Writing it
+here would be writing it twice. `tests/observability/otlp_wire` — three
+providers, installed before any kafkaman component, flushed on shutdown, asserted
+on the wire — stands as the reference for that port.
 
 Pages affected:
 - `crates/kafkaman-core/src/trace.rs` (new), `rows.rs`, `lib.rs`, `Cargo.toml`
@@ -750,7 +842,6 @@ Pages affected:
 - `crates/kafkaman/Cargo.toml`
 - `tests/observability/` — `src/lib.rs`, `Cargo.toml`, and the
   `trace_propagation`, `trace_absent`, `trace_root_enqueue` binaries
-- `apps/axum-outbox/` — host wiring for all three signals (moving)
 - `Cargo.toml`, `Cargo.lock`, `justfile`
 - `wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`
 - `wiki/decisions/telemetry-pipeline-ownership.decision.md`
@@ -836,9 +927,11 @@ must stay out of it. `SchedulerMetrics` is now composed into `RelayMetrics` and
 `DispatchMetrics` rather than carrying relay-specific methods; the purger, which
 needs neither histogram, still uses it directly.
 
-The example wires the sampler beside the relay, but only when a telemetry
-endpoint is configured — without a pipeline the callbacks never run and the
-sampler would be querying Postgres on an interval for nobody.
+The sampler was wired into the example beside the relay, and started only when a
+telemetry endpoint was configured — without a pipeline the callbacks never run
+and it would be querying Postgres on an interval for nobody. That wiring was
+reverted with the rest of the example's telemetry on 2026-08-26; the condition is
+worth carrying into the incoming example, which is why it is recorded here.
 
 `opentelemetry-semantic-conventions` joins `kafkaman-worker` and
 `kafkaman-rdkafka` as an optional dependency of their `metrics` features. It is
@@ -853,7 +946,6 @@ Pages affected:
 - `crates/kafkaman-worker/src/metrics.rs`, `queue_metrics.rs` (new), `relay.rs`,
   `dispatcher.rs`, `lib.rs`, `Cargo.toml`
 - `crates/kafkaman-rdkafka/src/metrics.rs`, `Cargo.toml`
-- `apps/axum-outbox/src/main.rs`
 - `tests/observability/` — `src/lib.rs`, `Cargo.toml`, and the
   `metrics_surface`, `queue_gauges`, `queue_gauge_staleness`,
   `single_cycle_silence`, `ingest_disjointness` binaries
@@ -863,13 +955,23 @@ Pages affected:
 - `wiki/plans/opentelemetry-completion.plan.md`
 - `wiki/index.md`, `wiki/log.md`
 
-## [2026-08-25] implementation | OTel Phase 0 step 5: the example installs a pipeline, and it reaches the wire
+## [2026-08-25] implementation | OTel Phase 0 step 5: host pipeline prototyped in the example, then reverted
 
-Closes Phase 0 of `wiki/plans/opentelemetry-completion.plan.md`. The example was
-the phase's own warning made flesh: it installed a `tracing_subscriber` and no
-`MeterProvider`, then started a relay — precisely the ordering that binds every
-instrument to the no-op provider for the life of the process. Every adopter
-copying it inherited a silent metric surface.
+Closes Phase 0 of `wiki/plans/opentelemetry-completion.plan.md`.
+
+**Read this entry as a design record, not a change record.** The wiring described
+below was built in `apps/axum-outbox` and then reverted on 2026-08-26, because
+that example is being replaced wholesale by the one under construction in a
+separate worktree — telemetry wiring belongs in the example that survives rather
+than being written twice. The branch carries no example wiring at all, and the
+history was rewritten so it never did. What survives is the reasoning, which the
+incoming example inherits, and `tests/observability/otlp_wire`, which does the
+same thing in a test process.
+
+The example was the phase's own warning made flesh: it installed a
+`tracing_subscriber` and no `MeterProvider`, then started a relay — precisely the
+ordering that binds every instrument to the no-op provider for the life of the
+process. Every adopter copying it inherited a silent metric surface.
 
 `apps/axum-outbox/src/telemetry.rs` is the host half of the pipeline: an OTLP/HTTP
 metrics exporter behind a `PeriodicReader` at a 15-second interval, installed as
@@ -930,10 +1032,8 @@ Evidence: `just lint` clean (fmt, clippy `-D warnings`, rustdoc `-D warnings`,
 lib tests); `cargo test --workspace --all-features` (208 passed, 4 ignored, up
 from 205).
 
-Pages affected:
-- `apps/axum-outbox/src/telemetry.rs` (new)
-- `apps/axum-outbox/tests/telemetry_export.rs` (new)
-- `apps/axum-outbox/src/main.rs`, `src/lib.rs`, `Cargo.toml`, `README.md`
+Pages affected (as landed after the 2026-08-26 revert; the `apps/` files this
+entry describes are not on the branch):
 - `Cargo.toml`, `Cargo.lock`, `tests/observability/Cargo.toml`
 - `wiki/plans/opentelemetry-completion.plan.md`
 - `wiki/compatibility/m6-observability-operability-api.compat.md`

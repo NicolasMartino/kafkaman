@@ -167,30 +167,26 @@ only the provenance and the helper name were wrong.
 
 ## Example Application Change
 
-`apps/axum-outbox` now enables `kafkaman/axum`, mounts `admin_router` under
-`/internal/kafkaman`, applies `CorrelationLayer`, and supervises the relay with
-`serve().with_runtime()` in place of a hand-rolled `tokio::select!`. Adopters
-copying the example get the drain-on-shutdown behavior by default.
+**Superseded 2026-08-26. `apps/axum-outbox` carries none of this on the
+observability branch, and is being replaced.**
 
-**Added 2026-08-25 (Phase 0 step 5).** The example also installs an OpenTelemetry
-metrics pipeline: `axum_outbox::telemetry::init_metrics` builds an OTLP/HTTP
-metrics exporter behind a `PeriodicReader`, sets it as the global
-`MeterProvider`, and returns a `MetricsPipeline` whose `shutdown` performs the
-final collect-and-export. `main` calls it before the pool, the migrations, and
-the relay, and holds the `serve` result so telemetry is flushed before the
-process exits with it.
+The M6 work described here — enabling `kafkaman/axum`, mounting `admin_router`
+under `/internal/kafkaman`, applying `CorrelationLayer`, and supervising the
+relay with `serve().with_runtime()` — landed in the example on `main` and is
+recorded because it describes behavior adopters copy. It is left in place as the
+record of what M6 did to the example, not as a description of this branch, whose
+`apps/` tree is identical to `main`'s.
 
-Endpoint configuration follows the OpenTelemetry specification:
-`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is used verbatim and wins over
-`OTEL_EXPORTER_OTLP_ENDPOINT`, which has `/v1/metrics` appended. With neither
-set, the example installs **no provider at all** rather than exporting into a
-closed port; the skip is logged. Exports carry `service.name=axum-outbox` at a
-15-second interval.
+The host-side OpenTelemetry pipeline was prototyped there and reverted: the
+example is being replaced wholesale by the one under construction in a separate
+worktree, and telemetry wiring belongs in the example that survives rather than
+being written twice. What that wiring has to do is not lost — the ordering
+contract is below, and `tests/observability/otlp_wire` builds all three providers
+and asserts their export on the wire, which makes it a working reference for the
+port.
 
-`opentelemetry`, `opentelemetry_sdk`, and `opentelemetry-otlp` are dependencies
-of `apps/axum-outbox`. No `crates/` manifest gained any of them. The workspace
-`opentelemetry_sdk` entry no longer carries the `testing` feature; the
-observability suite adds it locally.
+Exporter dependencies remain confined to `apps/` and `tests/`; on this branch
+that means `tests/` alone. No `crates/` manifest carries an SDK or an exporter.
 
 ## Metric Provider Ordering Contract
 
@@ -408,3 +404,34 @@ Each carries `messaging.system`, `messaging.destination.name`, and
 The consumer links rather than parents because it polls a batch that may hold
 records from many unrelated traces. `kafkaman.dispatch` parents rather than
 links, because by then exactly one row has been claimed.
+
+## Lifecycle Success Events Move Into The Publish Span
+
+**Changed 2026-08-25 (Phase 3).** Sampled per-message success events
+(`lifecycle = "per-message"` with a non-zero `sample_success`) were emitted from
+the relay loop after each cycle, outside any span. They are now emitted per row,
+inside that row's `kafkaman.relay.publish` span, with the span's OpenTelemetry
+context attached.
+
+The rate is unchanged: `LifecycleSampler` still emits every n-th success and its
+count still carries across cycles. What changes is that each event is now
+attributable to the message it describes and carries `trace_id`/`span_id`, which
+is the log-to-trace pivot the setting exists for. An event that cannot be traced
+back to its message is a line in a log file.
+
+`kafkaman-core` adds `attach` and `TraceScope` for this. **The reason it is
+needed is an ecosystem detail worth knowing**: `opentelemetry-appender-tracing`
+stamps a log record from the *OpenTelemetry* context current at emission, and
+does not read the `tracing` span stack. `tracing-opentelemetry` bridges spans
+without attaching them to the OpenTelemetry context, so a `tracing` event inside
+a `tracing` span reaches the log signal with no trace ids unless something
+attaches them. `attach` is that something, and it is scoped so the guard never
+crosses an `await`.
+
+An adopter emitting their own events inside kafkaman's spans — a dispatch
+handler, say — hits the same gap and can use the same call. The receive-side
+lifecycle event is still emitted from the dispatcher loop and is **not**
+correlated, because the `kafkaman.dispatch` span closes inside `dispatch_once`
+before the loop sees the stats; closing that gap means moving the sampler into
+`kafkaman-sqlx` or widening `DispatchStats`, and neither is worth doing before
+someone wants it.

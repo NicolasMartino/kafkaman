@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use kafkaman_core::{MarkOutcome, RelayConfig, RelayStats};
+use kafkaman_core::{LifecycleSampler, MarkOutcome, RelayConfig, RelayStats};
 use kafkaman_sqlx::{claim_batch, mark_publish_failed, mark_published, OutboxTable};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -22,22 +22,28 @@ pub async fn relay_once<P: Publisher>(
     table: &OutboxTable,
     cfg: &RelayConfig,
 ) -> Result<RelayStats> {
-    relay_once_inner(pool, publisher, table, cfg, None).await
+    relay_once_inner(pool, publisher, table, cfg, None, None).await
 }
 
 /// The body of [`relay_once`], with the loop's instruments threaded in.
 ///
-/// `metrics` is `None` when the public helper is called directly, which is how
-/// the scheduler counters stay out of a deployment's series when a test drives
-/// one cycle by hand — the same reason `relay_stats` lives on the loop rather
-/// than here. The per-publish latencies can only be measured inside this
-/// function, so they travel the same way rather than getting a second mechanism.
+/// `metrics` and `lifecycle` are `None` when the public helper is called
+/// directly, which is how the scheduler counters stay out of a deployment's
+/// series when a test drives one cycle by hand — the same reason `relay_stats`
+/// lives on the loop rather than here. The per-publish latencies and the
+/// per-message success events can only be produced inside this function, so they
+/// travel the same way rather than getting a second mechanism.
+///
+/// The sampler is borrowed mutably because its count carries across cycles:
+/// sampling one in ten successes has to mean one in ten over the stream, not one
+/// per batch that happens to contain ten.
 async fn relay_once_inner<P: Publisher>(
     pool: &PgPool,
     publisher: &P,
     table: &OutboxTable,
     cfg: &RelayConfig,
     metrics: Option<&RelayMetrics>,
+    mut lifecycle: Option<&mut LifecycleSampler>,
 ) -> Result<RelayStats> {
     cfg.validate()?;
 
@@ -79,7 +85,7 @@ async fn relay_once_inner<P: Publisher>(
         // Instrumented rather than entered: the publish awaits, and a span guard
         // held across an await attributes whatever else the runtime schedules on
         // this thread to this message.
-        let published = publisher.publish(&row).instrument(span).await;
+        let published = publisher.publish(&row).instrument(span.clone()).await;
         if let Some(metrics) = metrics {
             let outcome = if published.is_ok() {
                 "published"
@@ -120,7 +126,25 @@ async fn relay_once_inner<P: Publisher>(
         };
 
         match outcome {
-            MarkOutcome::Updated => {}
+            MarkOutcome::Updated => {
+                // Emitted here, per row, rather than per cycle from the loop —
+                // and inside the row's span. An event about one message that
+                // cannot be traced back to that message is a line in a log file;
+                // one that can is the pivot `sample_success` exists to provide.
+                if let Some(sampler) = lifecycle.as_deref_mut() {
+                    if sampler.take(1) > 0 {
+                        // Attached, not merely parented: the log appender stamps
+                        // records from the OpenTelemetry context, which the
+                        // `tracing` span stack does not set on its own.
+                        let _scope = kafkaman_core::attach(&span);
+                        tracing::info!(
+                            parent: &span,
+                            message_type = table.descriptor.message_type.as_str(),
+                            "outbox message published"
+                        );
+                    }
+                }
+            }
             MarkOutcome::StaleClaim => stats.stale += 1,
             MarkOutcome::Missing => stats.missing += 1,
         }
@@ -166,7 +190,16 @@ pub async fn run<P: Publisher>(
             break;
         }
 
-        match relay_once_inner(&pool, &publisher, &table, &cfg, Some(&metrics)).await {
+        match relay_once_inner(
+            &pool,
+            &publisher,
+            &table,
+            &cfg,
+            Some(&metrics),
+            Some(&mut lifecycle),
+        )
+        .await
+        {
             Ok(stats) => {
                 metrics.relay_stats(&stats);
                 if stats.claimed > 0 {
@@ -177,16 +210,6 @@ pub async fn run<P: Publisher>(
                         stale = stats.stale,
                         missing = stats.missing,
                         "relay cycle complete"
-                    );
-                }
-                // Per-message success events are opt-in and sampled: a healthy
-                // relay publishes continuously, so emitting one line per message
-                // is the difference between a log an operator reads and a log
-                // that costs more than the messages.
-                for _ in 0..lifecycle.take(stats.published) {
-                    tracing::info!(
-                        message_type = table.descriptor.message_type.as_str(),
-                        "outbox message published"
                     );
                 }
             }

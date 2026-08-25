@@ -1,7 +1,7 @@
 # OpenTelemetry Completion Plan
 
 - Document Class: Plan
-- Status: Active
+- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25; Phase 4's compose profile deferred to the incoming example
 - Date: 2026-08-25
 - Category: Observability execution
 - Scope: Turns M6's OpenTelemetry instrumentation into a working, verified, exportable telemetry pipeline — metrics, traces, and logs — and proves it end to end against a real backend.
@@ -83,17 +83,21 @@ services, and logs that pivot to those traces by `trace_id`.
 ## Phase 0 — Make Instruments Observable At All
 
 **Completed 2026-08-25.** Steps 1-4 landed in `otel phase 0: own metric
-instruments per loop`; step 5 in the example-wiring commit that follows it. The
-exit criterion is met and pinned by three tests:
-`tests/observability/provider_ordering` (a provider installed after a relay has
-run still collects), `axum-outbox`'s `telemetry_export` (the example's pipeline
-posts OTLP/HTTP protobuf to a real socket), and its `telemetry` unit tests
-(endpoint precedence, and construction inside a Tokio runtime). Two deviations
-from the text below, both recorded in the log entry: instrument construction is
-owned by whatever owns the instrument rather than by the loop alone — the
-publisher binds at construction, which widens the host contract — and the example
-installs no provider when no OTLP endpoint is configured, rather than always
-installing one.
+instruments per loop`. Step 5 — wiring the example — was prototyped in
+`apps/axum-outbox` and then reverted: that example is being replaced wholesale by
+the one under construction in a separate worktree, and telemetry wiring belongs
+in the example that survives. Its purpose is served instead by
+`tests/observability/otlp_wire`, which builds all three providers in a real
+process and asserts the export on the wire; the reasoning that step 5 was meant
+to force — that a host installs its pipeline before anything kafkaman builds — is
+pinned by `tests/observability/provider_ordering`, which runs a relay *before*
+installing an SDK and asserts the second run still collects.
+
+Two deviations from the text below, both recorded in the log entry: instrument
+construction is owned by whatever owns the instrument rather than by the loop
+alone — the publisher binds at construction, which widens the host contract — and
+a host with no OTLP endpoint configured should install no provider at all rather
+than export into a closed port.
 
 **The defect this phase fixes.** `worker_metrics()` and `kafka_metrics()` cache
 their `Counter` handles in a process-wide `OnceLock`, built from
@@ -289,25 +293,28 @@ work, which is what `sample_success` was for.
 
 ## Phase 4 — Wiring And Example
 
-**Partially completed 2026-08-25; the compose half is deferred, and the example
-half is about to move.** Steps 1 and 2 are done: no exporter appears in any
-`crates/` manifest, and the example installs all three signals with a shutdown
-that flushes each. Step 4 stands — no `kafkaman-otel` crate.
+**Steps 1 and 4 are done; steps 2 and 3 belong to the incoming example.** No
+exporter appears in any `crates/` manifest — on this branch they are confined to
+`tests/` alone — and step 4 stands: no `kafkaman-otel` crate, because pinning
+adopters to our choice of exporter versions is a real cost in an ecosystem that
+releases breaking 0.x versions in lockstep.
 
-Step 3, the Elasticsearch/Kibana compose profile, is **not done and should not be
-done here**. It was written to extend `examples/compose.yaml` from the
-two-service example, which does not exist on this branch. More decisively, the
-`apps/axum-outbox` example that currently carries the host wiring is being
-replaced by the example under construction in a separate worktree, so compose
-files and wiring written against it now would be written twice. The host-side
-pipeline in `apps/axum-outbox/src/telemetry.rs` is a working reference for that
-port: metrics, traces, and logs over OTLP/HTTP, installed before any kafkaman
-component, flushed on the drain path, and proved end to end by
-`apps/axum-outbox/tests/telemetry_export.rs`.
+Steps 2 and 3 — the example's own pipeline, and the Elasticsearch/Kibana compose
+profile — are **deliberately not done here**. The compose profile was written to
+extend `examples/compose.yaml` from the two-service example, which is not on this
+branch, and `apps/axum-outbox` is being replaced wholesale by the example under
+construction in a separate worktree. Wiring and compose files written against a
+directory that is about to be deleted would be written twice.
+
+`tests/observability/otlp_wire` is the working reference for that port: it builds
+a `MeterProvider`, a `TracerProvider`, and a `LoggerProvider` over OTLP/HTTP,
+installs the subscriber that bridges `tracing` into both traces and logs, runs a
+real relay loop, flushes all three on shutdown, and asserts kafkaman's own
+instrument names, span names, and log lines on the wire.
 
 
-1. **No exporter in a library crate.** `opentelemetry-otlp` appears in
-   `apps/axum-outbox` and in the test suite. Never in `crates/`.
+1. **No exporter in a library crate.** `opentelemetry-otlp` appears in the test
+   suite, and in whichever application ships as the example. Never in `crates/`.
 2. **Complete the example's pipeline.** Phase 0 step 5 already installed a
    metrics-only provider; this adds the tracer provider and the log appender
    beside it, and extends the shutdown flush to all three. The drain path already
@@ -332,6 +339,22 @@ component, flushed on the drain path, and proved end to end by
 **Exit:** `docker compose up`, then kafkaman telemetry is visible in Kibana.
 
 ## Phase 5 — The Test Suite
+
+**Completed 2026-08-25.** Every binary the table below names exists, plus five
+the plan did not anticipate. `metrics_disabled` is the one exception, and it is
+covered differently: a test binary cannot assert a `--no-default-features` build
+from inside a default build, so `just lint` now runs
+`cargo check -p kafkaman --no-default-features` and the no-op twins are compiled
+by the same gate as everything else.
+
+The unanticipated binaries, each of which exists because a property turned out to
+need pinning: `single_cycle_silence` (the public `relay_once` records nothing),
+`queue_gauge_staleness` (an async gauge republishes its last value, so staleness
+is a series rather than a gap), `trace_absent` and `trace_root_enqueue` (the two
+different meanings of "no trace context"), and `otlp_wire` (kafkaman's telemetry
+asserted on the wire in all three signals, moved here from the example so the
+proof does not depend on which example currently ships).
+
 
 `tests/observability/` as a sibling workspace member, mirroring `durable-send`'s
 layout: a shared `src/` harness, one `tests/<concern>/main.rs` per binary.
@@ -358,25 +381,40 @@ than an expectation.
 
 ## Phase 6 — Documentation
 
+**Completed 2026-08-25**, except the deployment procedure, which is deferred with
+the compose profile it documents.
+
+
 - ~~Decision page: metric semantic conventions and attribute schema.~~ Filed
   2026-08-25 as
   `wiki/decisions/metric-instrument-and-attribute-schema.decision.md`.
 - ~~Decision page: W3C trace headers as a third header namespace.~~ Filed
   2026-08-25 as
   `wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`.
-- **Deferred until the stack runs:** a reference page documenting the Elastic
-  deployment as a procedure — compose invocation, Kibana setup, dashboard
-  import, troubleshooting. The two-service example it extends is mid-merge with
-  unresolved conflicts and cannot currently build, so run instructions written
-  now would be unverifiable. The *design* is captured in the backend decision;
-  the *procedure* is filed once it has been executed.
-- Update `wiki/specs/m6-observability-operability.spec.md`: it currently
-  describes metrics as delivered without recording that no pipeline exists.
-- Compatibility note: the new outbox column, the header namespace change, the
-  instrument additions, and the provider-ordering contract.
-- `kafkaman.example.toml`: the three `[observability]` fields currently marked
-  **reserved** — `level`, `payload`, `headers` — should be re-examined here. Two
-  of them are log-content questions that Phase 3 makes answerable.
+- **Still deferred, and for a second reason now:** a reference page documenting
+  the Elastic deployment as a procedure — compose invocation, Kibana setup,
+  dashboard import, troubleshooting. The two-service example it extends is
+  mid-merge, and the `apps/axum-outbox` example that briefly carried the host
+  wiring has been reverted to its `main` state because it is being replaced
+  wholesale by the example under construction in a separate worktree. Telemetry
+  wiring belongs in the example that survives, and the procedure is filed once it
+  has been executed there.
+- ~~Update `wiki/specs/m6-observability-operability.spec.md`: it currently
+  describes metrics as delivered without recording that no pipeline exists.~~
+  Done 2026-08-25. The spec now records that M6 shipped instrumentation rather
+  than a pipeline, names the two statements that became wrong rather than merely
+  partial, and points at the compatibility note for the current surface.
+- ~~Compatibility note: the new outbox column, the header namespace change, the
+  instrument additions, and the provider-ordering contract.~~ Done, across four
+  sections: the provider-ordering contract, the metric schedule, the queue
+  metrics loop, and the trace-context schema/API/wire format.
+- ~~`kafkaman.example.toml`: the three `[observability]` fields currently marked
+  **reserved** — `level`, `payload`, `headers` — should be re-examined here.~~
+  Re-examined 2026-08-25 and **left reserved**, with the reasoning recorded in
+  the M6 spec's Limitations so it is not re-opened: `level` would duplicate and
+  fight the host subscriber's filter, and `payload`/`headers` still have nothing
+  to govern — the metric-schema decision forbids deriving any attribute from
+  message content, which makes the reserved answer permanent on that surface.
 
 ## Sequencing
 

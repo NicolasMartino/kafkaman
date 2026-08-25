@@ -608,9 +608,12 @@ durable entity propagation ledger and local cache store.
   observable queue-depth gauges behind a sampler loop, semconv messaging
   attributes, and five `tests/observability` binaries. Phases 2 and 3 followed:
   W3C trace context persisted on outbox *and* received rows through an additive
-  migration, four kafkaman spans, a third Kafka header namespace, and an OTel log
-  bridge in the example. Phase 4's compose profile is deferred — the example that
-  would carry it is being replaced. Status: Active.
+  migration, four kafkaman spans, a third Kafka header namespace, and sampled
+  success events emitted inside the publish span so they carry the trace they
+  belong to. Phases 5 and 6 followed: twelve `tests/observability` binaries
+  including an OTLP export asserted on the wire, and the M6 spec corrected.
+  Phase 4's compose profile is deferred — the example that would carry it is
+  being replaced. Status: Active.
 - [plans/first-poc-outbox-publisher.plan.md](plans/first-poc-outbox-publisher.plan.md)
   - Smallest durable-send slice: per-type outbox table, minimal `migrate()`,
   claim-lease relay, publisher, Axum example, and crash/idempotency gates. Status:

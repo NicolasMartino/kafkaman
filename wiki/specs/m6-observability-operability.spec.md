@@ -99,6 +99,25 @@ Labels are low-cardinality: scheduler, message type, topic, status, outcome, and
 reason. kafkaman still emits `tracing` events/spans but does not install a
 subscriber or exporter.
 
+**Superseded in part, 2026-08-25.** What M6 shipped was OpenTelemetry
+*instrumentation*, not an OpenTelemetry *pipeline*: no `opentelemetry_sdk`
+existed anywhere in the workspace, so every counter above resolved to the no-op
+provider in every build and every test, and nothing had ever observed one. That
+is closed. The current surface — counters, latency histograms, observable
+queue-depth gauges, four spans, and trace-correlated log records — is recorded in
+`wiki/compatibility/m6-observability-operability-api.compat.md` and pinned by
+`tests/observability/`, including an OTLP export asserted on the wire. The
+sections above describe the M6 subset and remain accurate about it; they are no
+longer the whole picture.
+
+Two M6 statements are now wrong rather than merely partial. Instruments are no
+longer cached process-wide — they are built by the loop or component that owns
+them, because an instrument binds permanently to whichever provider is installed
+when it is created. And the debug assertion behind the ingest partition is no
+longer the only thing enforcing it: `tests/observability/ingest_disjointness`
+asserts it against real ingest cycles through a real broker, in a build where
+`debug_assert` is compiled out.
+
 Metric attributes are built once per run loop rather than per record, so an idle
 scheduler does not allocate its message type on every poll.
 
@@ -261,6 +280,24 @@ host subscriber's job — an `EnvFilter` directive on the `kafkaman` targets —
 no kafkaman code path emits payload bodies or arbitrary user headers, so
 `payload`/`headers` are `off` in effect whatever they are set to. They are
 accepted now so adding a redaction hook later is not a breaking config change.
+
+**Re-examined 2026-08-25, after the log signal landed, and left reserved.** The
+question was whether an OTel log appender makes any of the three live. It does
+not, and the reasoning is worth recording so it is not re-opened by the next
+person to notice them:
+
+- `level` would duplicate the host's filter. A subscriber already decides which
+  events are recorded, per target, before kafkaman is consulted; a second
+  threshold inside the library would fight it, and the loser would be whichever
+  an operator did not expect. If kafkaman ever needs its own, the honest form is
+  a `Filtered` layer the host installs, not a config key.
+- `payload` and `headers` still have nothing to govern. No path emits either, and
+  the metric-schema decision forbids deriving any attribute from message content
+  — payload, user headers, or entity keys — which makes the reserved answer the
+  permanent one for the metric surface and the default one for the log surface.
+
+Making any of them live would be a behavior change to a parsed, validated config
+key, which is exactly what reserving them was meant to avoid.
 
 Queue age and stuck thresholds are available through resolved config and route
 behavior, but M6 does not add asynchronous gauge callbacks that periodically

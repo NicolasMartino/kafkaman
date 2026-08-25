@@ -97,6 +97,17 @@ fn is_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// A scope in which log records are stamped with a span's trace ids.
+///
+/// Restores the previous context when dropped. Never held across an `await`:
+/// the underlying guard is `!Send`, and a context that outlives its scope
+/// attributes unrelated work to the wrong trace.
+#[derive(Debug)]
+pub struct TraceScope {
+    #[cfg(feature = "traces")]
+    _guard: Option<opentelemetry::ContextGuard>,
+}
+
 #[cfg(feature = "traces")]
 mod enabled {
     use std::str::FromStr;
@@ -155,6 +166,30 @@ mod enabled {
         span.add_link(span_context);
     }
 
+    /// Attach a `tracing` span's OpenTelemetry context for the current scope.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// `opentelemetry-appender-tracing` stamps a log record with the trace and
+    /// span ids of the *OpenTelemetry* context that is current when the event is
+    /// emitted. It does not read the `tracing` span stack — the two are separate
+    /// stacks, and `tracing-opentelemetry` bridges spans without attaching them
+    /// to the OpenTelemetry one.
+    ///
+    /// So an event emitted inside a `tracing` span reaches the log signal with
+    /// no trace context unless something attaches it, and a log record that
+    /// cannot be pivoted into its trace has lost the property that made
+    /// exporting it worthwhile. This is that something.
+    pub fn attach(span: &tracing::Span) -> super::TraceScope {
+        super::TraceScope {
+            _guard: span_context_of(span).map(|span_context| {
+                opentelemetry::Context::new()
+                    .with_remote_span_context(span_context)
+                    .attach()
+            }),
+        }
+    }
+
     /// The OpenTelemetry context of a `tracing` span, if it has a valid one.
     fn span_context_of(span: &tracing::Span) -> Option<SpanContext> {
         let context = span.context();
@@ -206,13 +241,17 @@ mod disabled {
     pub fn set_parent(_span: &tracing::Span, _context: &TraceContext) {}
 
     pub fn add_link(_span: &tracing::Span, _context: &TraceContext) {}
+
+    pub fn attach(_span: &tracing::Span) -> super::TraceScope {
+        super::TraceScope {}
+    }
 }
 
 #[cfg(feature = "traces")]
-pub use enabled::{add_link, capture as capture_trace_context, set_parent};
+pub use enabled::{add_link, attach, capture as capture_trace_context, set_parent};
 
 #[cfg(not(feature = "traces"))]
-pub use disabled::{add_link, capture as capture_trace_context, set_parent};
+pub use disabled::{add_link, attach, capture as capture_trace_context, set_parent};
 
 #[cfg(test)]
 mod tests {
