@@ -98,6 +98,29 @@ The first run compiles librdkafka from source and takes a few minutes; later
 ones reuse the build cache. The stack stays up afterwards so you can poke at it
 on `:3001` (order) and `:3002` (product). `just examples down` tears it down.
 
+**With OpenTelemetry export**, add Elasticsearch and Kibana:
+
+```bash
+just examples observe
+```
+
+That is the same service stack plus the `observability` compose profile. The
+services export OTLP/HTTP directly to Elasticsearch at
+`http://elasticsearch:9200/_otlp`, and the Rust exporter appends
+`/v1/metrics`, `/v1/traces`, and `/v1/logs`. The plain `demo` path pins
+`OTEL_EXPORTER_OTLP_ENDPOINT` to the empty string, so the binaries install no
+provider and do not log failed exports into a backend that is not running — and
+so that a value you export for your own tooling is not inherited by containers
+where it would point somewhere else.
+
+Export is **plaintext HTTP only**. The workspace pins `opentelemetry-otlp` to
+its blocking `reqwest` client, which resolves without a TLS backend, and the
+runtime image carries no `ca-certificates`; an `https://` endpoint fails at run
+time with nothing failing at build time. A real deployment swaps in the
+exporter's `reqwest-rustls-client` feature and adds a root store to the image.
+The pipeline itself lives in `examples/telemetry`, shared by both binaries and
+written out in full so it can be copied rather than inferred.
+
 **Infrastructure only**, when you are working on the services themselves and
 want a normal `cargo` loop:
 
@@ -192,6 +215,20 @@ Topics → `products` / `orders` shows the actual snapshots the two services
 exchange, one record per entity key, and the offsets that
 `GET /products/{id}` reports back as `applied_offset`. It is behind its own
 profile, so neither `just examples up` nor `just examples demo` pays for it unasked.
+
+For telemetry, `just examples observe` adds Kibana on
+<http://127.0.0.1:5601>. Elasticsearch needs noticeably more memory than the
+plain stack; override `ES_JAVA_OPTS` if Docker Desktop is tight on RAM, and use
+`KIBANA_PORT` or `ELASTICSEARCH_PORT` if the defaults are already bound.
+`ELASTIC_VERSION` moves both images together, with 9.2 as the floor — the native
+`/_otlp` endpoint does not exist before it, and an older tag shows up as 404s
+from the exporter rather than as anything compose reports.
+
+Kibana opens **empty**: no data view for the kafkaman signals ships yet, and
+neither does a dashboard. Create one over the indices Elasticsearch's OTLP
+endpoint writes to and the metrics, spans, and correlated logs are there.
+Packaging that view is tracked in
+`wiki/plans/opentelemetry-completion.plan.md`.
 
 Walk the lifecycle:
 

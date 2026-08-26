@@ -187,8 +187,26 @@ convergence exit criterion.
 - **Delivers:** runtime observability config with per-message overrides,
   `tracing` spans/events, direct OpenTelemetry metrics, queue depth/age
   inspection, stuck-row detection, sanitized DLQ inspection and bounded redrive,
-  the `kafkaman-axum` admin/health routes, `CorrelationLayer`, and the
-  `serve().with_runtime()` shutdown helper.
+  the `kafkaman-axum` read-only admin/health routes and the separate
+  `redrive_router`, `CorrelationLayer`, and the `serve().with_runtime()` shutdown
+  helper.
+
+  **Extended 2026-08-26 (OpenTelemetry completion).** What M6 closed out was
+  OpenTelemetry *instrumentation* against a no-op provider. The pipeline that
+  makes it observable — exporters, spans across both durable gaps, trace-correlated
+  logs, observable queue-depth gauges, and `tests/observability` — landed
+  afterwards on `implementation/m6-observability`, then through three review
+  passes. The third's most consequential finding was not in the pipeline at all:
+  the additive changeset written in response to the *first* review added the DLQ's
+  failure columns without filling them, leaving every pre-existing dead letter
+  visible in `/dlq` and unreachable by the filter that renders it. It now
+  backfills. See
+  [opentelemetry-completion.plan.md](../plans/opentelemetry-completion.plan.md).
+
+  Two items remain, both deliberately deferred rather than dropped: Phase 4's
+  Elasticsearch/Kibana compose profile and the Elastic deployment reference page.
+  Both belong to the two-service example under construction, not to
+  `apps/axum-outbox`, which that example replaces.
 - **Realizes:** runtime-composition (request-path layers/routes + shutdown helper).
 - **Exit:** completed. An operator can see queue depth/age, inspect/redrive the
   received DLQ, and detect expired outbox claims or overdue received rows.

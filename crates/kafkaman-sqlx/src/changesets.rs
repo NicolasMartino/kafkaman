@@ -3,9 +3,10 @@ use kafkaman_core::MessageDescriptor;
 use crate::changeset::{ChangeBuilder, Changeset};
 use crate::schema_sql::{
     add_idempotency_key_sql, add_idempotency_source_sql, add_outbox_entity_key_sql,
-    add_outbox_trace_context_sql, add_received_entity_key_sql, add_received_trace_context_sql,
-    create_cache_table_sql, create_outbox_entity_state_index_sql,
-    create_outbox_retention_index_sql, create_outbox_state_index_sql, create_outbox_table_sql,
+    add_outbox_trace_context_sql, add_received_entity_key_sql, add_received_failure_metadata_sql,
+    add_received_trace_context_sql, backfill_received_failure_metadata_sql, create_cache_table_sql,
+    create_outbox_entity_state_index_sql, create_outbox_retention_index_sql,
+    create_outbox_state_index_sql, create_outbox_table_sql, create_received_failed_index_sql,
     create_received_idempotency_index_sql, create_received_state_index_sql,
     create_received_table_sql,
 };
@@ -117,14 +118,15 @@ descriptor_changeset! {
 }
 
 descriptor_changeset! {
-    /// Create a message type's received table, its dedupe index, and its claim
-    /// index.
+    /// Create a message type's received table, its dedupe index, its claim
+    /// index, and the partial index the DLQ views read.
     CreateReceivedTable => "create_received_table",
     |cfg, descriptor, builder| {
         let table = ReceivedTable::new(cfg.schema.clone(), descriptor)?;
         builder.push(create_received_table_sql(&table));
         builder.push(create_received_idempotency_index_sql(&table));
         builder.push(create_received_state_index_sql(&table));
+        builder.push(create_received_failed_index_sql(&table));
     }
 }
 
@@ -229,5 +231,60 @@ descriptor_changeset! {
         for statement in add_received_trace_context_sql(&table) {
             builder.push(statement);
         }
+    }
+}
+
+descriptor_changeset! {
+    /// Additive changeset bringing a received table created before dispatch
+    /// recorded *why* a row last failed up to the current shape. Fresh tables
+    /// already have both columns from [`create_received_table_sql`], so the
+    /// statements are no-ops there; include it in a changelog only to upgrade
+    /// pre-existing tables.
+    ///
+    /// Unlike the other additive changesets here, this one is not optional for a
+    /// table that predates it: `last_failed_at` and `last_failure_kind` are read
+    /// by the DLQ inspection queries and written by every failed dispatch, so a
+    /// table missing them fails those statements outright rather than degrading.
+    ///
+    /// The columns arrive populated. Adding them empty would leave every
+    /// pre-existing dead letter visible in `/dlq` — which renders the last audit
+    /// entry — and invisible to every filter, since those read the columns:
+    /// a redrive narrowed to the kind an operator can see would match nothing
+    /// and report success. [`backfill_received_failure_metadata_sql`] projects
+    /// both values back out of the `errors` audit trail they were always a
+    /// projection of, so the two views agree. A row whose newest entry names a
+    /// failure kind this binary does not know keeps `NULL` rather than being
+    /// guessed at.
+    AddReceivedFailureMetadata => "add_received_failure_metadata",
+    |cfg, descriptor, builder| {
+        let table = ReceivedTable::new(cfg.schema.clone(), descriptor)?;
+        for statement in add_received_failure_metadata_sql(&table) {
+            builder.push(statement);
+        }
+        for statement in backfill_received_failure_metadata_sql(&table) {
+            builder.push(statement);
+        }
+    }
+}
+
+descriptor_changeset! {
+    /// Additive changeset adding the DLQ index to a received table created
+    /// before it existed. Fresh tables get it from [`CreateReceivedTable`].
+    ///
+    /// Note for adopters, the same one [`AddOutboxRetentionIndex`] carries:
+    /// changesets apply inside a transaction, so this builds the index
+    /// non-concurrently and blocks writes on the table while it runs. On a
+    /// received table large enough to want the index, that is a real window in
+    /// which ingest cannot insert.
+    ///
+    /// Ordered after [`AddReceivedFailureMetadata`] in any changelog that needs
+    /// both: the index keys on `last_failed_at` and `last_failure_kind`, so the
+    /// columns have to exist first — and building it after the backfill means
+    /// the index is built once, over final values, instead of being churned by
+    /// the `UPDATE` that follows it.
+    AddReceivedFailedIndex => "add_received_failed_index",
+    |cfg, descriptor, builder| {
+        let table = ReceivedTable::new(cfg.schema.clone(), descriptor)?;
+        builder.push(create_received_failed_index_sql(&table));
     }
 }

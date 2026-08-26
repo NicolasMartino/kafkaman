@@ -728,6 +728,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "example-contracts",
+ "example-telemetry",
  "kafkaman",
  "serde",
  "serde_json",
@@ -737,7 +738,6 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
- "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -749,6 +749,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "example-contracts",
+ "example-telemetry",
  "kafkaman",
  "serde",
  "serde_json",
@@ -759,7 +760,6 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
- "tracing-subscriber",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -775,6 +775,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "example-telemetry"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -1473,6 +1486,7 @@ dependencies = [
 name = "kafkaman"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "kafkaman-axum",
  "kafkaman-config",
  "kafkaman-core",
@@ -1897,10 +1911,13 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
+ "prost",
  "rdkafka",
  "reqwest 0.13.4",
  "serde_json",
+ "sqlx",
  "time",
  "tokio",
  "tokio-util",
@@ -3621,10 +3638,8 @@ checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
 dependencies = [
  "js-sys",
  "opentelemetry",
- "smallvec",
  "tracing",
  "tracing-core",
- "tracing-log",
  "tracing-subscriber",
  "web-time",
 ]

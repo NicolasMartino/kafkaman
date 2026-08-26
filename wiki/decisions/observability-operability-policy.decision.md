@@ -107,13 +107,33 @@ validated config object, but both are semver-sensitive for downstream code
 constructing the public structs directly. `run_dispatcher` and the two status
 summary functions also gained parameters; see the compatibility note.
 
-Lifecycle sampling is deterministic (every `n`-th success) rather than random.
-That makes the rate exact over any window and keeps an RNG dependency out of the
-worker, at the cost of being predictable — acceptable because this selects log
-lines, not security material.
+Lifecycle sampling is deterministic and proportional rather than random: after
+`N` successes exactly `⌊N × sample_success⌋` events have been emitted — the count
+never runs ahead of the rate and never falls a whole event behind it. That makes
+the rate exact over any window and keeps an RNG dependency out of the worker, at
+the cost of being predictable — acceptable because this selects log lines, not
+security material.
+
+**Corrected 2026-08-26.** This paragraph read "every `n`-th success", which was
+both the wording and the implementation, and it silently rounded the operator's
+rate to the nearest reciprocal — `0.75` emitted every success. The property to
+state is the proportion, not the stride.
 
 The new Axum surface is opt-in. Applications not enabling the `axum` feature do
-not build the admin route or middleware dependency path.
+not build the admin route or middleware dependency path. Within it the read-only
+routes and the destructive redrive route are separate routers, so mounting a
+dashboard cannot hand out a re-enqueue endpoint by accident.
+
+**Operability has a migration surface, and it is not all optional.** The DLQ
+inspection and redrive routes read `last_failed_at` and `last_failure_kind` and
+order by the first. A received table created before those columns existed does
+not degrade on these routes — it raises, on the path an operator reaches for
+during an incident. `AddReceivedFailureMetadata` is therefore a required
+changeset for such a table rather than an optional one, unlike every other
+additive changeset kafkaman ships. `AddReceivedFailedIndex` beside it is a
+performance change and genuinely optional, with the usual caveat that a changeset
+builds its index inside a transaction and blocks writes while it does. See the
+compatibility note.
 
 ## Revisit Triggers
 

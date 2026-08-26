@@ -8,6 +8,11 @@
 #       The above plus the provisioner and both services, built from
 #       examples/Dockerfile. One command, nothing else installed.
 #
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp \
+#   docker compose -f examples/compose.yaml --profile services --profile observability up -d --wait
+#       The service stack plus Elasticsearch and Kibana. Elasticsearch's native
+#       OTLP endpoint is HTTP-only; the Rust exporter appends /v1/{signal}.
+#
 # `just examples up`, `just examples demo`, and `just examples down` wrap these.
 #
 # The `services` profile carries a one-shot `provision` container that both
@@ -123,6 +128,60 @@ services:
       redpanda:
         condition: service_healthy
 
+  # Elasticsearch and Kibana are the reference telemetry backend for the
+  # example, not a dependency of the propagation demo itself. They stay behind a
+  # profile because Elasticsearch wants real memory and a user should not have
+  # to run it just to see two services exchange snapshots.
+  #
+  # The services export directly to Elasticsearch's native OTLP/HTTP endpoint:
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp. Do not point the
+  # Rust exporter at port 4317 or 4318 here; there is no collector in this
+  # example topology, and Elasticsearch's endpoint lives on its HTTP port.
+  elasticsearch:
+    profiles: ["observability"]
+    # 9.2 is the floor, not a preference: the native `/_otlp` endpoint the
+    # services export to does not exist before it, and an older tag fails as
+    # 404s from the exporter rather than as anything compose reports.
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-9.3.5}
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.apm_data.enabled: "true"
+      # A self-generated trial expires 30 days after the volume is first
+      # created, and the stack then refuses trial-tier features rather than
+      # saying why. `just examples down` takes the volume with it, which resets
+      # the clock; a long-lived stack wants `basic` and whatever subset of the
+      # APM UI that leaves.
+      xpack.license.self_generated.type: trial
+      ES_JAVA_OPTS: ${ES_JAVA_OPTS:--Xms1g -Xmx1g}
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  kibana:
+    profiles: ["observability"]
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION:-9.3.5}
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "${KIBANA_PORT:-5601}:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:5601/api/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
   # Builds what the services boot into: one database each, and the entity
   # topics they exchange.
   #
@@ -177,6 +236,10 @@ services:
       # silently idles while still reporting healthy.
       BIND_ADDR: 0.0.0.0:3002
       KAFKA_CONSUMER_GROUP: product-service
+      # Blank by default, intentionally. The binary treats blank exactly like
+      # unset and installs no OTel provider, so the plain services profile does
+      # not spam exporter errors into a backend that is not running.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "3002:3002"
@@ -186,6 +249,16 @@ services:
       # server that is listening.
       provision:
         condition: service_completed_successfully
+      # `required: false` is what keeps this from dragging Elasticsearch into
+      # the plain `services` profile: without it compose auto-enables a
+      # depended-on profile, and `just examples demo` would start a backend it
+      # spent the whole design avoiding. With it, the dependency binds only when
+      # the `observability` profile is already active — and then it matters,
+      # because provisioning finishes in about 15s while Elasticsearch needs
+      # 30-60s, and the gap is spent logging failed exports.
+      elasticsearch:
+        condition: service_healthy
+        required: false
     healthcheck:
       # /health returns 204 and checks nothing, so this is a "process is
       # serving" signal rather than a readiness probe. It is still worth
@@ -215,7 +288,12 @@ services:
     # then SIGKILLs, and the graceful-shutdown path this example exists to
     # demonstrate never runs at all.
     stop_signal: SIGINT
-    stop_grace_period: 15s
+    # 30s rather than 15s because shutdown is now drain-then-flush: the service
+    # stops its loops, and then three batch exporters get one last export window
+    # to Elasticsearch. A loaded or GC-pausing backend can push that past 15s,
+    # and a SIGKILL there loses precisely the final telemetry the flush exists
+    # to deliver.
+    stop_grace_period: 30s
 
   order:
     profiles: ["services"]
@@ -234,6 +312,10 @@ services:
       # silently idles while still reporting healthy.
       BIND_ADDR: 0.0.0.0:3001
       KAFKA_CONSUMER_GROUP: order-service
+      # Blank by default, intentionally. The binary treats blank exactly like
+      # unset and installs no OTel provider, so the plain services profile does
+      # not spam exporter errors into a backend that is not running.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "3001:3001"
@@ -243,6 +325,16 @@ services:
       # server that is listening.
       provision:
         condition: service_completed_successfully
+      # `required: false` is what keeps this from dragging Elasticsearch into
+      # the plain `services` profile: without it compose auto-enables a
+      # depended-on profile, and `just examples demo` would start a backend it
+      # spent the whole design avoiding. With it, the dependency binds only when
+      # the `observability` profile is already active — and then it matters,
+      # because provisioning finishes in about 15s while Elasticsearch needs
+      # 30-60s, and the gap is spent logging failed exports.
+      elasticsearch:
+        condition: service_healthy
+        required: false
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:3001/health"]
       interval: 2s
@@ -251,7 +343,12 @@ services:
       start_period: 30s
     restart: on-failure:3
     stop_signal: SIGINT
-    stop_grace_period: 15s
+    # 30s rather than 15s because shutdown is now drain-then-flush: the service
+    # stops its loops, and then three batch exporters get one last export window
+    # to Elasticsearch. A loaded or GC-pausing backend can push that past 15s,
+    # and a SIGKILL there loses precisely the final telemetry the flush exists
+    # to deliver.
+    stop_grace_period: 30s
 
 # No named volumes. The stack is disposable, and leaving the data in anonymous
 # volumes means `down -v` genuinely resets it — both the Postgres data directory

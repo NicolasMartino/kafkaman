@@ -22,10 +22,6 @@ pub use kafkaman_sqlx as sqlx;
 /// The relay and dispatcher run loops.
 pub use kafkaman_worker as worker;
 
-/// Axum admin/health routes and correlation middleware, behind the `axum` feature.
-#[cfg(feature = "axum")]
-pub use kafkaman_axum as axum;
-
 /// Kafka transport, behind the `rdkafka` feature.
 ///
 /// Gated because it links librdkafka, which not every consumer wants to build;
@@ -41,13 +37,33 @@ pub use kafkaman_rdkafka as rdkafka;
 #[cfg(feature = "rdkafka")]
 pub mod runtime;
 
-/// Axum composition, behind the `axum` feature.
+/// Axum admin/health routes, correlation middleware, and runtime composition.
 ///
-/// Needs a [`Runtime`] to compose with, so it carries the `rdkafka` requirement
-/// too. Enabling `axum` alone gets you nothing, which is why the module is
-/// gated on both.
+/// A module rather than `pub use kafkaman_axum as axum`, because the runtime
+/// composition helpers below have to live in the same namespace and a crate
+/// re-export cannot be extended. It is a glob rather than a list so that a new
+/// public item in `kafkaman-axum` reaches adopters without anyone remembering to
+/// name it here.
+#[cfg(feature = "axum")]
+pub mod axum {
+    pub use kafkaman_axum::*;
+
+    /// Runtime composition: `serve(listener, router).with_runtime(rt).spawn()`.
+    ///
+    /// `serve` is deliberately explicit rather than left to the glob above.
+    /// `kafkaman-axum` exports a `serve` of its own that takes a router and
+    /// nothing else, and an explicit import shadows a glob one, so this is the
+    /// `serve` the facade offers — the composing form, which is the one an
+    /// application assembling a [`crate::Runtime`] wants. Reach for
+    /// [`kafkaman_axum::serve`] directly on the rare occasion the plain form is
+    /// what you meant.
+    #[cfg(feature = "rdkafka")]
+    pub use crate::axum_runtime::{serve, RunningService, Serve};
+}
+
 #[cfg(all(feature = "axum", feature = "rdkafka"))]
-pub mod axum;
+#[path = "axum.rs"]
+mod axum_runtime;
 
 #[cfg(feature = "rdkafka")]
 pub use runtime::{

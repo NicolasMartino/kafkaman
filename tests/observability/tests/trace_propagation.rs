@@ -1,4 +1,5 @@
-//! Whether one trace survives the two gaps kafkaman puts in the middle of it.
+//! Whether trace context survives the two gaps kafkaman puts in the middle of
+//! it, and whether the broker hop is a link rather than a continuation.
 //!
 //! # What is actually hard here
 //!
@@ -28,6 +29,11 @@
 //! The consumer links rather than parents because it polls a batch that may hold
 //! records from many unrelated traces; parenting would attach all of them to
 //! whichever trace happened to be first.
+//!
+//! So the answer is **two** traces joined by a link, not one that runs end to
+//! end, and this test asserts the trace ids differ as deliberately as it asserts
+//! the link exists. The distinction is the difference between a dashboard query
+//! that works and one that silently stops at the broker.
 #![cfg(feature = "redpanda")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -40,10 +46,11 @@ use kafkaman_sqlx::{dispatch_once, MessageRouter};
 use observability_tests::{ProductSnapshot, TestResult, TracePipeline};
 use opentelemetry::trace::TraceContextExt;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 #[tokio::test]
-async fn one_message_produces_one_connected_trace_across_both_durable_gaps() -> TestResult {
+async fn one_message_produces_two_linked_traces_across_both_durable_gaps() -> TestResult {
     let (_postgres, _redpanda, brokers, harness) = start_redpanda_harness().await?;
     let outbox_table = harness.outbox_table::<ProductSnapshot>().await?;
     let received_table = harness.received_table::<ProductSnapshot>().await?;
@@ -54,13 +61,18 @@ async fn one_message_produces_one_connected_trace_across_both_durable_gaps() -> 
     // a job runner. The point of the enqueue span is that it descends from
     // whatever the caller was doing, so the trace starts before kafkaman.
     let caller = tracing::info_span!("test.request");
-    let caller_trace_id = {
-        let _entered = caller.enter();
-        let envelope = ProductSnapshot::envelope("traced-product", "a traced product")
-            .try_with_idempotency_key("traced-product")?;
-        harness.enqueue(&envelope).await?;
-        trace_id_of(&caller)
-    };
+    let envelope = ProductSnapshot::envelope("traced-product", "a traced product")
+        .try_with_idempotency_key("traced-product")?;
+    // `.instrument` rather than a held `enter()` guard. The guard is `!Send` and
+    // an entered span left open across an `await` attributes whatever else runs
+    // on the thread to the caller's trace — the exact failure `kafkaman_core`'s
+    // `attach` documentation warns about, and a test that models the wrong
+    // pattern is a test somebody copies.
+    harness
+        .enqueue(&envelope)
+        .instrument(caller.clone())
+        .await?;
+    let caller_trace_id = trace_id_of(&caller);
 
     // Publish through a real broker, from a loop, exactly as a deployment would.
     let publisher = RdkafkaPublisher::from_brokers(&brokers)?;

@@ -14,3 +14,4 @@ mod rfc9557;
 mod rows;
 mod status;
 mod topics;
+mod trace;

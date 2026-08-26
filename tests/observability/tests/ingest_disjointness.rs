@@ -136,13 +136,39 @@ async fn ingest_outcomes_partition_the_consumed_records() -> TestResult {
         "commits must never appear as an ingest outcome"
     );
 
-    // The standard messaging attribute rides along on the Kafka-side series.
+    // The identity attributes ride along on every Kafka-side series, and the
+    // topic is the one that matters most here: without it, ingest volume and
+    // publish volume cannot be compared on the single attribute they obviously
+    // share, and an operator asking "is this topic backing up" has to map
+    // message types to topics by hand.
+    for outcome in ["inserted", "duplicate", "skipped"] {
+        let attributes = &records.point_with(&[("outcome", outcome)]).attributes;
+        assert_eq!(
+            attributes.get("messaging.destination.name"),
+            Some(&ProductSnapshot::TOPIC.to_owned()),
+            "the {outcome} series should name the topic it consumed from"
+        );
+        assert_eq!(
+            attributes.get("messaging.system"),
+            Some(&"kafka".to_owned())
+        );
+        assert_eq!(
+            attributes.get("message_type"),
+            Some(&ProductSnapshot::MESSAGE_TYPE.to_owned())
+        );
+    }
+
+    // Commits carry the same identity minus the outcome — they track consumer
+    // progress rather than record classification, which is the whole reason they
+    // are a separate instrument.
+    let commit_point = commits.point_with(&[("message_type", ProductSnapshot::MESSAGE_TYPE)]);
     assert_eq!(
-        records
-            .point_with(&[("outcome", "inserted")])
-            .attributes
-            .get("messaging.system"),
-        Some(&"kafka".to_owned())
+        commit_point.attributes.get("messaging.destination.name"),
+        Some(&ProductSnapshot::TOPIC.to_owned())
+    );
+    assert!(
+        !commit_point.attributes.contains_key("outcome"),
+        "a commit is not an ingest outcome, and must not be labelled as one"
     );
 
     Ok(())

@@ -22,7 +22,10 @@ async-trait.workspace = true
 kafkaman-core = { path = "../kafkaman-core", default-features = false }
 kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
 kafkaman-worker = { path = "../kafkaman-worker", default-features = false }
-opentelemetry = { workspace = true, optional = true }
+# Metrics only, for the same reason as `kafkaman-worker`: the publish and
+# ingest spans are built through `kafkaman-core`'s verb API, which needs no
+# OpenTelemetry type here.
+opentelemetry = { workspace = true, optional = true, features = ["metrics"] }
 opentelemetry-semantic-conventions = { workspace = true, optional = true }
 rdkafka.workspace = true
 serde.workspace = true

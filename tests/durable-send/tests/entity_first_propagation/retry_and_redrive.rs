@@ -111,7 +111,7 @@ async fn concurrent_dispatch_of_two_states_converges_to_newer() -> TestResult {
     let release_old = Arc::new(Notify::new());
     let old_started_for_handler = Arc::clone(&old_started);
     let release_old_for_handler = Arc::clone(&release_old);
-    let router = Arc::new(MessageRouter::new().handler::<ProductSnapshot>(
+    let router = Arc::new(MessageRouter::new().handler_before::<ProductSnapshot>(
         move |_conn, meta, _msg| {
             let old_started = Arc::clone(&old_started_for_handler);
             let release_old = Arc::clone(&release_old_for_handler);
@@ -120,7 +120,7 @@ async fn concurrent_dispatch_of_two_states_converges_to_newer() -> TestResult {
                     old_started.notify_one();
                     release_old.notified().await;
                 }
-                Ok(())
+                Ok(HandlerFlow::Continue)
             })
         },
     ));

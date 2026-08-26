@@ -23,37 +23,65 @@ fn required_env(name: &str, purpose: &str) -> Result<String, BoxError> {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    let database_url = required_env("DATABASE_URL", "points to this service's Postgres database")?;
-    let brokers = required_env("KAFKA_BROKERS", "points to Kafka/Redpanda")?;
-    let bind: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:3002".to_owned())
-        .parse()?;
-    let consumer_group =
-        std::env::var("KAFKA_CONSUMER_GROUP").unwrap_or_else(|_| "product-service".to_owned());
-
-    let mut service = start(ServiceOptions {
-        database_url,
-        brokers,
-        bind,
-        consumer_group,
+    // Assembled before telemetry is installed, so a missing variable or an
+    // unparseable address exits while there is still nothing to flush.
+    // `Config::discover` only walks the filesystem looking for `kafkaman.toml` —
+    // it emits no events — so nothing is lost by running it ahead of the
+    // subscriber either.
+    let options = ServiceOptions {
+        database_url: required_env("DATABASE_URL", "points to this service's Postgres database")?,
+        brokers: required_env("KAFKA_BROKERS", "points to Kafka/Redpanda")?,
+        bind: std::env::var("BIND_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:3002".to_owned())
+            .parse::<SocketAddr>()?,
+        consumer_group: std::env::var("KAFKA_CONSUMER_GROUP")
+            .unwrap_or_else(|_| "product-service".to_owned()),
+        // Discovery walks up from the current directory, which is why this
+        // binary is meant to be run from `examples/product`.
         config: Config::discover()?,
-    })
-    .await?;
+    };
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        result = service.wait() => {
-            result?;
-            return Err("a kafkaman loop exited before shutdown was requested".into());
-        }
-    }
+    // Before any kafkaman loop exists: instruments are created as each loop is
+    // built, and one created ahead of the meter provider is bound to the no-op
+    // provider for the life of the process.
+    let telemetry = example_telemetry::init("kafkaman-example-product")?;
 
-    service.shutdown().await
+    // Every way out of `run` — a boot failure, a dead loop, or Ctrl-C — comes
+    // back through here, so the flush covers all of them. A process that exits
+    // without flushing loses the telemetry explaining why it exited.
+    let result = run(options).await;
+    let telemetry_result = telemetry.shutdown();
+
+    result?;
+    telemetry_result
+}
+
+/// Own the service lifecycle, so `main` can own the telemetry lifecycle around it.
+async fn run(options: ServiceOptions) -> Result<(), BoxError> {
+    let mut service = start(options).await?;
+
+    // Supervise rather than only joining at shutdown: if a loop dies the process
+    // must stop, instead of serving requests whose effects nothing will carry.
+    //
+    // The arm below is a `match` rather than a `?`. `?` inside a `select!` arm
+    // returns from this function on the spot, skipping the drain underneath it —
+    // and with it the telemetry flush — on exactly the failure this supervision
+    // exists to report.
+    //
+    // No conversion on the error, unlike `order`: this service's `RunningService`
+    // is the hand-rolled enum in `boot.rs` and already yields `BoxError`.
+    let wait_result: Result<(), BoxError> = tokio::select! {
+        _ = tokio::signal::ctrl_c() => Ok(()),
+        result = service.wait() => match result {
+            Ok(()) => Err("a kafkaman loop exited before shutdown was requested".into()),
+            Err(err) => Err(err),
+        },
+    };
+
+    let shutdown_result = service.shutdown().await;
+
+    // The loop's own error first: the drain failing afterwards is a consequence
+    // worth logging, not the thing that went wrong.
+    wait_result?;
+    shutdown_result
 }

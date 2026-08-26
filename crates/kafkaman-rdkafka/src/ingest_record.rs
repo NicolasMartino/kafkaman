@@ -72,17 +72,23 @@ fn all_headers<H: Headers>(headers: Option<&H>) -> serde_json::Value {
 }
 
 /// One consumed record, decoded.
-///
-/// A struct rather than a tuple because the third member is easy to misread: the
-/// trace context here is the *producer's*, used to link the ingest span, and not
-/// the context stored on the received row — that one is ingest's own.
 pub(crate) struct DecodedRecord<P> {
     pub envelope: Envelope<P>,
     pub key: Option<Vec<u8>>,
-    pub producer_trace: Option<TraceContext>,
 }
 
-pub(crate) fn record_envelope<P, M>(message: &M) -> Result<DecodedRecord<P>>
+/// Decode one record's payload and reserved metadata into an [`Envelope`].
+///
+/// Takes headers the caller has already decoded rather than decoding them
+/// itself. That is not a micro-optimization: the ingest span links to the
+/// producer's trace, which lives in those headers, and the span has to be open
+/// before the decode it exists to describe. Scanning the header list once and
+/// handing the result to both is what lets the ordering be right without paying
+/// for a second pass on every record.
+pub(crate) fn record_envelope<P, M>(
+    message: &M,
+    headers: &RecordHeaders,
+) -> Result<DecodedRecord<P>>
 where
     P: KafkaMessage + DeserializeOwned,
     M: Message,
@@ -97,7 +103,6 @@ where
     let payload = message.payload().ok_or(Error::MissingPayload)?;
     let payload = serde_json::from_slice::<P>(payload)?;
     let key = message.key().map(Vec::from);
-    let headers = RecordHeaders::of(message);
 
     let mut envelope = Envelope::new(payload);
     envelope.headers = headers.user_headers();
@@ -143,20 +148,7 @@ where
         envelope.causation_id = Some(parse_uuid_header("kafkaman-causation-id", causation_id)?);
     }
 
-    Ok(DecodedRecord {
-        envelope,
-        key,
-        producer_trace: headers.trace_context(),
-    })
-}
-
-/// The producer's trace context, for a record that could not be decoded.
-///
-/// The happy path gets this from [`record_envelope`] without a second pass over
-/// the headers; a quarantine is rare enough that one more pass costs nothing,
-/// and a poison record still deserves to appear in the trace that produced it.
-pub(crate) fn record_trace_context<M: Message>(message: &M) -> Option<TraceContext> {
-    RecordHeaders::of(message).trace_context()
+    Ok(DecodedRecord { envelope, key })
 }
 
 /// A record's headers, decoded and split by namespace in one pass.
@@ -173,7 +165,7 @@ pub(crate) fn record_trace_context<M: Message>(message: &M) -> Option<TraceConte
 /// application data that is persisted and republished verbatim. And Kafka permits
 /// repeated keys, which the two namespaces resolve in opposite directions — see
 /// [`RecordHeaders::of`].
-struct RecordHeaders {
+pub(crate) struct RecordHeaders {
     /// Producer-set headers, keys exactly as written.
     user: BTreeMap<String, String>,
     /// Reserved `kafkaman-` headers, keys lowercased for lookup.
@@ -189,7 +181,7 @@ struct RecordHeaders {
 }
 
 impl RecordHeaders {
-    fn of<M: Message>(message: &M) -> Self {
+    pub(crate) fn of<M: Message>(message: &M) -> Self {
         let mut user = BTreeMap::new();
         let mut reserved = BTreeMap::new();
         let mut trace = BTreeMap::new();
@@ -221,6 +213,16 @@ impl RecordHeaders {
                 // rather than the user one. A duplicated `traceparent` is either
                 // a mistake or an attempt to redirect the trace, and neither
                 // deserves the later copy.
+                //
+                // `tracestate` is treated the same way, and that is a deliberate
+                // departure from the Recommendation, which says values from
+                // multiple headers should be combined with commas. That rule
+                // exists because HTTP lets one logical field be split across
+                // lines, so joining restores what the sender wrote. Kafka
+                // headers are a genuine multimap: two `tracestate` records are
+                // two values, not one split in half. Joining them would
+                // manufacture a list nobody sent — and, since each half may
+                // carry the same vendor key, one the grammar forbids.
                 if crate::publisher::is_trace_header(&lowercased) {
                     trace.entry(lowercased).or_insert(value);
                 } else if lowercased.starts_with(RESERVED_HEADER_PREFIX) {
@@ -243,7 +245,7 @@ impl RecordHeaders {
     /// Never an error. A record from an uninstrumented producer has none, a
     /// malformed value is dropped, and ingest proceeds identically either way —
     /// trace context is never required for a message to be correct.
-    fn trace_context(&self) -> Option<TraceContext> {
+    pub(crate) fn trace_context(&self) -> Option<TraceContext> {
         TraceContext::from_parts(
             self.trace.get("traceparent").cloned(),
             self.trace.get("tracestate").cloned(),

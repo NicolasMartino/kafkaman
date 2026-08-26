@@ -285,3 +285,102 @@ async fn redrive_with_clear_history_resets_attempts_and_errors() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn a_redrive_leaves_rows_another_redrive_already_claimed() -> TestResult {
+    let _test_guard = receive_test_lock().lock().await;
+    let schema = durable_send_tests::unique_schema("kafkaman_redrive_concurrent");
+    let (_postgres, harness) = start_harness_with_config(retry_test_config(&schema, 1, 20)).await?;
+    let table = harness.received_table::<OrderCreated>().await?;
+    let table_name = table.qualified_name();
+
+    // Four exhausted rows, failed the way production fails them so the redrive
+    // filter matches on real `last_failed_at`/`last_failure_kind` values.
+    let router = MessageRouter::new().handler::<OrderCreated>(|_conn, _meta, _msg| {
+        Box::pin(async move { Err(kafkaman_sqlx::Error::Handler("boom".to_owned())) })
+    });
+    for idx in 0..4 {
+        let event = Envelope::new(OrderCreated {
+            order_id: format!("order-concurrent-{idx}"),
+        })
+        .with_idempotency_key(format!("idem-order-concurrent-{idx}"));
+        assert!(harness.insert_received(&event, 0, idx, None).await?);
+        dispatch_once(harness.pool(), &table, &router, OffsetDateTime::now_utc()).await?;
+    }
+    let failed = ReceiveStatus::Failed.sql_literal();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT count(*) FROM {table_name} WHERE status = {failed}"
+        ))
+        .fetch_one(harness.pool())
+        .await?,
+        4,
+        "all four rows exhausted their retry budget"
+    );
+
+    // Stand in for a redrive already in flight: another transaction holding the
+    // first two candidates, in the order the redrive itself would take them.
+    let mut in_flight = harness.pool().begin().await?;
+    let claimed = sqlx::query_scalar::<_, uuid::Uuid>(&format!(
+        "SELECT message_id FROM {table_name}
+         WHERE status = {failed}
+         ORDER BY last_failed_at, created_at, message_id
+         LIMIT 2
+         FOR UPDATE"
+    ))
+    .fetch_all(&mut *in_flight)
+    .await?;
+    assert_eq!(claimed.len(), 2);
+
+    // Bounded, because the failure this guards against is a *hang*: without
+    // `SKIP LOCKED` this redrive waits on the transaction above instead of
+    // taking the rows nobody holds.
+    let replay = Replay::received_descriptor(Replay::RUNTIME_VERSION, OrderCreated::descriptor()?)
+        .max_rows(10);
+    let moved = tokio::time::timeout(
+        Duration::from_secs(10),
+        redrive_received(harness.pool(), &harness.config(), &replay),
+    )
+    .await
+    .expect("a redrive must not block on rows another redrive is holding")?;
+    assert_eq!(
+        moved, 2,
+        "the two held rows belong to the redrive holding them; this one takes \
+         the other two and reports only what it moved"
+    );
+
+    // The held rows are untouched, so the operator who is holding them still
+    // decides their fate — including whether their failure history survives.
+    let held = claimed
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join("','");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT count(*) FROM {table_name}
+             WHERE status = {failed} AND message_id IN ('{held}')"
+        ))
+        .fetch_one(harness.pool())
+        .await?,
+        2
+    );
+
+    in_flight.rollback().await?;
+
+    // Once nobody holds them they redrive normally, and the second call reports
+    // two rather than re-reporting the first call's work.
+    let rest = redrive_received(harness.pool(), &harness.config(), &replay).await?;
+    assert_eq!(rest, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT count(*) FROM {table_name} WHERE status = {failed}"
+        ))
+        .fetch_one(harness.pool())
+        .await?,
+        0,
+        "the two redrives between them moved every failed row exactly once"
+    );
+
+    Ok(())
+}

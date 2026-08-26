@@ -241,9 +241,9 @@ Changing a row below carries the weight of a public API change. Fixed by
 | `kafkaman.scheduler.rows` | Counter | `{row}` | `scheduler`, `message_type`, `status` |
 | `kafkaman.scheduler.errors` | Counter | `{error}` | `scheduler`, `message_type` |
 | `kafkaman.kafka.publish.records` | Counter | `{record}` | `topic`, `outcome`, `messaging.system`, `messaging.destination.name` |
-| `kafkaman.kafka.ingest.records` | Counter | `{record}` | `message_type`, `outcome`, `messaging.system` |
-| `kafkaman.kafka.ingest.commits` | Counter | `{commit}` | `message_type`, `messaging.system` |
-| `kafkaman.kafka.ingest.errors` | Counter | `{error}` | `message_type`, `reason`, `messaging.system` |
+| `kafkaman.kafka.ingest.records` | Counter | `{record}` | `message_type`, `outcome`, `messaging.system`, `messaging.destination.name` |
+| `kafkaman.kafka.ingest.commits` | Counter | `{commit}` | `message_type`, `messaging.system`, `messaging.destination.name` |
+| `kafkaman.kafka.ingest.errors` | Counter | `{error}` | `message_type`, `reason`, `messaging.system`, `messaging.destination.name` |
 | `kafkaman.relay.publish.duration` | Histogram | `s` | `topic`, `outcome`, `messaging.system`, `messaging.destination.name` |
 | `kafkaman.dispatch.duration` | Histogram | `s` | `message_type`, `outcome` |
 | `kafkaman.outbox.time_to_publish` | Histogram | `s` | `message_type` |
@@ -253,9 +253,11 @@ Changing a row below carries the weight of a public API change. Fixed by
 | `kafkaman.received.oldest_age` | Observable gauge | `s` | `message_type`, `status` |
 | `kafkaman.queue.sample_age` | Observable gauge | `s` | none |
 
-Everything below the `ingest.errors` row is new in this slice; the rows above it
-gained only units and the two `messaging.*` attributes, so an existing dashboard
-keeps working.
+Everything below the `ingest.errors` row is new in this slice. The rows above it
+kept their names and gained only units and the `messaging.*` attributes — but an
+added attribute is an added dimension, so the three `ingest.*` counters split
+into per-topic series. See *Ingest counters gained `messaging.destination.name`*
+below for what that costs a dashboard already querying them.
 
 Histogram bucket boundaries, in seconds, are declared rather than defaulted — the
 OpenTelemetry defaults are millisecond-scaled and would put every observation in
@@ -413,8 +415,9 @@ the relay loop after each cycle, outside any span. They are now emitted per row,
 inside that row's `kafkaman.relay.publish` span, with the span's OpenTelemetry
 context attached.
 
-The rate is unchanged: `LifecycleSampler` still emits every n-th success and its
-count still carries across cycles. What changes is that each event is now
+The rate is unchanged by *that* move: the sampler's count still carries across
+cycles. (The rate itself changed separately — see
+"`sample_success` honours any rate" below.) What changes is that each event is now
 attributable to the message it describes and carries `trace_id`/`span_id`, which
 is the log-to-trace pivot the setting exists for. An event that cannot be traced
 back to its message is a line in a log file.
@@ -429,9 +432,312 @@ attaches them. `attach` is that something, and it is scoped so the guard never
 crosses an `await`.
 
 An adopter emitting their own events inside kafkaman's spans — a dispatch
-handler, say — hits the same gap and can use the same call. The receive-side
-lifecycle event is still emitted from the dispatcher loop and is **not**
-correlated, because the `kafkaman.dispatch` span closes inside `dispatch_once`
-before the loop sees the stats; closing that gap means moving the sampler into
-`kafkaman-sqlx` or widening `DispatchStats`, and neither is worth doing before
-someone wants it.
+handler, say — hits the same gap and can use the same call.
+
+The receive-side event is correlated too, as of the review pass below. It is
+emitted from inside `kafkaman.dispatch` rather than from the dispatcher loop,
+which required the sampler to cross into `kafkaman-sqlx` — see
+`dispatch_once_sampled`.
+
+## Review-Pass Changes
+
+An implementation review of this branch produced the following changes on top of
+everything above. Each is here because it changes something an adopter can
+observe.
+
+### `kafkaman-sqlx::dispatch_once_sampled` (new)
+
+`dispatch_once` is unchanged and emits no lifecycle events. `dispatch_once_sampled`
+takes `&mut LifecycleSampler` and emits the sampled per-message success event
+from inside the row's `kafkaman.dispatch` span, so the event carries the trace and
+span ids of the dispatch it describes. `run_dispatcher` uses it; a host driving
+dispatch by hand and wanting correlated success events should too.
+
+The `kafkaman.dispatch` span also now opens when the row is *claimed* rather than
+when the handler is called, so it covers the missing-handler path and the failure
+accounting. A row whose message type has no registered handler previously
+produced no span at all.
+
+### `kafkaman-axum::redrive_router` (new), `admin_router` (narrowed)
+
+**Breaking.** `admin_router` no longer carries `POST /dlq/{message_type}/redrive`;
+it is read-only. The destructive route moved to `redrive_router`, so mounting it
+is an explicit decision and can take a different auth policy from the reads:
+
+```rust
+let admin = admin_router(state.clone())
+    .layer(read_auth)
+    .merge(redrive_router(state).layer(write_auth));
+```
+
+A deployment that wants the previous surface merges the two with no layer, which
+is fine where the whole listener is already private.
+
+### `Config::observability` returns `Option`
+
+**Breaking.** It was `Result<ObservabilitySection>` and returned `MissingKey` for
+an absent section that the example config marks OPTIONAL. It is now
+`Result<Option<ObservabilitySection>>`, matching `retention()`, and
+`observability_config()` applies the defaults itself. `ResolvedConfig` behaviour
+is unchanged — it was already special-casing this.
+
+### Stuck rows gained `stuck_for_ms`
+
+**Breaking for the receive side.** `OutboxStuckRow` and `ReceivedStuckRow` both
+gain `stuck_for_ms`, and `ReceivedStuckRow::age_ms` changed meaning. The two
+fields now mean the same thing on both types:
+
+| Field | Meaning |
+| --- | --- |
+| `age_ms` | Time since `created_at` — how long the message has been waiting |
+| `stuck_for_ms` | Time since the row became late — `claim_expires_at` for an outbox row, `due_at` for a received row |
+
+`stuck_for_ms` is what `stuck_after` filters on. Previously `age_ms` measured
+from `created_at` on the outbox side and from `due_at` on the receive side: one
+field name, two answers, on one operator screen. Both reach the JSON as separate
+keys.
+
+### `outcome = "published"` on the Kafka publish counter
+
+**Breaking for dashboards.** `kafkaman.kafka.publish.records` labelled a
+successful send `acknowledged` while `kafkaman.relay.publish.duration` labelled
+the same event `published`. It is `published` on both now, so `sum by (outcome)`
+composes across them.
+
+### Trace context is forwarded when nothing is tracing
+
+`RdkafkaPublisher` falls back to the row's stored `traceparent` when there is no
+current span — a build with `traces` off, or a host with no tracer. Previously
+such a relay stripped the header, breaking the trace for downstream services that
+*were* instrumented. Downstream now links to the enqueue rather than to the
+publish: one hop coarser, same trace.
+
+### `traceparent` parsing follows the W3C grammar exactly
+
+Values that were previously accepted and are now dropped as malformed: uppercase
+hex in any field, and any trailing content on a version-`00` header. Higher
+versions still accept appended fields. A dropped value costs a trace and nothing
+else — a record is never rejected for it — but a producer emitting uppercase hex
+will see its context stop propagating through kafkaman.
+
+### `run_queue_metrics` refuses a second concurrent sampler
+
+Returns `Error::QueueMetricsAlreadyRunning` rather than starting. The gauges are
+registered once per process and all read one snapshot, so two loops would
+overwrite each other on every refresh. Stopping and restarting is supported and
+is the case the process-wide registration exists to make safe; the consequence is
+that the gauges bind to the meter provider installed when the *first* sampler in
+the process starts.
+
+### `sample_success` honours any rate
+
+`LifecycleSampler` emitted every `round(1/rate)`-th success, so `0.75` emitted
+100% and `0.66` emitted 50%. It now hits any rate in `0.0..=1.0` exactly. A
+deployment that set one of the affected rates will see its event volume change to
+what it asked for — downward, in both of those cases.
+
+### The `metrics`/`traces` opt-out is now real
+
+`kafkaman --no-default-features` previously still linked `opentelemetry`, because
+`kafkaman-config` and `kafkaman-axum` pulled `kafkaman-core` with default
+features. No API changed; the dependency graph did. `just opt-out` asserts it and
+`just features` compiles all six `metrics`/`traces` combinations.
+
+## Second Review-Pass Changes
+
+A second implementation review followed the first. Everything below is on top of
+the section above.
+
+### Received tables: two new changesets
+
+`AddReceivedFailureMetadata` and `AddReceivedFailedIndex`, in that order — the
+index is on `last_failed_at`, so the column has to exist first.
+
+`AddReceivedFailureMetadata` is **not optional** for a received table created
+before `last_failed_at` and `last_failure_kind` existed, which is the one thing
+that distinguishes it from every other additive changeset here. Those columns are
+named by every DLQ inspection query and written by every failed dispatch, so a
+table without them does not degrade — `received_failed_rows`,
+`received_failed_count`, and `redrive_received` raise, on the path an operator
+reaches for during an incident. The columns are nullable and existing rows keep
+`NULL`, so the DLQ simply has no failure history from before the upgrade.
+
+`AddReceivedFailedIndex` is a performance change and optional. It carries the
+same warning as `AddOutboxRetentionIndex`: changesets apply inside a
+transaction, so the index is built non-concurrently and blocks writes on the
+received table while it runs — on a table large enough to want the index, that is
+a window in which ingest cannot insert.
+
+Fresh tables need neither. `CreateReceivedTable` now emits the partial index
+alongside the table, which is a fourth statement in that changeset. Its
+`checksum_material` is unchanged — it is built from the version, name, and
+descriptor — so an already-applied `create_received_table` will **not** re-run and
+will not gain the index. Existing deployments add `AddReceivedFailedIndex` to
+pick it up.
+
+### `TraceContext` has exactly one constructor
+
+`Default` is gone (an empty `traceparent` is not a trace context) and
+`Deserialize` is hand-written to validate rather than assign fields.
+Deserializing a malformed `TraceContext` is now an error.
+
+Rows are unaffected: `OutboxRow::trace` and `ReceivedRow::trace` read through a
+lenient adapter that drops context which no longer parses, exactly as a column
+read does. A row serialized before the grammar was tightened still loads, minus
+the trace link. Nothing in kafkaman deserializes a bare `TraceContext`; adopters
+who do will see the error.
+
+### `tracestate` is validated and normalized
+
+Previously forwarded verbatim if non-empty. Now checked against the W3C list
+grammar and rewritten canonically: whitespace around commas dropped, empty list
+members dropped, and more than 32 members truncated from the right as the
+Recommendation prescribes. A `tracestate` that breaks the grammar is discarded on
+its own — the `traceparent` beside it survives, because the trace id is what
+correlates.
+
+Adopters see two changes: a stored or forwarded `tracestate` may differ
+byte-for-byte from what arrived (`"a=1, b=2"` becomes `"a=1,b=2"`), and a
+malformed one is no longer passed on under kafkaman's name.
+
+### `traceparent`: every appended field is checked
+
+The previous pass rejected an empty field appended after the flags. It checked
+only the first, so `01-…-01-aa-` was accepted. Every appended field is now
+checked, and a value with more than 12 of them is not treated as a
+`traceparent` — the header is stored in a column and rewritten on every hop, so
+an unbounded field count is an unbounded header travelling under kafkaman's name.
+
+### Redrive accepts the failure kind the DLQ prints
+
+`POST /dlq/{message_type}/redrive` now accepts either spelling of
+`failure_kind`: the RFC 9457 `type` URI that DLQ inspection renders in
+`latest_error.type`, or the bare discriminant. Purely additive — the discriminant
+still works. An unrecognized value is still refused rather than resolved to a
+default, because on a destructive route the difference is which rows move.
+
+### `kafkaman.ingest` opens before the record is decoded
+
+The span now covers envelope decoding, and a record that fails to decode is
+traced rather than silently unspanned. Adopters see decode time inside
+`kafkaman.ingest` where previously the span excluded it, so recorded durations
+grow by the decode cost.
+
+### OpenTelemetry features are narrowed per axis
+
+The workspace dependency is `default-features = false`, and each crate enables
+only the axis it uses: `kafkaman-core` the trace API, `kafkaman-worker` and
+`kafkaman-rdkafka` the metrics API.
+
+What each axis actually links — both columns stated, because naming only the
+first invites reading the second as a promise it does not make:
+
+| Build | `opentelemetry` features enabled |
+| --- | --- |
+| `--features metrics` | `metrics`, and nothing else |
+| `--features traces` | `trace`, plus the optional dependencies `trace` itself enables: `futures`, `futures-core`, `futures-sink`, `pin-project-lite`, `thiserror` |
+
+So a `metrics`-only build links none of `trace`, `logs`, `internal-logs` or
+`futures`. A `traces` build **does** link `futures`: that is upstream's own
+composition of its `trace` feature, not something kafkaman adds, and narrowing
+cannot remove it.
+
+Nothing is lost. Cargo features are additive, so a host that wants any of them
+adds it — and a host installing `opentelemetry_sdk` gets all four back through
+the SDK's own defaults. `just opt-out` asserts both the forbidden pairs and the
+exact metrics set, so the narrowness cannot decay. The traces set is documented
+rather than asserted: it is upstream's optional-dependency list, and pinning it
+would turn one of their patch releases into a red build here.
+
+### Ingest counters gained `messaging.destination.name`
+
+`kafkaman.kafka.ingest.records`, `.commits` and `.errors` now carry the topic.
+They previously carried `message_type` and `messaging.system` only, which left
+them with no attribute in common with `kafkaman.kafka.publish.records` beyond a
+constant — so "are we consuming this topic as fast as we publish to it" was not a
+question the telemetry could answer.
+
+Adding an attribute changes series identity. An existing dashboard or recording
+rule on these three instruments sees the series split until it is updated.
+
+### Queue gauges: install the provider before the first sampler
+
+Not a change, but a consequence that was undocumented at the API and is now
+stated on `run_queue_metrics`. The gauges register once per process — OpenTelemetry
+0.32 offers no way to unregister an observable gauge — so they bind to whichever
+`MeterProvider` is installed when the first sampler in the process starts, and no
+later install or sampler restart can rebind them. Every other kafkaman instrument
+is exempt, because the run loops build theirs at start.
+
+The failure mode is silent: every other kafkaman series arrives and the queue
+series are simply absent. `tests/observability/queue_gauge_ordering` pins it.
+
+## Third Review-Pass Changes
+
+A third implementation review followed the second. Everything below is on top of
+both sections above.
+
+### `AddReceivedFailureMetadata` now backfills
+
+The changeset adds `last_failed_at` and `last_failure_kind` **populated**, from
+the `errors` audit trail they were always a projection of. Adding them empty —
+which is what it did before — left every pre-existing dead letter visible and
+unreachable at the same time: `/dlq` renders the newest audit entry's `type`,
+while every filter reads the columns, so a redrive narrowed to the kind an
+operator could plainly see matched nothing and reported success. The
+`occurred_after` filter missed the same rows, and because `ORDER BY
+last_failed_at` sorts NULLs last, a paged DLQ view dropped exactly those rows off
+the end while the count beside it still counted them.
+
+The backfill reads both spellings a stored kind can have — the RFC 9457 `type`
+URI and the bare discriminant that predates it — and strips the `[UTC]`
+annotation from the RFC 9557 timestamp. A row whose newest entry names a failure
+class this binary does not know keeps `NULL` rather than being guessed at, and a
+timestamp that does not parse costs only itself.
+
+**Corrected 2026-08-26.** "Costs only itself" was the intent and not the
+behaviour. The two columns are filled by two statements: the kind pass is string
+equality against a generated `CASE` and cannot raise, but the timestamp pass ends
+in a `::timestamptz`, and a shape test is not a parser. `2026-99-99T10:00:00Z`
+matches every regex that describes an RFC 3339 date and still raises
+`datetime_field_overflow` — so does `2026-02-30`, and no pattern can rule out a
+day the calendar does not have. Inside one set-based `UPDATE` that raise aborted
+the statement, the migration transaction, and the boot behind it: a single
+corrupted audit entry turned into a process that would not start.
+
+The timestamp pass is now a `DO` block — one set-based `UPDATE`, and only if that
+raises, a second pass one row at a time with each cast in its own subtransaction.
+**The operational consequence:** a table holding even one unparseable audit
+timestamp backfills row-at-a-time rather than in a single statement, which is
+slower on a large DLQ. Every other table pays nothing. Either way the migration
+completes, the rows around the bad one recover, and the bad one keeps `NULL` for
+its timestamp while still recovering its kind.
+
+Adopters upgrading a table that already has the columns see the statement run and
+match nothing: it is guarded on `last_failed_at IS NULL OR last_failure_kind IS
+NULL` and coalesces rather than overwrites.
+
+### The DLQ partial index gained a fourth key column
+
+`(last_failed_at, created_at, message_id, last_failure_kind) WHERE status =
+'Failed'`. The kind trails the ordering chain rather than leading it, so a
+kind-filtered DLQ page keeps the index ordering *and* rejects other kinds inside
+the index. Leading with the kind would have inverted the trade. The index is new
+in M6 and unreleased, so this is a redefinition rather than a migration — no
+adopter has the three-column form.
+
+### `tracestate` rejects two more shapes, and is bounded
+
+Values containing a tab, and lists with a repeated key, are now discarded — the
+`traceparent` beside them survives, as always. A `tracestate` longer than 2048
+characters is dropped without being parsed.
+
+**This can change what an adopter has stored.** A `tracestate` kafkaman forwarded
+before and rejects now stops being written to the column and stops being emitted
+as a header. The `traceparent` is unaffected, so no trace loses its correlation —
+only its vendor decoration.
+
+Repeated `tracestate` *headers* on one record remain first-wins, matching
+`traceparent`. That is a documented deviation from the Recommendation's
+combine-with-commas rule, which exists for HTTP field splitting and does not
+describe a Kafka multimap; see the trace-context decision.

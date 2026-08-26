@@ -1,6 +1,24 @@
 //! Read-only inspection of outbox and received tables: depth by status, and the
 //! rows that have aged past an operator's threshold.
 //!
+//! # The two ages
+//!
+//! Every stuck row reports two durations, and conflating them is the mistake
+//! this split exists to prevent.
+//!
+//! `age_ms` is time since `created_at`: how long this message has been waiting,
+//! start to finish. It is the number that says how much delay a customer has
+//! experienced.
+//!
+//! `stuck_for_ms` is time since the row became *late* — `claim_expires_at` for
+//! an outbox row whose claimant died, `due_at` for a received row past its
+//! backoff. It is the number `stuck_after` filters on, so it is the one that
+//! says how long the fault has been going on.
+//!
+//! They differ by however long the row queued legitimately first, which on a
+//! healthy backlog is most of it. Reporting only `age_ms` — as this did — makes
+//! a thirty-second outage on an hour-old message look like an hour-long outage.
+//!
 //! Nothing here mutates. The one operational write that belongs with these — a
 //! runtime DLQ redrive — lives in `replay.rs` beside the statement it reuses.
 use std::time::Duration;
@@ -53,8 +71,10 @@ pub struct ReceivedStatusSummary {
 /// An outbox row whose publish claim expired without the claimant marking it
 /// either published or failed — the signature of a worker that died mid-publish.
 ///
-/// `age_ms` measures from `created_at`, so it reports how long the message has
-/// been undelivered rather than how long this particular claim has been stale.
+/// `age_ms` measures from `created_at` and `stuck_for_ms` from
+/// `claim_expires_at` — how long the message has been undelivered, and how long
+/// it has been stuck. `stuck_after` filters on the second. They differ by
+/// however long the row queued legitimately before its claimant died.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OutboxStuckRow {
     pub message_type: String,
@@ -65,15 +85,18 @@ pub struct OutboxStuckRow {
     pub claim_expires_at: Option<OffsetDateTime>,
     #[serde(with = "kafkaman_core::rfc9557")]
     pub created_at: OffsetDateTime,
+    /// Time since `created_at`: how long this message has been undelivered.
     pub age_ms: u64,
+    /// Time since `claim_expires_at`: how long it has been *stuck*.
+    pub stuck_for_ms: u64,
 }
 
 /// A received row that has been due for dispatch longer than the caller's
 /// threshold — a dispatcher that is down, wedged, or falling behind.
 ///
 /// `due_at` is `next_attempt_at` when a retry is scheduled and `created_at`
-/// otherwise, and `age_ms` measures from `due_at`: a row inside its backoff
-/// window is not late, it is waiting.
+/// otherwise. A row inside its backoff window is not late, it is waiting, which
+/// is why the fault clock starts at `due_at` rather than at `created_at`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReceivedStuckRow {
     pub message_type: String,
@@ -86,7 +109,10 @@ pub struct ReceivedStuckRow {
     pub created_at: OffsetDateTime,
     #[serde(with = "kafkaman_core::rfc9557")]
     pub due_at: OffsetDateTime,
+    /// Time since `created_at`: how long this message has been unprocessed.
     pub age_ms: u64,
+    /// Time since `due_at`: how long it has been *overdue*.
+    pub stuck_for_ms: u64,
 }
 
 /// Per-status row counts and oldest-row age for one outbox table.
@@ -207,14 +233,20 @@ pub async fn outbox_stuck_rows(
             let status: String = row.try_get("status")?;
             let status = status.parse().map_err(Error::Core)?;
             let created_at: OffsetDateTime = row.try_get("created_at")?;
+            let claim_expires_at: Option<OffsetDateTime> = row.try_get("claim_expires_at")?;
             Ok(OutboxStuckRow {
                 message_type: table.descriptor.message_type.as_str().to_owned(),
                 message_id: row.try_get("message_id")?,
                 status,
                 claimed_by: row.try_get("claimed_by")?,
-                claim_expires_at: row.try_get("claim_expires_at")?,
+                claim_expires_at,
                 created_at,
                 age_ms: age_ms_since(now, created_at),
+                // The query selected this row on `claim_expires_at`, so this is
+                // the number that answers the question the filter asked.
+                stuck_for_ms: claim_expires_at
+                    .map(|expired_at| age_ms_since(now, expired_at))
+                    .unwrap_or(0),
             })
         })
         .collect()
@@ -281,7 +313,13 @@ pub async fn received_stuck_rows(
                 next_attempt_at: row.try_get("next_attempt_at")?,
                 created_at,
                 due_at,
-                age_ms: age_ms_since(now, due_at),
+                age_ms: age_ms_since(now, created_at),
+                // Selected on `due_at`, so this is the overdue clock. It used to
+                // be reported as `age_ms`, which meant the same field name
+                // measured from `created_at` on the outbox side and from
+                // `due_at` here — two answers to one question on the same
+                // operator screen.
+                stuck_for_ms: age_ms_since(now, due_at),
             })
         })
         .collect()

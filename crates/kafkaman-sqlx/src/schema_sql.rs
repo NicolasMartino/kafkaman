@@ -181,6 +181,193 @@ pub fn create_received_state_index_sql(table: &ReceivedTable) -> String {
     )
 }
 
+/// The index the DLQ views read.
+///
+/// Partial on `status = 'Failed'`, which is the only status any of them looks
+/// at, and ordered the way the DLQ queries order — `last_failed_at`, then
+/// `created_at`, then `message_id`, the tie-break chain in `queries.rs`. An operator's
+/// DLQ page is `WHERE status = 'Failed' ORDER BY last_failed_at LIMIT n`, and a
+/// redrive is the same query with `FOR UPDATE SKIP LOCKED` bolted on. The
+/// general `(status, next_attempt_at, created_at)` index can answer the `WHERE`
+/// and nothing else — the sort that follows it has to read every failed row and
+/// order it, on a table whose live rows are the ones nobody is looking at.
+///
+/// `last_failure_kind` rides along as a fourth key column, after the ordering
+/// chain rather than before it. A DLQ view narrowed to one failure kind is the
+/// same ordered scan with an equality test, and a trailing key column is one
+/// PostgreSQL can apply inside the index — so rows of other kinds are rejected
+/// without a heap fetch, while the unfiltered page keeps the index ordering it
+/// already had. Leading with the kind would invert that: filtered pages would
+/// get a range scan and unfiltered ones would go back to sorting.
+///
+/// Partial rather than complete because the DLQ is the small end of the table by
+/// design. Indexing every row to serve queries about the failed ones would size
+/// the index to the workload rather than to the backlog.
+pub fn create_received_failed_index_sql(table: &ReceivedTable) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} \
+         (last_failed_at, created_at, message_id, last_failure_kind) \
+         WHERE status = {}",
+        table.index_name("_failed").quoted(),
+        table.qualified_name(),
+        ReceiveStatus::Failed.sql_literal(),
+    )
+}
+
+/// The two columns that record *why* a received row last failed.
+///
+/// Written on every failed dispatch and read by the DLQ views, which order by
+/// the timestamp and filter on the kind. Nullable because a row that has never
+/// failed has neither, which is most rows.
+///
+/// The CHECK rides on the `ADD COLUMN`, so it lands exactly when the column
+/// does. On a table that already has the column the whole statement is skipped —
+/// including the constraint — which is the same trade every `IF NOT EXISTS`
+/// changeset here makes: converge on the shape, never rewrite what is already
+/// there.
+pub fn add_received_failure_metadata_sql(table: &ReceivedTable) -> [String; 2] {
+    let name = table.qualified_name();
+    [
+        format!("ALTER TABLE {name} ADD COLUMN IF NOT EXISTS last_failed_at TIMESTAMPTZ"),
+        format!(
+            "ALTER TABLE {name} ADD COLUMN IF NOT EXISTS last_failure_kind TEXT \
+             CHECK (last_failure_kind IN ({}))",
+            received_failure_kind_sql_literal_list(),
+        ),
+    ]
+}
+
+/// Recover both failure columns for rows that were dead-lettered before the
+/// columns existed.
+///
+/// # Why `ADD COLUMN` alone is not the migration
+///
+/// The DLQ views read the columns; the operator's view reads `errors`. A failed
+/// row left with NULLs is therefore visible *and* unreachable: `/dlq` renders
+/// the last audit entry's `type`, and a redrive filtered by that exact kind
+/// tests `last_failure_kind`, matches nothing, and reports success having moved
+/// no rows. The `occurred_after` filter misses them the same way, and because
+/// `ORDER BY last_failed_at` sorts NULLs last, a paged DLQ view drops precisely
+/// these rows off the end while the count beside it still counts them. Every one
+/// of those failures is silent.
+///
+/// # Why the data is there to recover
+///
+/// Every recorded failure appends an RFC 9457 problem detail to `errors` with
+/// both its `type` URI and its `occurred_at`. The columns were only ever a
+/// queryable projection of the newest entry, so the backfill reads the same
+/// place the projection came from.
+///
+/// That timestamp is RFC 9557 — RFC 3339 with a `[UTC]` annotation PostgreSQL
+/// cannot cast, which is why the DLQ queries do not read the JSON. A migration
+/// is the one place stripping the annotation is the right trade: it happens once
+/// rather than per query.
+///
+/// # Why the cast runs inside a subtransaction
+///
+/// A shape test is not a parser. `2026-99-99T10:00:00Z` matches any regex that
+/// describes an RFC 3339 date and still raises `datetime_field_overflow`, and so
+/// does `2026-02-30` — no pattern can rule out a day the calendar does not have.
+/// A raise inside a set-based `UPDATE` aborts the whole statement, which aborts
+/// the migration transaction, which turns one malformed audit row written years
+/// ago into a process that will not boot. That is not a trade worth making for a
+/// column that is a convenience projection.
+///
+/// So the timestamp pass is a `DO` block: one set-based `UPDATE` for the case
+/// that costs nothing, and — only if that raises — a second pass one row at a
+/// time, each in its own subtransaction, where an unparseable entry costs its
+/// own row and nothing else. The shape test survives as a *value* filter rather
+/// than a safety one: it keeps `infinity`, `now` and the rest of PostgreSQL's
+/// special inputs, all of which cast happily, from being mistaken for a recorded
+/// failure time.
+///
+/// The kind pass cannot raise — it is string equality against a generated `CASE`
+/// — so it stays a plain statement, and a row whose timestamp is unreadable
+/// still recovers the kind beside it.
+///
+/// A `type` outside the current vocabulary leaves the kind NULL rather than
+/// guessing, and must: the CHECK its sibling statement installs would reject
+/// anything invented here.
+pub fn backfill_received_failure_metadata_sql(table: &ReceivedTable) -> [String; 2] {
+    const LAST: &str = "errors -> (jsonb_array_length(errors) - 1)";
+    let name = table.qualified_name();
+    let failed = ReceiveStatus::Failed.sql_literal();
+    let occurred_at = format!("split_part({LAST} ->> 'occurred_at', '[', 1)");
+    // Both spellings of every kind: the RFC 9457 `type` URI written today, and
+    // the bare discriminant rows carried before the problem-detail format. The
+    // pair mirrors `ReceivedFailureKind::from_problem_type`, and generating it
+    // from `ALL` is what stops the migration and the enum from drifting apart.
+    let kinds = ReceivedFailureKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let discriminant = sql_string_literal(kind.discriminant());
+            format!(
+                "WHEN {problem_type} THEN {discriminant} WHEN {discriminant} THEN {discriminant}",
+                problem_type = sql_string_literal(kind.problem_type()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Written once and shared by both passes of the timestamp statement, so the
+    // row-at-a-time fallback can never select a different set than the
+    // set-based attempt it is standing in for.
+    let unrecovered_timestamps = format!(
+        "status = {failed}
+           AND last_failed_at IS NULL
+           AND jsonb_typeof(errors) = 'array'
+           AND jsonb_array_length(errors) > 0
+           AND {occurred_at} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ]'"
+    );
+
+    [
+        format!(
+            "UPDATE {name} SET last_failure_kind = CASE
+                COALESCE({LAST} ->> 'type', {LAST} ->> 'kind') {kinds}
+             END
+             WHERE status = {failed}
+               AND last_failure_kind IS NULL
+               AND jsonb_typeof(errors) = 'array'
+               AND jsonb_array_length(errors) > 0"
+        ),
+        format!(
+            "DO $kafkaman_backfill$
+             DECLARE
+                 dead_letter record;
+             BEGIN
+                 BEGIN
+                     UPDATE {name}
+                        SET last_failed_at = {occurred_at}::timestamptz
+                      WHERE {unrecovered_timestamps};
+                     RETURN;
+                 EXCEPTION WHEN invalid_datetime_format OR datetime_field_overflow THEN
+                     -- At least one stored timestamp is date-shaped and not a
+                     -- date. Fall through and pay for it a row at a time.
+                     NULL;
+                 END;
+
+                 FOR dead_letter IN
+                     SELECT message_id, {occurred_at} AS recovered_at
+                       FROM {name}
+                      WHERE {unrecovered_timestamps}
+                 LOOP
+                     BEGIN
+                         UPDATE {name}
+                            SET last_failed_at = dead_letter.recovered_at::timestamptz
+                          WHERE message_id = dead_letter.message_id;
+                     EXCEPTION WHEN invalid_datetime_format OR datetime_field_overflow THEN
+                         -- This row's audit trail cannot say when it failed.
+                         -- Leaving it NULL is the honest answer; aborting the
+                         -- changelog is not.
+                         NULL;
+                     END;
+                 END LOOP;
+             END
+             $kafkaman_backfill$"
+        ),
+    ]
+}
+
 pub fn create_cache_table_sql(table: &CacheTable) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {name} (

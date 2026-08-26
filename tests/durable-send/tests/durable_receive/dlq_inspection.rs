@@ -207,13 +207,25 @@ async fn received_inspection_reports_depth_stuck_rows_and_redrives_dlq() -> Test
             .await?
     );
 
-    // A freshly inserted row is queued work, so an aggressive threshold must
-    // flag it — and a terminal bucket must never be flagged, however old.
+    // Backdated, not raced. The assertion below is that a row older than the
+    // threshold is a backlog, and a 1ms threshold turned that into a bet on the
+    // test taking longer than a millisecond to reach the next statement. Five
+    // minutes states it with no clock in it, and stays well inside the hour-long
+    // threshold the negative case below uses.
+    sqlx::query(&format!(
+        "UPDATE {} SET created_at = created_at - interval '5 minutes'",
+        table.qualified_name()
+    ))
+    .execute(harness.pool())
+    .await?;
+
+    // Queued work past the threshold is a backlog — and a terminal bucket must
+    // never be flagged, however old.
     let summary = received_status_summary(
         harness.pool(),
         &table,
         OffsetDateTime::now_utc(),
-        Duration::from_millis(1),
+        Duration::from_secs(60),
     )
     .await?;
     let pending = summary
@@ -224,10 +236,11 @@ async fn received_inspection_reports_depth_stuck_rows_and_redrives_dlq() -> Test
     assert_eq!(pending.count, 1);
     assert!(
         pending.over_max_queue_age,
-        "a pending row older than a 1ms max_queue_age is a backlog"
+        "a pending row five minutes past a 60s max_queue_age is a backlog"
     );
 
     // With a threshold longer than the row has existed, nothing is a backlog.
+    // Five minutes of backdating is deliberately far inside this hour.
     let quiet = received_status_summary(
         harness.pool(),
         &table,
@@ -297,7 +310,15 @@ async fn received_inspection_reports_depth_stuck_rows_and_redrives_dlq() -> Test
     assert_eq!(overdue[0].status, ReceiveStatus::Retryable);
     assert_eq!(overdue[0].next_attempt_at, Some(scheduled));
     assert_eq!(overdue[0].due_at, scheduled);
-    assert!(overdue[0].age_ms >= 60_000);
+    // The overdue clock, which is what `stuck_after` filtered on. `age_ms`
+    // measures from `created_at` instead — the row existed before it was due,
+    // so it is necessarily the larger of the two and answers a different
+    // question.
+    assert!(overdue[0].stuck_for_ms >= 60_000);
+    assert!(
+        overdue[0].age_ms >= overdue[0].stuck_for_ms,
+        "a row cannot have been overdue for longer than it has existed"
+    );
 
     // Exhaust the retry budget so the row reaches the DLQ.
     let mut attempts = row.attempts;

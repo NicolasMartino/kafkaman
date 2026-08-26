@@ -77,8 +77,11 @@ payload = "off"
 # Accepted: off, kafkaman-only, all. Default kafkaman-only.
 headers = "kafkaman-only"
 # LIVE, and only meaningful with lifecycle = "per-message". Fraction of successes that
-# get an event; sampling is deterministic (every Nth success), not random. Must be
-# 0.0..=1.0. Default 0.0, which is silent.
+# get an event. Sampling is deterministic and proportional, not random: after N
+# successes exactly floor(N * sample_success) events have been emitted — never more than
+# the rate allows, and never a whole event behind it — so 0.25 costs a quarter of the
+# volume rather than something near it. Must be 0.0..=1.0. Default 0.0, which is
+# silent.
 sample_success = 0.0
 # LIVE. How long an expired claim or overdue received row must stay overdue before the
 # stuck-row route reports it. Must be > 0. Default 60s.
@@ -91,7 +94,7 @@ max_queue_age = "5m"
 # OPTIONAL, repeatable. Per-message-type overrides, merged over
 # `[observability.defaults]`. The message type must be registered with
 # `ResolvedConfig`, or boot fails.
-[observability.messages.order_created]
+[observability.messages.order_snapshot]
 lifecycle = "per-message"           # Emit an event per successful message for this type only.
 sample_success = 0.05               # ...one in every twenty of them.
 stuck_after = "30s"                 # A high-value stream should be reported overdue sooner.

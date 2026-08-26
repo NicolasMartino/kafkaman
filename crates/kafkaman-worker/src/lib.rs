@@ -57,6 +57,12 @@ pub enum Error {
         field: &'static str,
         reason: &'static str,
     },
+
+    #[error(
+        "a queue metrics sampler is already running in this process; \
+         one sampler covers every table, so start a second only after the first has stopped"
+    )]
+    QueueMetricsAlreadyRunning,
 }
 
 /// Somewhere to publish a claimed outbox row.

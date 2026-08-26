@@ -104,17 +104,28 @@ design obvious rather than novel.** `correlation_id` already makes this journey:
 context follows the identical path, and the outbox row grows two nullable columns
 rather than one.
 
-The resulting trace has this shape:
+The result is **two traces joined by a link**, not one trace:
 
 ```
-HTTP request span  (service A, host-instrumented)
-└── kafkaman.enqueue          — in the caller's transaction, writes traceparent
-      ⋮  (durable gap: commit, relay poll, claim)
-    kafkaman.relay.publish    — child of enqueue, restored from the row
-      ⋮  (Kafka)
-    kafkaman.ingest           — service B, LINKS to relay.publish
-    └── kafkaman.dispatch     — handler execution
+trace A (the caller's)
+  HTTP request span  (service A, host-instrumented)
+  └── kafkaman.enqueue        — in the caller's transaction, writes traceparent
+        ⋮  (durable gap: commit, relay poll, claim)
+      kafkaman.relay.publish  — child of enqueue, restored from the row
+        ⋮  (Kafka)
+
+trace B (the consumer's)
+  kafkaman.ingest             — service B, root span, LINKS to relay.publish
+  └── kafkaman.dispatch       — child of ingest, restored from the received row
 ```
+
+Decision 6 is what makes it two rather than one: a link is not a parent, and a
+linked span starts its own trace. That is the intended shape and not a
+concession — a consumer polls a batch that may hold records from many unrelated
+traces, so a single trace would have to pick one of them to belong to. What the
+link buys is that a reader who has either trace can reach the other; what it
+costs is that no single trace id spans the broker hop, and any query written as
+though one does will return half the story.
 
 The dotted gaps are real elapsed time — potentially seconds, potentially longer
 after a failure — and showing them is a feature. The gap between `enqueue` and
@@ -124,8 +135,8 @@ time went.
 
 ## Amendments
 
-Three things this decision fixed before implementation turned out to be
-incomplete, and one turned out to be wrong. All four were found by building it.
+Four things this decision fixed before implementation turned out to be
+incomplete, and one turned out to be wrong. All five were found by building it.
 
 ### 2026-08-25 — The received row carries trace context too
 
@@ -179,6 +190,88 @@ opaque list, so `kafkaman-core::trace` implements both directly against the
 Recommendation: it accepts unknown versions with trailing fields, per the
 forward-compatibility rule, and rejects the all-zero ids and the reserved `ff`
 version.
+
+
+### 2026-08-26 — The trace shape is two traces, and the diagram said one
+
+The shape diagram above drew `kafkaman.ingest` in the same tree as
+`kafkaman.enqueue`, and the verification bullet asked for "one trace id" spanning
+enqueue through dispatch. Both contradict Decision 6, which was ratified in the
+same document: the consumer *links* to the producer, and a link starts a new
+trace by definition. The implementation follows Decision 6 and the integration
+test asserts exactly that — the two trace ids differ and a link joins them — so
+the picture was the thing that was wrong.
+
+Worth recording rather than quietly editing, because the wrong version is the one
+an operator would naturally assume and would write queries against. A dashboard
+built on "find the trace id and follow it end to end" silently stops at the
+broker. The correct instruction is: follow the trace to `relay.publish`, then
+follow its link.
+
+### 2026-08-26 — `tracestate` is not opaque, and where malformed context is dropped
+
+The amendment above called `tracestate` "an opaque list" and forwarded it
+verbatim. That was wrong in one specific way: kafkaman does not merely *hold*
+these values, it stores them in a column and writes them back onto the wire as
+standard headers at the next hop, under its own name. Forwarding an unparseable
+`tracestate` makes kafkaman a laundering step — whatever is downstream then has
+to deal with a header this process chose to pass on. So it is validated against
+the Recommendation's list grammar and normalized: whitespace around commas
+dropped, empty members dropped, more than 32 members truncated from the right as
+the specification prescribes.
+
+The `traceparent` and the `tracestate` are validated **independently**, and that
+asymmetry is deliberate. A `tracestate` that breaks the grammar is discarded on
+its own and the `traceparent` beside it survives, because the trace id is what
+correlates and the vendor list is only what decorates. Losing the second must
+never cost the first.
+
+**The rule for context that is already stored**, stated once because it comes up
+at three different doors and the answers differ:
+
+| Door | On a malformed value | Why |
+| --- | --- | --- |
+| A record header, or a database column | Dropped; the row is unaffected | Absent context is the ordinary case. A message must never stop for a field with no business meaning. |
+| `TraceContext::deserialize` | Error | The caller has asserted it holds a trace context. The useful reply to a false assertion is to say so. |
+| `OutboxRow::trace` / `ReceivedRow::trace` | Dropped; the row still loads | A stored row must stay readable by a binary whose vocabulary has moved on. The grammar has already been tightened once — lowercase hex, closed version `00` — and a row serialized before that must still load, minus a link that no longer means anything. |
+
+The last row is the same reasoning `problem_type` uses when it degrades an
+unrecognized failure kind rather than failing the read, and it is why
+`TraceContext` has no `Default`: an empty `traceparent` is not a trace context,
+and a type whose whole contract is "this value is well formed" cannot have a
+constructor that produces one that is not.
+
+### 2026-08-26 — Three holes in the `tracestate` grammar, and a deliberate deviation
+
+The validation added above was checked against the Recommendation's ABNF and had
+three gaps. All three matter for the same reason the validation exists at all:
+kafkaman re-emits these bytes as a standard header under its own name.
+
+**Tab was accepted inside a value.** `chr = %x20-2B / %x2D-3C / %x3E-7E` starts
+at space, so the only legal place for a tab is the optional whitespace *between*
+list members — which is trimmed before a value is ever examined. Accepting `0x09`
+in the value position forwarded `vendor=a<TAB>b` as though it were well formed.
+
+**A key could repeat.** `a=1,a=2` satisfies every production and is still not a
+valid list: the Recommendation gives each key at most one member, and forwarding
+a repeat hands every reader downstream an ambiguity to resolve on its own.
+Uniqueness is judged over the whole value, not the part that survives the
+32-member ceiling — truncation is what a *valid* list gets for being too long,
+and a list with a repeated key was never valid at any length.
+
+**Parsing was unbounded.** The member ceiling bounds what is *stored*; nothing
+bounded what was *read*, and every member costs a uniqueness check against every
+key before it. A `tracestate` longer than 2048 characters — four times the 512
+the Recommendation asks implementations to propagate — is now dropped whole.
+
+**Repeated `tracestate` *headers* are first-wins**, matching `traceparent`, and
+this is a knowing deviation. The Recommendation says values from multiple headers
+should be combined with commas, per RFC 7230 field order. That rule exists
+because HTTP permits one logical field to be split across lines, so joining
+restores what the sender actually wrote. Kafka headers are a genuine multimap: two
+`tracestate` records are two values, not one value in halves. Joining them would
+manufacture a list nobody sent — and, since each half may carry the same vendor
+key, one the grammar above now rejects.
 
 ## Options Considered
 
@@ -256,9 +349,10 @@ consumption, and attaches unrelated messages to an arbitrary trace.
 
 ## Verification
 
-- A test asserts one trace id spans enqueue → relay publish → Kafka → ingest →
-  dispatch, across two harnesses, with the publish span parented to the enqueue
-  span across a restart.
+- A test asserts the producer trace spans enqueue → relay publish across the
+  outbox gap, that the consumer trace spans ingest → dispatch across the receive
+  gap, that the two carry *different* trace ids, and that the ingest span links
+  back to the publish span that produced the record.
 - A test asserts `traceparent` sent by a producer never appears in the user
   headers handed to a handler.
 - A test asserts a row enqueued outside any span publishes and dispatches

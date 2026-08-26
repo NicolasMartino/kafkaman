@@ -100,7 +100,11 @@ impl RdkafkaPublisher {
 
         match self.producer.send(record, Timeout::Never).await {
             Ok((partition, offset)) => {
-                self.metrics.record(&row.row.topic, "acknowledged");
+                // `published`, not `acknowledged`: the relay's own
+                // `kafkaman.relay.publish.duration` labels the same event that
+                // way, and one word for one state is what lets an operator
+                // group both instruments by `outcome` in a single query.
+                self.metrics.record(&row.row.topic, "published");
                 Ok(PublishAck {
                     topic: row.row.topic.clone(),
                     partition,
@@ -164,14 +168,24 @@ fn managed_headers(row: &ClaimedOutboxRow) -> Result<Vec<(&'static str, String)>
         managed.push(("kafkaman-causation-id", id.to_string()));
     }
 
-    // W3C trace context, from the span this publish is running in — which the
-    // relay parented from the context stored at enqueue. It carries no
-    // `kafkaman-` prefix on purpose: the entire value of the standard is that a
-    // consumer which has never heard of kafkaman still recognizes it.
+    // W3C trace context. It carries no `kafkaman-` prefix on purpose: the entire
+    // value of the standard is that a consumer which has never heard of kafkaman
+    // still recognizes it.
     //
-    // Captured here rather than read from the row, because the consumer links to
-    // *this publish*, not to the enqueue that preceded it.
-    if let Some(trace) = kafkaman_core::capture_trace_context() {
+    // The current span comes first, because the consumer links to *this
+    // publish*, not to the enqueue that preceded it — and the relay has already
+    // parented this span from the context stored at enqueue, so the two are in
+    // the same trace either way.
+    //
+    // The stored context is the fallback for the case that produces no current
+    // span at all: a build with `traces` off, or a host that installs no tracer.
+    // Without it such a relay strips the `traceparent` from every message it
+    // forwards, breaking the trace for every downstream service that *is*
+    // instrumented — a process opting out of producing spans must not thereby
+    // opt its neighbours out too. What downstream sees then is a link to the
+    // enqueue rather than to the publish: one hop coarser, and still the same
+    // trace.
+    if let Some(trace) = kafkaman_core::capture_trace_context().or_else(|| row.row.trace.clone()) {
         managed.push(("traceparent", trace.traceparent().to_owned()));
         if let Some(state) = trace.tracestate() {
             managed.push(("tracestate", state.to_owned()));

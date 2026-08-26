@@ -44,7 +44,8 @@
 //! it is deliberately independent of the SDK's collection interval so that
 //! scraping faster does not query harder.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use kafkaman_core::{OutboxStatus, ReceiveStatus};
@@ -143,11 +144,9 @@ impl Snapshot {
     }
 }
 
-/// The registered gauges, kept alive for as long as the loop runs.
+/// The registered gauges, kept alive for the life of the process.
 ///
-/// Held rather than dropped: these are the handles the callbacks hang from, and
-/// a loop that registered them and then dropped them would be reporting on
-/// borrowed time.
+/// Held rather than dropped: these are the handles the callbacks hang from.
 #[derive(Debug)]
 struct Gauges {
     _outbox_depth: ObservableGauge<u64>,
@@ -157,19 +156,118 @@ struct Gauges {
     _sample_age: ObservableGauge<f64>,
 }
 
+/// The one registration this process makes, and the snapshot its callbacks read.
+#[derive(Debug)]
+struct Registration {
+    snapshot: Arc<Mutex<Snapshot>>,
+    _gauges: Gauges,
+}
+
+/// Registered once per process, on first use.
+///
+/// # Why this is a `OnceLock` when the loop instruments deliberately are not
+///
+/// Every other instrument in kafkaman is owned by the loop that reports it,
+/// precisely so it binds to whichever meter provider is installed when that loop
+/// starts. Observable gauges cannot follow that rule, because OpenTelemetry 0.32
+/// has no way to *unregister* a callback: dropping the `ObservableGauge` handle
+/// leaves the callback in the SDK's pipeline, still holding the snapshot it was
+/// built with.
+///
+/// So a per-loop registration is a leak with a symptom. Stop the sampler and
+/// start it again in the same process — a supervised task restarting after a
+/// database outage, a test that runs two scenarios — and the old callback is
+/// still registered, still observing, and now frozen at whatever was true when
+/// its loop stopped. Every series reports twice, once live and once stale, and
+/// the two are indistinguishable at the exporter.
+///
+/// Registering once and repointing the shared snapshot is what the API leaves.
+/// The cost is stated plainly: these gauges bind to the provider installed when
+/// the *first* sampler in the process starts, so a host that installs its
+/// pipeline later gets no queue series at all.
+static REGISTRATION: OnceLock<Registration> = OnceLock::new();
+
+/// Whether a sampler is running, so a second one is refused rather than wrong.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn registration() -> &'static Registration {
+    REGISTRATION.get_or_init(|| {
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let gauges = register(Arc::clone(&snapshot));
+        Registration {
+            snapshot,
+            _gauges: gauges,
+        }
+    })
+}
+
+/// Claims the process's single sampler slot, releasing it on drop.
+///
+/// A guard rather than a bare flag so the slot is released on every exit path —
+/// a clean shutdown, an error return, or a panic unwinding out of the loop. A
+/// sampler that could not be restarted after a panic would be worse than the
+/// duplicate registration this replaces.
+#[derive(Debug)]
+struct SamplerSlot;
+
+impl SamplerSlot {
+    fn claim() -> Result<Self> {
+        RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| Error::QueueMetricsAlreadyRunning)
+    }
+}
+
+impl Drop for SamplerSlot {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::Release);
+    }
+}
+
 /// Sample queue depth and age until `shutdown` is cancelled.
 ///
-/// Register one of these per process. The gauges are registered with the global
-/// meter when this starts, so two concurrent loops covering the same tables
-/// report the same rows twice — the callbacks are additive, and OpenTelemetry
-/// has no way to tell that two of them mean the same thing.
+/// One sampler per process, covering every table it is given. A second
+/// concurrent call returns [`Error::QueueMetricsAlreadyRunning`] rather than
+/// starting: the callbacks all read one snapshot, so two loops would overwrite
+/// each other's numbers on every refresh and the series would silently describe
+/// whichever loop wrote last. Refusing is the only outcome an operator can act
+/// on.
+///
+/// Stopping and starting again is fine, and is the case the process-wide
+/// gauge registration exists to make safe; the module documentation explains why
+/// that registration cannot be per-loop the way every other instrument here is.
+///
+/// # Install the meter provider before the first sampler
+///
+/// That process-wide registration has one consequence a host has to know, because
+/// nothing reports it. The gauges are registered on the first call in the
+/// process, and an OpenTelemetry instrument binds to whichever provider is
+/// installed at the moment it is created — permanently; the API offers no
+/// rebind. A sampler started before the host installs its `MeterProvider`
+/// therefore registers against the no-op provider and stays there for the life
+/// of the process, and no later install and no restart of this loop can recover
+/// it.
+///
+/// Every other kafkaman instrument is exempt: the run loops build theirs at
+/// start, so restarting a loop rebinds it. The gauges cannot, because
+/// OpenTelemetry 0.32 has no way to *un*register an observable gauge — a
+/// per-loop registration would leave every stopped loop's callback in the SDK's
+/// pipeline and accumulate one more on each restart.
+///
+/// What the failure looks like: every other kafkaman series arrives normally and
+/// the queue series are simply absent, which reads as "the sampler is not
+/// running". `tests/observability/queue_gauge_ordering` pins it.
 ///
 /// Like every other loop here, a failed cycle is logged and retried: a database
 /// blip must not take the sampler down. The difference between "the queue is
 /// empty" and "the sampler is broken" is carried by
-/// `kafkaman.queue.sample_age`, not by the sampler exiting.
+/// `kafkaman.queue.sample_age`, not by the sampler exiting. That holds after
+/// shutdown too — the snapshot keeps its timestamp, so a stopped sampler shows
+/// as an age that climbs rather than as depths that quietly stop being true.
 ///
-/// Returns `Err` only for a configuration that can never succeed.
+/// Returns `Err` for a configuration that can never succeed, and for a second
+/// concurrent sampler.
 pub async fn run_queue_metrics(
     pool: PgPool,
     outbox_tables: Vec<OutboxTable>,
@@ -178,19 +276,20 @@ pub async fn run_queue_metrics(
     shutdown: CancellationToken,
 ) -> Result<()> {
     cfg.validate()?;
+    let _slot = SamplerSlot::claim()?;
 
-    let shared = Arc::new(Mutex::new(Snapshot::default()));
-    // Registered before the first refresh, so the instruments bind to whatever
-    // provider is installed when the loop starts rather than to whatever exists
-    // whenever the first query happens to finish.
-    let _gauges = register(Arc::clone(&shared));
+    // Registered before the first refresh, so nothing observes a snapshot that
+    // has never been written. On the first sampler in the process this also
+    // binds the instruments to the installed meter provider; on every later one
+    // it is a lookup.
+    let shared = &registration().snapshot;
 
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        refresh(&pool, &outbox_tables, &received_tables, &cfg, &shared).await;
+        refresh(&pool, &outbox_tables, &received_tables, &cfg, shared).await;
 
         if !sleep_or_shutdown(cfg.refresh_interval, &shutdown).await {
             break;

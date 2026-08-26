@@ -19,6 +19,20 @@ async fn outbox_inspection_reports_depth_age_and_expired_claims() -> TestResult 
             .await?;
     }
 
+    // Backdated, not raced. Every age assertion below is about a row *older than
+    // the threshold*, and a 1ms threshold made that a bet on the test reaching
+    // the next statement more slowly than a millisecond — true almost always,
+    // and a flake the rest of the time, on a suite whose flakes teach people to
+    // rerun rather than to read. Five minutes states the same property with no
+    // clock in it, and stays well inside the hour-long threshold the negative
+    // cases use.
+    sqlx::query(&format!(
+        "UPDATE {} SET created_at = created_at - interval '5 minutes'",
+        table.qualified_name()
+    ))
+    .execute(harness.pool())
+    .await?;
+
     // Mark one row terminal so the summary has to keep the buckets apart: the
     // pending count must not absorb it, and its age must not raise a backlog
     // warning however aggressive the threshold.
@@ -46,7 +60,7 @@ async fn outbox_inspection_reports_depth_age_and_expired_claims() -> TestResult 
         harness.pool(),
         &table,
         OffsetDateTime::now_utc(),
-        Duration::from_millis(1),
+        Duration::from_secs(60),
     )
     .await?;
     let pending = summary
@@ -77,7 +91,7 @@ async fn outbox_inspection_reports_depth_age_and_expired_claims() -> TestResult 
     );
     assert!(
         pending.over_max_queue_age,
-        "a pending row past a 1ms threshold is a backlog"
+        "a pending row five minutes past a 60s threshold is a backlog"
     );
 
     let published = summary

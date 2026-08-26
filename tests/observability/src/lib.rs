@@ -341,13 +341,33 @@ pub async fn relay_until_published(harness: &Harness, key: &str) -> TestResult {
         shutdown.clone(),
     ));
 
-    published
-        .recv()
-        .await
-        .expect("the relay should publish the enqueued row");
+    next(&mut published, "the relay should publish the enqueued row").await;
     shutdown.cancel();
     worker.await??;
     Ok(())
+}
+
+/// How long a bounded wait gives a loop before calling it stuck.
+///
+/// Generous, because these run against containers on a loaded machine and a
+/// flaky suite teaches people to rerun rather than to read. Finite, because the
+/// alternative is worse: an unbounded `recv().await` on a loop that stopped
+/// publishing hangs until the whole test binary is killed, and what the operator
+/// then sees is a timeout with no failing assertion and no indication which of
+/// the waits it was.
+pub const LOOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Wait for the next signal from a loop, or fail saying which wait gave up.
+///
+/// Every channel wait in this suite goes through here. A regression that stops a
+/// loop signalling should read as a named assertion failure, not as a suite that
+/// never finishes.
+pub async fn next<T>(channel: &mut mpsc::UnboundedReceiver<T>, expectation: &str) -> T {
+    match tokio::time::timeout(LOOP_TIMEOUT, channel.recv()).await {
+        Ok(Some(value)) => value,
+        Ok(None) => panic!("{expectation}, but the channel closed first"),
+        Err(_) => panic!("{expectation}, but nothing arrived within {LOOP_TIMEOUT:?}"),
+    }
 }
 
 /// An installed tracer pipeline plus the exporter holding the spans it finished.

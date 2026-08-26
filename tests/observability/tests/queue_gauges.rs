@@ -99,7 +99,67 @@ async fn queued_rows_become_depth_and_age_series() -> TestResult {
         "nothing was received, and that is a reported zero rather than silence"
     );
 
+    // A second concurrent sampler is refused rather than accepted and silently
+    // wrong. Every callback reads one snapshot, so two loops would overwrite
+    // each other on every refresh and the series would describe whichever
+    // happened to write last.
+    let refused = run_queue_metrics(
+        harness.pool().clone(),
+        vec![harness.outbox_table::<ProductSnapshot>().await?],
+        Vec::new(),
+        sampler_config(),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(kafkaman_worker::Error::QueueMetricsAlreadyRunning)
+        ),
+        "a second sampler should be refused, got {refused:?}"
+    );
+
     shutdown.cancel();
     sampler.await??;
+
+    // Restarting in the same process must not leave the stopped sampler
+    // reporting. OpenTelemetry 0.32 has no way to unregister an observable-gauge
+    // callback and dropping the handle does not remove it, so a sampler that
+    // registered its own would leave the old one observing its frozen snapshot
+    // for the life of the process — these two pending rows would still be
+    // reported long after nothing was sampling them.
+    //
+    // The restart covers no tables at all, which makes the question sharp: the
+    // series must disappear, and they only can if both loops write through the
+    // same registration.
+    let restarted_shutdown = CancellationToken::new();
+    let restarted = tokio::spawn(run_queue_metrics(
+        harness.pool().clone(),
+        Vec::new(),
+        Vec::new(),
+        sampler_config(),
+        restarted_shutdown.clone(),
+    ));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let points = pipeline
+            .collect()
+            .into_iter()
+            .find(|metric| metric.name == "kafkaman.outbox.depth")
+            .map(|metric| metric.points.len())
+            .unwrap_or(0);
+        if points == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a restarted sampler covering no tables still reported {points} outbox              depth points, so the stopped sampler's callback is still registered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    restarted_shutdown.cancel();
+    restarted.await??;
     Ok(())
 }

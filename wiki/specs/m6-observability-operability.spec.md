@@ -59,10 +59,20 @@ that inherits it.
 
 `lifecycle` and `sample_success` reach the relay and dispatcher loops as
 `LifecycleEmission` (`kafkaman-core`), which the loops turn into a
-`LifecycleSampler`. Sampling is deterministic — every `n`-th success, where
-`n = round(1 / sample_success)` — rather than a per-message Bernoulli trial. The
-sampler carries its count across cycles, so a low rate still emits on a
-scheduler handling one message per poll, and the rate is exact over any window.
+`LifecycleSampler`. Sampling is deterministic rather than a per-message Bernoulli
+trial: after `N` successes the sampler has emitted exactly `⌊N ×
+sample_success⌋` events — never ahead of the rate, never a whole event behind it
+— so the rate is exact over any window and a low rate cannot go a long stretch
+emitting nothing, which is precisely when an operator turned sampling on to see
+something. The count carries across cycles, so the rate holds on a scheduler
+handling one message per poll.
+
+**Corrected 2026-08-26.** This paragraph specified "every `n`-th success, where
+`n = round(1 / sample_success)`", and that is what shipped. It silently rounds
+the operator's rate to the nearest reciprocal: `0.75` becomes every 1st (100% of
+successes, at four thirds the intended volume and cost) and `0.66` becomes every
+2nd. Nothing in the config file, the logs, or the metrics would show it. The
+proportional form above is what the sampler does now.
 
 `stuck_after` is the overdue threshold for the stuck-row routes. `max_queue_age`
 sets `over_max_queue_age` on each depth summary bucket; terminal statuses never
@@ -126,6 +136,14 @@ Both metric surfaces sit behind a default-on `metrics` feature on
 `--no-default-features` drops the `opentelemetry` dependency entirely while
 keeping the loops, matching how the crate already gates `rdkafka`.
 
+**Amended 2026-08-26.** That last sentence was a claim no build could check, and
+for a while it was false — sibling crates pulled `kafkaman-core` with default
+features and Cargo unifies across the graph. `just opt-out` now asserts it with
+`cargo tree`, together with the narrower property that followed: each crate
+enables only the OpenTelemetry axis it uses, and a `metrics` build links the
+metrics API alone. Features are additive, so an axis a library enables without
+using is permanent in every adopter's graph. See the compatibility note.
+
 ### SQL inspection
 
 `kafkaman-sqlx` exposes read-only queue inspection APIs:
@@ -168,8 +186,13 @@ The new `kafkaman-axum` crate provides:
 - `CorrelationLayer`, which reads or creates `x-correlation-id`, stores it in
   request extensions, adds it to the request span, and returns it in the response
   header.
-- `admin_router(AdminState)`, with health/readiness, outbox summary, received
-  summary, stuck-row, DLQ summary, and bounded received-DLQ redrive routes.
+- `admin_router(AdminState)`, read-only: health/readiness, outbox summary,
+  received summary, stuck rows on both sides, and the DLQ summary.
+- `redrive_router(AdminState)`, carrying the one destructive route — bounded
+  received-DLQ redrive. Separate from `admin_router` deliberately: a deployment
+  that mounts the read-only router for dashboards must not acquire a
+  re-enqueue endpoint as a side effect. Mounting both is `admin_router(state
+  .clone()).merge(redrive_router(state))`.
 - `serve(listener, app).with_runtime(tasks, shutdown)`, which supervises an Axum
   server plus required runtime tasks, fails if a required task exits before
   shutdown, and — after the server stops — cancels the shutdown token and
@@ -216,12 +239,21 @@ container exists. That leaves a window in which another process can take it, so
 
 ### Example application
 
-`apps/axum-outbox` now mounts `admin_router` under `/internal/kafkaman`, applies
-`CorrelationLayer`, resolves its relay `lifecycle` policy from
-`[observability]`, and supervises the relay through `serve().with_runtime()`
-instead of a hand-rolled `tokio::select!`. This replaces roughly twenty lines of
-bespoke supervision with the library helper and gives every M6 surface an
-end-to-end exercise.
+**Corrected 2026-08-26.** This section described `apps/axum-outbox` mounting
+`admin_router` under `/internal/kafkaman`, applying `CorrelationLayer`, and
+supervising the relay through `serve().with_runtime()`. None of that is on this
+branch: `apps/` is byte-identical to `main`, and the example there states in its
+own README that it demonstrates the M1 durable-send path *without*
+`kafkaman-axum`. The section described work that was reverted, and left the spec
+claiming an end-to-end exercise that did not exist.
+
+M6 ships no example-application change. The end-to-end exercise of every M6
+surface lives in `tests/observability` instead — `admin_http` drives the routes
+over real HTTP against a real database, and `otlp_wire` proves the telemetry
+leaves the process. That is the better home for it anyway: it makes the proof
+independent of whichever example currently ships, which is the reasoning
+`wiki/decisions/telemetry-pipeline-ownership.decision.md` already gives for
+keeping exporter dependencies in `tests/`.
 
 ## Evidence
 
@@ -270,9 +302,10 @@ Recorded verification on 2026-08-24:
 ## Limitations
 
 M6 does not add authentication/authorization for admin routes. Hosts must mount
-the router behind their own access control. `admin_router`'s documentation
-carries this warning at the call site, and the example app nests it under
-`/internal/kafkaman` rather than at the root, but the crate cannot enforce it.
+them behind their own access control. Both routers carry the warning at the call
+site, and splitting the destructive route into `redrive_router` means an
+unauthenticated dashboard mount is at worst a disclosure rather than a
+re-enqueue endpoint — but the crate cannot enforce either.
 
 Three policy fields are reserved rather than implemented: `level`, `payload`, and
 `headers`. They parse and validate but nothing reads them. Filtering today is the
@@ -300,12 +333,21 @@ Making any of them live would be a behavior change to a parsed, validated config
 key, which is exactly what reserving them was meant to avoid.
 
 Queue age and stuck thresholds are available through resolved config and route
-behavior, but M6 does not add asynchronous gauge callbacks that periodically
-query Postgres without an admin request. The summary routes remain unbounded
-aggregates executed per request, one query per message type in sequence.
-Sequential is deliberate — issuing them concurrently would take a pool connection
-per message type away from the relay and dispatcher to serve an operator — but it
-means the routes are sized for an operator or a slow scrape, not a probe.
+behavior. The summary routes are unbounded aggregates executed per request, one
+query per message type in sequence. Sequential is deliberate — issuing them
+concurrently would take a pool connection per message type away from the relay
+and dispatcher to serve an operator — but it means the routes are sized for an
+operator or a slow scrape, not a probe.
+
+**Superseded.** This section said M6 adds no asynchronous gauge callbacks that
+query Postgres without an admin request. `kafkaman_worker::run_queue_metrics`
+now does exactly that, and the qualification that made it worth doing is that the
+callbacks do *not* query: a background loop owns the queries on its own interval
+and the callbacks read the snapshot it maintains. An observable-gauge callback is
+synchronous and could not await a round trip in any case, and a database queried
+on the SDK's collection schedule would be queried hardest exactly when it is
+already struggling. See
+`wiki/decisions/metric-instrument-and-attribute-schema.decision.md`.
 
 `/ready` verifies only that Postgres is reachable. It does not check that tables
 exist, that migrations are current, or that workers are alive.

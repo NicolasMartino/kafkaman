@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use kafkaman_core::LifecycleEmission;
-use kafkaman_sqlx::{dispatch_once, DispatchStats, MessageRouter, ReceivedTable};
+use kafkaman_sqlx::{dispatch_once_sampled, DispatchStats, MessageRouter, ReceivedTable};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,20 @@ pub async fn run_dispatcher(
         // a transient database error must not stop a dispatcher, and the sleep
         // that follows is also the backoff.
         let started = Instant::now();
-        let claimed = match dispatch_once(&pool, &table, &router, OffsetDateTime::now_utc()).await {
+        // The sampler goes in rather than the event coming out. A success event
+        // emitted here, after the call returns, names a message type and nothing
+        // else — the `kafkaman.dispatch` span it belongs to has already closed,
+        // so the line carries no trace id and cannot be pivoted back to the row
+        // it describes. `dispatch_once_sampled` emits it inside that span.
+        let claimed = match dispatch_once_sampled(
+            &pool,
+            &table,
+            &router,
+            OffsetDateTime::now_utc(),
+            &mut lifecycle,
+        )
+        .await
+        {
             Ok(stats) => {
                 metrics.cycle();
                 metrics.rows("claimed", stats.claimed);
@@ -54,12 +67,6 @@ pub async fn run_dispatcher(
                 metrics.rows("failed", stats.failed);
                 if stats.claimed > 0 {
                     metrics.dispatched(dispatch_outcome(&stats), started.elapsed());
-                }
-                for _ in 0..lifecycle.take(stats.processed) {
-                    tracing::info!(
-                        message_type = table.descriptor.message_type.as_str(),
-                        "received message processed"
-                    );
                 }
                 if stats.claimed > 0 {
                     tracing::debug!(

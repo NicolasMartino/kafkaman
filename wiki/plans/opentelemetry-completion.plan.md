@@ -1,7 +1,7 @@
 # OpenTelemetry Completion Plan
 
 - Document Class: Plan
-- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25; Phase 4's compose profile deferred to the incoming example
+- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25 and corrected across two review passes on 2026-08-25/26; Phase 4's example pipeline and compose profile ported 2026-08-27, with full Kibana visibility verification still pending
 - Date: 2026-08-25
 - Category: Observability execution
 - Scope: Turns M6's OpenTelemetry instrumentation into a working, verified, exportable telemetry pipeline — metrics, traces, and logs — and proves it end to end against a real backend.
@@ -14,7 +14,6 @@
   - crates/kafkaman-core/src/lifecycle.rs
   - crates/kafkaman-rdkafka/src/publisher.rs
   - crates/kafkaman-rdkafka/src/ingest_record.rs
-  - apps/axum-outbox/src/main.rs
 - Related:
   - wiki/proposals/13-telemetry-pipeline-completion.proposal.md
   - wiki/decisions/telemetry-pipeline-ownership.decision.md
@@ -293,18 +292,20 @@ work, which is what `sample_success` was for.
 
 ## Phase 4 — Wiring And Example
 
-**Steps 1 and 4 are done; steps 2 and 3 belong to the incoming example.** No
-exporter appears in any `crates/` manifest — on this branch they are confined to
-`tests/` alone — and step 4 stands: no `kafkaman-otel` crate, because pinning
-adopters to our choice of exporter versions is a real cost in an ecosystem that
-releases breaking 0.x versions in lockstep.
+**Steps 1 through 4 are now ported onto the rebased two-service example.** No
+exporter appears in any `crates/` manifest; the SDK and OTLP exporter are held by
+the `order` and `product` example binaries, and by `tests/observability`. Step 4
+still stands: no `kafkaman-otel` crate, because pinning adopters to our choice of
+exporter versions is a real cost in an ecosystem that releases breaking 0.x
+versions in lockstep.
 
-Steps 2 and 3 — the example's own pipeline, and the Elasticsearch/Kibana compose
-profile — are **deliberately not done here**. The compose profile was written to
-extend `examples/compose.yaml` from the two-service example, which is not on this
-branch, and `apps/axum-outbox` is being replaced wholesale by the example under
-construction in a separate worktree. Wiring and compose files written against a
-directory that is about to be deleted would be written twice.
+The 2026-08-27 port put the example's own pipeline in the shared
+`examples/telemetry` crate, which both service binaries depend on, and
+extended `examples/compose.yaml` with an `observability` profile containing
+Elasticsearch and Kibana. The binaries install no provider when every OTLP
+endpoint variable is absent or blank, so the default example remains quiet; `just
+examples observe` supplies `OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp`
+and starts the observed stack.
 
 `tests/observability/otlp_wire` is the working reference for that port: it builds
 a `MeterProvider`, a `TracerProvider`, and a `LoggerProvider` over OTLP/HTTP,
@@ -315,11 +316,11 @@ instrument names, span names, and log lines on the wire.
 
 1. **No exporter in a library crate.** `opentelemetry-otlp` appears in the test
    suite, and in whichever application ships as the example. Never in `crates/`.
-2. **Complete the example's pipeline.** Phase 0 step 5 already installed a
-   metrics-only provider; this adds the tracer provider and the log appender
-   beside it, and extends the shutdown flush to all three. The drain path already
-   exists; telemetry flush joins it, because a process that exits without
-   flushing loses the telemetry about why it exited.
+2. **Complete the example's pipeline.** The two service binaries install a
+   metrics provider, tracer provider, log provider, `tracing-opentelemetry`
+   bridge, and OTel log bridge before building any kafkaman runtime loops. Their
+   shutdown path drains the service first, then shuts down all installed
+   providers so the final export window is not skipped.
 3. **Docker compose — smaller than expected.** The two-service example already
    ships `examples/compose.yaml` with `postgres`, `redpanda`, `console`,
    `product`, and `order`, alongside a `Dockerfile`, `README.md`, and
@@ -329,14 +330,17 @@ instrument names, span names, and log lines on the wire.
    The example exports **directly to Elasticsearch over OTLP/HTTP** with no
    collector; the collector is documented as the production topology. Rationale
    in `wiki/decisions/telemetry-backend-and-example-topology.decision.md`. A
-   Kibana dashboard for the kafkaman instruments ships with it.
+   Kibana dashboard artifact is still pending.
 4. **A `kafkaman-otel` convenience crate is deferred, not rejected.** One call
    that builds the standard pipeline is attractive, but it pins adopters to our
    choice of exporter crate versions — a real cost in an ecosystem that releases
    breaking 0.x versions in lockstep. Document the wiring first; extract the
    crate only if the example proves it is genuinely repetitive.
 
-**Exit:** `docker compose up`, then kafkaman telemetry is visible in Kibana.
+**Exit still pending:** run `just examples observe`, walk the smoke lifecycle,
+and confirm kafkaman metrics, traces, and correlated logs are visible in Kibana.
+Kibana currently opens with no data view over the OTLP indices, so packaging one
+is part of clearing this exit rather than a separate nicety.
 
 ## Phase 5 — The Test Suite
 
@@ -355,6 +359,14 @@ different meanings of "no trace context"), and `otlp_wire` (kafkaman's telemetry
 asserted on the wire in all three signals, moved here from the example so the
 proof does not depend on which example currently ships).
 
+Two more came out of the second review pass, at fourteen binaries in total:
+`ingest_span_covers_decode` (a record that fails to decode still gets a
+`kafkaman.ingest` span and still links to the producer — the path nobody watches,
+because quarantine keeps the partition moving and the queue looking healthy) and
+`queue_gauge_ordering` (the gauges bind to the provider installed when the first
+sampler starts, permanently, so a host that starts sampling before wiring its
+pipeline gets silence).
+
 
 `tests/observability/` as a sibling workspace member, mirroring `durable-send`'s
 layout: a shared `src/` harness, one `tests/<concern>/main.rs` per binary.
@@ -363,9 +375,9 @@ layout: a shared `src/` harness, one `tests/<concern>/main.rs` per binary.
 | --- | --- |
 | `metrics_surface` | Instrument names, kinds, units, attribute sets, and values, from real relay/dispatch/ingest cycles through an in-memory SDK exporter. Includes the disjointness invariant as a real assertion. |
 | `provider_ordering` | Phase 0's fix: an SDK installed after first record still collects. |
-| `trace_propagation` | One trace id spans enqueue → relay publish → Kafka → ingest → dispatch, across two harnesses. |
+| `trace_propagation` | Context survives both durable gaps: enqueue → relay publish in one trace, ingest → dispatch in another, joined by a link. **Corrected 2026-08-26:** this row originally said "one trace id spans enqueue → … → dispatch", which contradicts Decision 6 of the propagation decision — a consumer links, and a link starts a new trace. The test asserts two trace ids and a link between them. |
 | `admin_http` | Every admin route over real HTTP against real Postgres, plus the correlation round trip. The routes are currently only exercised through `admin_free_router()`. |
-| `lifecycle_events` | `sample_success = 0.5` yields exactly ⌈n/2⌉ events across cycles; the default is silent. |
+| `lifecycle_events` | `sample_success = 0.5` yields exactly ⌊n/2⌋ events across cycles; the default is silent. |
 | `metrics_disabled` | `--no-default-features` compiles and records nothing. |
 
 **Constraint that shapes the split:** one global provider per process. Metric
@@ -460,3 +472,48 @@ It *is* a prerequisite for the spec's claim that kafkaman delivers OpenTelemetry
 metrics being verifiable rather than merely asserted. Phase 0 and Phase 5's
 `metrics_surface` binary are the minimum that makes the existing claim true.
 Everything after that is new capability.
+
+## What The Review Passes Changed
+
+**Added 2026-08-26.** Three implementation reviews followed the phases above.
+They matter to this plan rather than only to the changelog, because each found
+defects in work the plan had already marked completed — and in each case the
+completion was recorded honestly against the phase's own exit criterion. The
+criteria were the problem.
+
+- **Phase 0's exit was "an instrument is observable".** It was, and the
+  `metrics`/`traces` opt-out the same phase advertised was nevertheless false:
+  `kafkaman --no-default-features` still linked `opentelemetry`, because two
+  sibling crates pulled `kafkaman-core` with default features and Cargo unifies
+  features across the graph. No build failed, because there is no build that
+  could. Only `cargo tree` can answer it, which is why `just opt-out` now does,
+  in the fast gate and in CI.
+- **Phase 3's exit was "events carry trace ids".** They did. The rate at which
+  they were emitted was wrong: `LifecycleSampler` rounded `sample_success` to the
+  nearest reciprocal, so `0.75` emitted every success. Invisible from the config
+  file, the logs, and the metrics alike.
+- **Phase 2's exit was "context survives both durable gaps".** It did, and a
+  relay built without `traces` stripped `traceparent` from every message it
+  published — breaking propagation for the instrumented services *around* it,
+  which is not a gap this phase thought to look at.
+
+- **The migration written in response to the first review had its own version of
+  this.** `AddReceivedFailureMetadata` added the DLQ's two failure columns, and
+  its exit was "a legacy table converges on the current shape". It did. The rows
+  in it did not: the columns arrived empty, so every pre-existing dead letter
+  rendered with a failure kind it could not be filtered or redriven by. A
+  migration's exit criterion is what the data looks like afterwards, not what the
+  schema does.
+
+The generalisable lesson, recorded because it will apply to the next plan as
+much as this one: a phase whose exit criterion is "the feature works" is
+verified against the path the author had in mind. The three defects above all
+sat one step to the side of it — in the dependency graph rather than the build,
+in the rate rather than the record, in the *absence* of a feature rather than
+its presence. Where a phase makes a claim about something a build cannot check,
+the exit criterion has to name the check.
+
+The full list of changes is in
+`wiki/compatibility/m6-observability-operability-api.compat.md` under
+"Review-Pass Changes", "Second Review-Pass Changes" and "Third Review-Pass
+Changes".

@@ -89,5 +89,37 @@ async fn a_relay_cycle_reports_the_scheduled_instruments() -> TestResult {
         "occurred_at precedes the acknowledgement, so the latency is non-negative"
     );
 
+    // And nothing else. The assertions above say every scheduled instrument is
+    // present; this one says the schedule is the whole surface. An instrument
+    // that appears without being scheduled is the same compatibility problem as
+    // one that disappears — a dashboard is built on whatever it finds, and a
+    // series added by accident is a series somebody depends on before anyone
+    // notices it was never meant to exist.
+    //
+    // The list is the relay's own instruments and no others. `scheduler.errors`
+    // is on it because the loop builds it whether or not anything goes wrong;
+    // whether an instrument with no measurements reaches the exporter at all is
+    // the SDK's business, and not something this test should assert either way.
+    // What it does assert is that no *other* loop's series appear: no ingester
+    // and no queue sampler ran here, so a `kafkaman.kafka.*` or
+    // `kafkaman.queue.*` series would mean an instrument is being recorded from
+    // somewhere that is not running.
+    const RELAY_SCHEDULE: [&str; 5] = [
+        "kafkaman.scheduler.cycles",
+        "kafkaman.scheduler.rows",
+        "kafkaman.scheduler.errors",
+        "kafkaman.relay.publish.duration",
+        "kafkaman.outbox.time_to_publish",
+    ];
+    let collected = pipeline.collected_names();
+    let unscheduled: Vec<&String> = collected
+        .iter()
+        .filter(|name| !RELAY_SCHEDULE.contains(&name.as_str()))
+        .collect();
+    assert!(
+        unscheduled.is_empty(),
+        "a relay cycle reported instruments outside its schedule: {unscheduled:?}"
+    );
+
     Ok(())
 }

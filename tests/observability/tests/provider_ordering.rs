@@ -58,5 +58,19 @@ async fn a_provider_installed_after_a_relay_has_run_still_collects() -> TestResu
          but the exporter only saw {collected:?}"
     );
 
+    // 5. And only the second run's. The first row published in step 1 is gone,
+    //    not buffered — an instrument bound to the no-op provider discards, it
+    //    does not queue. Asserting the count rather than mere presence is what
+    //    separates "the second run collected" from "both runs collected", and
+    //    only one of those is what an instrument rebuilt per loop can do.
+    let published = pipeline.metric("kafkaman.outbox.time_to_publish");
+    let total: u64 = published.points.iter().map(|point| point.count).sum();
+    assert_eq!(
+        total, 1,
+        "each run publishes exactly one row, and only the run after the install \
+         is observable — a total of 2 would mean the pre-install observation had \
+         been held somewhere, and a total of 0 that the rebind never happened"
+    );
+
     Ok(())
 }

@@ -32,12 +32,103 @@ lint:
     # this gate ever compiles the disabled halves — and a twin that stops
     # compiling is discovered by an adopter, not by us.
     cargo check -p kafkaman --no-default-features
+    just opt-out
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
     cargo test --workspace --lib
+
+# Prove the OpenTelemetry opt-out is real, not just documented.
+#
+# Compiling with `--no-default-features` does not prove it. Cargo unifies
+# features across the whole graph, so one internal crate depending on
+# `kafkaman-core` with default features puts `opentelemetry` back in while every
+# build still succeeds — which is exactly how the contract was false for a
+# while. Only the dependency graph can answer the question, and `cargo tree`
+# answers it in milliseconds, so this runs in the fast gate rather than the slow
+# one.
+#
+# `cargo tree -i` exits non-zero when the package is not in the graph, so the
+# assertion is that it *fails*.
+opt-out:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for features in "" "axum" "rdkafka" "axum,rdkafka"; do
+      if cargo tree -p kafkaman -e normal --no-default-features \
+           --features "$features" -i opentelemetry >/dev/null 2>&1; then
+        echo "opentelemetry is linked with --no-default-features --features '$features'" >&2
+        echo "an internal dependency is pulling kafkaman-core or kafkaman-sqlx with defaults" >&2
+        exit 1
+      fi
+    done
+    # The other half of the ownership boundary: no crate under `crates/` may
+    # depend on an SDK or an exporter, at any feature combination. A library that
+    # links the SDK decides the host's pipeline for it — which provider, which
+    # exporter, which shutdown — and there is no way for the host to take that
+    # back. `--all-features` is the strongest form of the question.
+    for crate in kafkaman kafkaman-core kafkaman-config kafkaman-sqlx \
+                 kafkaman-worker kafkaman-rdkafka kafkaman-axum; do
+      for forbidden in opentelemetry_sdk opentelemetry-otlp opentelemetry-appender-tracing; do
+        if cargo tree -p "$crate" -e normal --all-features -i "$forbidden" >/dev/null 2>&1; then
+          echo "$crate depends on $forbidden; SDKs and exporters belong to the host" >&2
+          exit 1
+        fi
+      done
+    done
+    # And the third question, which the two above cannot ask: when
+    # `opentelemetry` *is* linked, is it linked narrowly? Cargo features are
+    # additive and a host can never subtract one, so a library crate that
+    # enables an axis it does not use has widened every adopter's graph
+    # permanently. A metrics-only deployment must not carry the trace API, and
+    # neither build has any business carrying `logs` — that signal belongs to
+    # the appender, which is a host dependency.
+    enabled() {
+      cargo tree -p kafkaman -e features --no-default-features --features "$1" \
+           -i opentelemetry 2>/dev/null \
+        | sed -n 's/.*opentelemetry feature "\([a-z-]*\)".*/\1/p' | sort -u
+    }
+    for spec in "metrics:trace" "metrics:logs" "traces:metrics" "traces:logs"; do
+      build="${spec%%:*}"
+      forbidden="${spec##*:}"
+      if enabled "$build" | grep -qx "$forbidden"; then
+        echo "a '$build' build enables the opentelemetry '$forbidden' feature" >&2
+        echo "narrow the axis in the crate that asks for it; a host cannot undo it" >&2
+        exit 1
+      fi
+    done
+    # The forbidden pairs above say what must not be there. This says what is:
+    # a metrics build links the metrics API and nothing else, which is the
+    # strongest claim that can be pinned. The traces axis cannot be — `trace`
+    # drags in opentelemetry's own optional dependencies (`futures`, `thiserror`
+    # and friends), a list that belongs to upstream and would turn one of their
+    # patch releases into a red build here. That set is recorded in the
+    # compatibility note instead of asserted.
+    actual=$(enabled metrics | paste -sd, -)
+    if [ "$actual" != "metrics" ]; then
+      echo "a metrics build enables opentelemetry [$actual], expected [metrics]" >&2
+      echo "something in the graph widened the axis; a host cannot undo it" >&2
+      exit 1
+    fi
+    echo "opt-out holds: no opentelemetry without metrics or traces, no SDK in crates/,"
+    echo "and a metrics build links the metrics API alone"
+
+# Every feature combination that ships.
+#
+# `metrics` and `traces` are independent switches, and `axum` ships without
+# `rdkafka`, so five of these seven combinations are only ever compiled here. A `#[cfg]` that assumes its sibling
+# feature is on compiles cleanly under `--all-features` and breaks for whoever
+# turns exactly one of them off.
+features:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for features in "" "metrics" "traces" "metrics,traces" \
+                    "axum" "axum,rdkafka" "axum,rdkafka,metrics,traces"; do
+      echo "==> --no-default-features --features '$features'"
+      cargo check -p kafkaman --all-targets --no-default-features --features "$features"
+    done
 
 # Format, lint, and run the full test suite. Mirrors .github/workflows/ci.yml.
 check:
     just lint
+    just features
     just test all
 
 # Normal successful tests rely on Testcontainers' Drop cleanup. This fallback is
@@ -51,10 +142,10 @@ clean-containers:
                        --filter label=com.kafkaman.managed-by=testcontainers)
     if [ -n "$ids" ]; then docker rm -f $ids; else echo "nothing to clean"; fi
 
-# `demo` is the whole thing in containers; `up` starts only the infrastructure
-# and leaves the services to cargo. The other three attach to whichever of the
-# two is already running.
-[doc("Drive the example stack. arg: demo (default) | up | ui | logs | down")]
+# `demo` is the whole thing in containers; `observe` adds Elasticsearch and
+# Kibana; `up` starts only the infrastructure and leaves the services to cargo.
+# The other three attach to whichever of the two is already running.
+[doc("Drive the example stack. arg: demo (default) | observe | up | ui | logs | down")]
 examples arg="demo":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -65,13 +156,41 @@ examples arg="demo":
         # The `services` profile pulls in the one-shot `provision` container,
         # which both services gate on; `--wait` treats its clean exit as
         # satisfied rather than as a service that failed to stay up.
-        "${compose[@]}" --profile services up -d --build --wait --wait-timeout 600
+        #
+        # The endpoint is pinned empty rather than left to the shell. Compose
+        # reads `${OTEL_EXPORTER_OTLP_ENDPOINT:-}` from the environment, so a
+        # developer who exports one for their own tooling would otherwise get
+        # containers exporting at an address that means something else inside
+        # the compose network — usually their own loopback, which is nothing.
+        OTEL_EXPORTER_OTLP_ENDPOINT= \
+          "${compose[@]}" --profile services up -d --build --wait --wait-timeout 600
         examples/smoke.sh
         echo ""
         echo "The stack is still running:"
         echo "  order    http://127.0.0.1:3001/swagger-ui"
         echo "  product  http://127.0.0.1:3002/swagger-ui"
         echo "  message UI:  just examples ui"
+        echo "Tear it down with: just examples down"
+        ;;
+      observe)
+        # Direct to Elasticsearch's native OTLP/HTTP endpoint. The exporter
+        # appends /v1/metrics, /v1/traces, and /v1/logs to this base path.
+        OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp \
+          "${compose[@]}" --profile services --profile observability \
+            up -d --build --wait --wait-timeout 900
+        examples/smoke.sh
+        echo ""
+        echo "The observed stack is still running:"
+        echo "  order    http://127.0.0.1:3001/swagger-ui"
+        echo "  product  http://127.0.0.1:3002/swagger-ui"
+        echo "  Kibana   http://127.0.0.1:${KIBANA_PORT:-5601}"
+        echo "  message UI:  just examples ui"
+        echo ""
+        echo "Kibana ships with no data view for the kafkaman signals yet, so it"
+        echo "opens empty. Discover -> create a data view over the indices"
+        echo "Elasticsearch's OTLP endpoint writes to; a packaged dashboard is"
+        echo "still pending (wiki/plans/opentelemetry-completion.plan.md)."
+        echo ""
         echo "Tear it down with: just examples down"
         ;;
       up)
@@ -105,6 +224,6 @@ examples arg="demo":
       # `-v` so the next start is genuinely clean: the volumes hold the Postgres
       # data directory and Redpanda's log, and provisioning is what rebuilds
       # both.
-      down)  "${compose[@]}" --profile services --profile ui down -v ;;
-      *) echo "usage: just examples [demo|up|ui|logs|down]" >&2; exit 1 ;;
+      down)  "${compose[@]}" --profile services --profile ui --profile observability down -v ;;
+      *) echo "usage: just examples [demo|observe|up|ui|logs|down]" >&2; exit 1 ;;
     esac

@@ -1,9 +1,9 @@
-use kafkaman_core::KafkaMessage;
+use kafkaman_core::{Envelope, KafkaMessage, TraceContext};
 use rdkafka::message::{Header, OwnedHeaders, OwnedMessage};
 use rdkafka::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::ingest_record::record_envelope;
+use crate::ingest_record::{record_envelope, RecordHeaders};
 use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -42,6 +42,30 @@ fn record(headers: OwnedHeaders) -> OwnedMessage {
     )
 }
 
+/// One record, decoded the way `ingest_once` decodes it.
+///
+/// The two halves travel together because they come out of one pass over the
+/// headers and because the tests below care about the pair: the producer context
+/// the ingest span links to, and the user headers left once the reserved and
+/// trace namespaces have been stripped.
+struct Ingested {
+    envelope: Envelope<ProductSnapshot>,
+    producer_trace: Option<TraceContext>,
+}
+
+fn decode(headers: OwnedHeaders) -> crate::Result<Ingested> {
+    let message = record(headers);
+    // Header scan first, exactly as the consumer does it: the ingest span needs
+    // the producer's context before the payload has been looked at.
+    let scanned = RecordHeaders::of(&message);
+    let producer_trace = scanned.trace_context();
+    let decoded = record_envelope::<ProductSnapshot, _>(&message, &scanned)?;
+    Ok(Ingested {
+        envelope: decoded.envelope,
+        producer_trace,
+    })
+}
+
 fn header(key: &str, value: &str) -> OwnedHeaders {
     OwnedHeaders::new().insert(Header {
         key,
@@ -61,9 +85,7 @@ fn a_malformed_idempotency_source_degrades_instead_of_failing_ingest() {
         value: Some("{not json"),
     });
 
-    let envelope = record_envelope::<ProductSnapshot, _>(&record(headers))
-        .expect("ingest must proceed")
-        .envelope;
+    let envelope = decode(headers).expect("ingest must proceed").envelope;
 
     let identity = envelope
         .idempotency_key
@@ -82,9 +104,7 @@ fn a_well_formed_idempotency_source_survives_the_wire() {
         value: Some(r#"{"order_id":"o-1"}"#),
     });
 
-    let envelope = record_envelope::<ProductSnapshot, _>(&record(headers))
-        .unwrap()
-        .envelope;
+    let envelope = decode(headers).unwrap().envelope;
     let source = envelope
         .idempotency_key
         .and_then(|identity| identity.source)
@@ -103,7 +123,7 @@ fn a_malformed_occurred_at_is_rejected_rather_than_degraded() {
     });
 
     assert!(matches!(
-        record_envelope::<ProductSnapshot, _>(&record(headers)),
+        decode(headers),
         Err(Error::InvalidHeader {
             name: "kafkaman-occurred-at",
             ..
@@ -142,9 +162,7 @@ fn duplicate_headers_resolve_in_opposite_directions_by_namespace() {
             value: Some("second"),
         });
 
-    let envelope = record_envelope::<ProductSnapshot, _>(&record(headers))
-        .unwrap()
-        .envelope;
+    let envelope = decode(headers).unwrap().envelope;
 
     assert_eq!(
         envelope.message_id, first,
@@ -182,8 +200,7 @@ fn w3c_trace_headers_are_extracted_and_kept_out_of_user_headers() {
             value: Some("kept"),
         });
 
-    let decoded = record_envelope::<ProductSnapshot, _>(&record(headers))
-        .expect("trace headers are never a reason to reject a record");
+    let decoded = decode(headers).expect("trace headers are never a reason to reject a record");
 
     let trace = decoded
         .producer_trace
@@ -220,7 +237,7 @@ fn trace_header_matching_ignores_case() {
         value: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
     });
 
-    let decoded = record_envelope::<ProductSnapshot, _>(&record(headers)).unwrap();
+    let decoded = decode(headers).unwrap();
     assert!(decoded.producer_trace.is_some());
     assert!(decoded.envelope.headers.is_empty());
 }
@@ -236,11 +253,118 @@ fn a_malformed_traceparent_costs_the_trace_and_nothing_else() {
         value: Some("00-not-a-trace-id"),
     });
 
-    let decoded = record_envelope::<ProductSnapshot, _>(&record(headers))
-        .expect("a malformed traceparent must not reject the record");
+    let decoded = decode(headers).expect("a malformed traceparent must not reject the record");
     assert!(decoded.producer_trace.is_none());
     assert!(
         !decoded.envelope.headers.contains_key("traceparent"),
         "unusable trace context is still trace context, and still not user data"
+    );
+}
+
+/// A duplicated trace header resolves to the first copy, not the last.
+///
+/// Kafka allows repeated keys, and the three namespaces do not agree on which
+/// copy wins: user headers keep the last, reserved and trace keys keep the
+/// first. The direction is what makes it a rule rather than an accident — the
+/// later copy of a `traceparent` is either a mistake or an attempt to move a
+/// message into a trace it does not belong to, and a consumer that took it would
+/// link its ingest span to whichever trace an attacker preferred.
+#[test]
+fn a_duplicated_traceparent_keeps_the_first_copy() {
+    const FIRST: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const SECOND: &str = "00-11111111111111111111111111111111-2222222222222222-01";
+
+    let headers = header("kafkaman-idempotency-key", DIGEST)
+        .insert(Header {
+            key: "traceparent",
+            value: Some(FIRST),
+        })
+        .insert(Header {
+            key: "traceparent",
+            value: Some(SECOND),
+        })
+        // Case is not a way around it either: the second copy is the same
+        // header as far as the namespace is concerned.
+        .insert(Header {
+            key: "TRACEPARENT",
+            value: Some(SECOND),
+        });
+
+    let decoded = decode(headers).unwrap();
+    let trace = decoded.producer_trace.expect("the first copy is usable");
+    assert_eq!(trace.traceparent(), FIRST);
+}
+
+/// The grammar is the W3C one, checked at the edge rather than downstream.
+///
+/// Every value here looks close enough to pass a shape check and is invalid
+/// under the Recommendation. Accepting one means kafkaman stores it in a column,
+/// puts it back on the wire, and hands another service a trace id that does not
+/// match the one its own SDK would have produced for the same trace — a
+/// corruption that is essentially undebuggable from the far end.
+#[test]
+fn a_traceparent_that_breaks_the_w3c_grammar_is_dropped() {
+    for value in [
+        // Uppercase hex. The grammar is `HEXDIGLC`, and a backend comparing
+        // trace ids as bytes sees a different trace.
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        // Version 00 is a closed format: nothing follows the flags.
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        // The specification's invalid all-zero ids.
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        // `ff` is a reserved, forbidden version.
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ] {
+        let headers = header("kafkaman-idempotency-key", DIGEST).insert(Header {
+            key: "traceparent",
+            value: Some(value),
+        });
+
+        let decoded = decode(headers).expect("an invalid traceparent must never reject a record");
+        assert!(
+            decoded.producer_trace.is_none(),
+            "{value:?} is not a W3C traceparent and must not be treated as one"
+        );
+        assert!(
+            decoded.envelope.headers.is_empty(),
+            "{value:?} is unusable trace context, which is still not user data"
+        );
+    }
+}
+
+/// A newer producer's `traceparent` is still usable.
+///
+/// The other half of the grammar rule, and the one that costs something if it is
+/// wrong: the Recommendation requires forward compatibility, so a later version
+/// appends fields rather than rearranging the first four. Rejecting them would
+/// silently break tracing against every service that upgraded first.
+#[test]
+fn a_future_version_traceparent_is_still_extracted() {
+    let headers = header("kafkaman-idempotency-key", DIGEST).insert(Header {
+        key: "traceparent",
+        value: Some("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-something"),
+    });
+
+    let decoded = decode(headers).unwrap();
+    assert!(decoded.producer_trace.is_some());
+}
+
+/// `tracestate` without a `traceparent` describes nothing.
+///
+/// It is a vendor list keyed to a trace, so on its own it is not a partial
+/// context to be salvaged — it is a header with no referent.
+#[test]
+fn a_tracestate_alone_is_not_a_context() {
+    let headers = header("kafkaman-idempotency-key", DIGEST).insert(Header {
+        key: "tracestate",
+        value: Some("vendor=1"),
+    });
+
+    let decoded = decode(headers).unwrap();
+    assert!(decoded.producer_trace.is_none());
+    assert!(
+        !decoded.envelope.headers.contains_key("tracestate"),
+        "it is still protocol context rather than application data"
     );
 }

@@ -147,7 +147,9 @@ pub struct TopicsSection {
 ///
 /// `Default` is what an absent section means, and it is deliberately the same
 /// value as an empty `[observability]` table: no overrides anywhere, so every
-/// policy falls through to [`ObservabilityPolicy::default`].
+/// policy falls through to [`ObservabilityPolicy::default`]. Writing the section
+/// and leaving it empty is therefore indistinguishable from omitting it, which
+/// is the property that lets the section be optional without a second code path.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilitySection {

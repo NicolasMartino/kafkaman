@@ -21,7 +21,10 @@ traces = ["kafkaman-core/traces", "kafkaman-sqlx/traces"]
 async-trait.workspace = true
 kafkaman-core = { path = "../kafkaman-core", default-features = false }
 kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
-opentelemetry = { workspace = true, optional = true }
+# Metrics only: this crate records counters and histograms and never touches
+# the trace API — `traces` here delegates to `kafkaman-core`, which owns the
+# span work. See the workspace manifest for why the axis is named per crate.
+opentelemetry = { workspace = true, optional = true, features = ["metrics"] }
 opentelemetry-semantic-conventions = { workspace = true, optional = true }
 sqlx.workspace = true
 thiserror.workspace = true

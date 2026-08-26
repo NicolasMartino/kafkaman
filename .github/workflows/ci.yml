@@ -1,6 +1,12 @@
-# Runs exactly what `just check` runs locally, so a green local run means a green
-# CI run. The absence of this workflow is how a `clippy -D warnings` failure and
-# a semantically broken test reached the branch.
+# Runs what `just check` runs locally — lint, the feature matrix, the full test
+# suite — plus one job it does not: the coverage floor. That one re-runs the
+# whole suite under instrumentation, which is too slow to sit in a gate meant to
+# be run before every push; `just test coverage` is the local equivalent when it
+# is the job that went red. Everything else is the same command, so a green
+# `just check` predicts everything but that.
+#
+# The absence of this workflow is how a `clippy -D warnings` failure and a
+# semantically broken test reached the branch.
 name: CI
 
 on:
@@ -34,6 +40,66 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # The OpenTelemetry opt-out, which no build can prove. Cargo unifies
+      # features across the graph, so one internal crate depending on
+      # `kafkaman-core` with default features re-links `opentelemetry` while
+      # every `--no-default-features` build still succeeds. `cargo tree -i`
+      # exits non-zero when the package is absent, so absence is the pass.
+      - name: opentelemetry opt-out holds
+        run: |
+          for features in "" "axum" "rdkafka" "axum,rdkafka"; do
+            if cargo tree -p kafkaman -e normal --no-default-features \
+                 --features "$features" -i opentelemetry >/dev/null 2>&1; then
+              echo "::error::opentelemetry linked with --no-default-features --features '$features'"
+              exit 1
+            fi
+          done
+          # No crate under crates/ may depend on an SDK or exporter at any
+          # feature combination: that choice belongs to the host process.
+          for crate in kafkaman kafkaman-core kafkaman-config kafkaman-sqlx \
+                       kafkaman-worker kafkaman-rdkafka kafkaman-axum; do
+            for forbidden in opentelemetry_sdk opentelemetry-otlp opentelemetry-appender-tracing; do
+              if cargo tree -p "$crate" -e normal --all-features -i "$forbidden" >/dev/null 2>&1; then
+                echo "::error::$crate depends on $forbidden"
+                exit 1
+              fi
+            done
+          done
+          # And when opentelemetry *is* linked, it must be linked narrowly.
+          # Features are additive and a host can never subtract one, so an axis
+          # a library enables without using is permanent in every adopter's
+          # graph.
+          enabled() {
+            cargo tree -p kafkaman -e features --no-default-features --features "$1" \
+                 -i opentelemetry 2>/dev/null \
+              | sed -n 's/.*opentelemetry feature "\([a-z-]*\)".*/\1/p' | sort -u
+          }
+          for spec in "metrics:trace" "metrics:logs" "traces:metrics" "traces:logs"; do
+            if enabled "${spec%%:*}" | grep -qx "${spec##*:}"; then
+              echo "::error::a '${spec%%:*}' build enables the opentelemetry '${spec##*:}' feature"
+              exit 1
+            fi
+          done
+          # And the positive form, for the axis that can carry one: a metrics
+          # build links the metrics API alone. `traces` cannot be pinned this
+          # way — `trace` pulls opentelemetry's own optional dependencies, whose
+          # list is upstream's to change.
+          actual=$(enabled metrics | paste -sd, -)
+          if [ "$actual" != "metrics" ]; then
+            echo "::error::a metrics build enables opentelemetry [$actual], expected [metrics]"
+            exit 1
+          fi
+      # `metrics` and `traces` are independent switches, and `axum` ships
+      # without `rdkafka`. Five of these seven combinations are compiled
+      # nowhere else, and a `#[cfg]` that assumes its
+      # sibling feature is on is invisible under `--all-features`.
+      - name: feature matrix
+        run: |
+          for features in "" "metrics" "traces" "metrics,traces" \
+                          "axum" "axum,rdkafka" "axum,rdkafka,metrics,traces"; do
+            echo "==> --no-default-features --features '$features'"
+            cargo check -p kafkaman --all-targets --no-default-features --features "$features"
+          done
 
   test:
     name: tests

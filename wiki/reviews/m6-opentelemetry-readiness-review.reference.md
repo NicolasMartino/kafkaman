@@ -148,3 +148,33 @@ The review's recommended order maps onto the filed plan as:
 Two independent passes over the same code produced the same sequence, differing
 only on where example wiring belongs. That agreement is itself evidence the
 ordering is right.
+
+## Outcome
+
+**Added 2026-08-26.** Every step this review recommended has landed, and three
+later implementation reviews of the resulting branch found defects it did not
+reach — which is not a criticism of it. This review read the M6 code and asked
+"what is missing"; the later ones read the completed pipeline and asked "is what
+is here correct". The three most consequential findings were of the second kind:
+
+- The `metrics`/`traces` opt-out advertised in step 1's neighbourhood was false
+  in the dependency graph while every build succeeded.
+- `LifecycleSampler` rounded `sample_success` to the nearest reciprocal.
+- The step 6 propagation this review called the plan's only irreversible step
+  worked in both directions it was tested in, and a relay built *without*
+  `traces` stripped `traceparent` from every message it published.
+
+The third pass added a fourth of the same kind: `AddReceivedFailureMetadata`
+added the DLQ's two failure columns and left them empty, which is invisible to a
+reading of the changeset and obvious to one that asks what an operator sees next
+— a dead letter that renders with a failure kind and cannot be redriven by it.
+
+None of these is visible from a reading that asks what exists. All are visible
+from one that asks what a specific configuration does. Recorded here
+because this document is the one a future reader reaches for when asking how
+well the OTel work was reviewed.
+
+Residuals as of 2026-08-26: Phase 4's Elasticsearch/Kibana compose profile and
+the Elastic deployment reference page, both deliberately deferred to the example
+under construction rather than written against `apps/axum-outbox`, which is being
+replaced. See `wiki/plans/opentelemetry-completion.plan.md`.

@@ -110,9 +110,10 @@ impl Config {
     ///
     /// Optional, like `[retention]` and unlike `[relay]`: every field in it has
     /// a quiet production default, so an absent section is a complete policy
-    /// rather than an incomplete one. Callers that want the resolved policy
-    /// should use [`Config::observability_config`], which applies those
-    /// defaults.
+    /// rather than an incomplete one — which is what the example config has
+    /// always said. Callers that want the resolved policy should use
+    /// [`Config::observability_config`], which applies those defaults rather
+    /// than leaving each caller to remember them.
     pub fn observability(&self) -> Result<Option<ObservabilitySection>> {
         self.section("observability")
     }
@@ -175,6 +176,12 @@ impl Config {
             .collect::<BTreeSet<_>>();
 
         let observability = match self.observability() {
+            // An absent section resolves to the documented defaults rather than
+            // to an error. `ResolvedConfig` used to special-case exactly this
+            // with a `contains("observability")` guard of its own, which left
+            // every *other* caller getting `MissingKey` for a section the
+            // example config marks OPTIONAL — the config was optional in one
+            // code path and required in another.
             Ok(observability) => observability.unwrap_or_default(),
             Err(err) => return Err(ConfigErrors::new(vec![err.into()])),
         };

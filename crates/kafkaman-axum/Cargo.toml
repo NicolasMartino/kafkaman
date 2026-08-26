@@ -7,8 +7,11 @@ repository.workspace = true
 
 [dependencies]
 axum.workspace = true
-kafkaman-core = { path = "../kafkaman-core" }
-kafkaman-sqlx = { path = "../kafkaman-sqlx" }
+# Default-off for the same reason as `kafkaman-config`: an internal dependency
+# that asks for `traces` re-enables it for every crate in the graph. The admin
+# routes emit through `tracing` alone and need no OpenTelemetry types.
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

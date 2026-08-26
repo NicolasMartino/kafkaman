@@ -8,7 +8,13 @@ repository.workspace = true
 [features]
 default = ["metrics", "traces"]
 # Reusable Axum admin/health routes and request correlation middleware.
-axum = ["dep:kafkaman-axum"]
+#
+# `dep:axum` alongside the obvious `dep:kafkaman-axum`: the facade declares a
+# `pub mod axum` of its own, so `src/axum.rs` has to name the crate as
+# `::axum` to disambiguate, and a leading `::` resolves only against a direct
+# dependency. It costs nothing in the graph — `kafkaman-axum` already pulls
+# the same workspace-pinned `axum` in.
+axum = ["dep:axum", "dep:kafkaman-axum"]
 # Links librdkafka; opt in when the application publishes or consumes.
 #
 # `RuntimeBuilder` lives behind this feature rather than beside it: assembling a
@@ -17,6 +23,13 @@ axum = ["dep:kafkaman-axum"]
 rdkafka = ["dep:kafkaman-rdkafka"]
 # OpenTelemetry counters from the worker loops and Kafka transport. On by
 # default; opt out to build without an `opentelemetry` dependency.
+#
+# "Without an `opentelemetry` dependency" is a claim about the dependency graph,
+# not about this file, and Cargo will not enforce it: every internal dependency
+# below carries `default-features = false` for that reason, and `just opt-out`
+# asserts the result. One sibling crate asking for the default `traces` puts
+# `opentelemetry` back into a `--no-default-features` build with nothing failing
+# to compile.
 metrics = ["kafkaman-worker/metrics", "kafkaman-rdkafka?/metrics"]
 # W3C trace context capture and span parenting. On by default; opt out to build
 # without an `opentelemetry` dependency at all. Stored context is still read and
@@ -30,6 +43,7 @@ traces = [
 ]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 kafkaman-axum = { path = "../kafkaman-axum", optional = true }
 kafkaman-config = { path = "../kafkaman-config" }
 kafkaman-core = { path = "../kafkaman-core", default-features = false }

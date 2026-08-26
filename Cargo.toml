@@ -12,6 +12,7 @@ members = [
     "examples/order",
     "examples/product",
     "examples/provision",
+    "examples/telemetry",
     "tests/durable-send",
     "tests/distributed-cache",
     "tests/observability",
@@ -27,7 +28,16 @@ repository = "https://github.com/nicolasmartino/kafkaman"
 [workspace.dependencies]
 async-trait = "0.1"
 axum = "0.8"
-opentelemetry = { version = "0.32", features = ["metrics"] }
+# Default features off, and every crate below enables exactly the one axis it
+# uses: `kafkaman-core` the trace API, `kafkaman-worker` and `kafkaman-rdkafka`
+# the metrics API. Cargo features are additive and a host cannot subtract one,
+# so a library that enables `trace` for a metrics-only build has widened that
+# build's graph permanently — the default set also drags in `logs`, `futures`
+# and `thiserror`. Nothing is lost by narrowing: a host that installs the SDK
+# gets `trace`, `metrics`, `logs` and `internal-logs` back through
+# `opentelemetry_sdk`'s own defaults, and a host that wants OpenTelemetry's
+# internal diagnostics without the SDK can add the feature itself.
+opentelemetry = { version = "0.32", default-features = false }
 # The SDK and the exporter never appear in a `crates/` manifest — the host owns
 # the pipeline, and the example app is a host. The observability suite adds the
 # `testing` feature on top of this.
@@ -42,7 +52,11 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 # `opentelemetry` API crate and `tracing-subscriber`, and no SDK — which is what
 # lets a library crate depend on it. 0.33 is the release paired with
 # `opentelemetry` 0.32.
-tracing-opentelemetry = "0.33"
+# Default features off: they add `tracing-log` and a `MetricsLayer` this
+# workspace never builds. `kafkaman-core` wants exactly one thing from this
+# crate — the span bridge behind `OpenTelemetrySpanExt` — and the narrower the
+# library crates' graph is, the less an adopter inherits for turning `traces` on.
+tracing-opentelemetry = { version = "0.33", default-features = false }
 # The `tracing` -> OpenTelemetry *logs* bridge. Application-side only: it needs a
 # LoggerProvider, which is SDK.
 opentelemetry-appender-tracing = "0.32"

@@ -18,6 +18,20 @@ pub struct LifecycleEmission {
     pub sample_success: f64,
 }
 
+/// The fixed denominator every rate is expressed against.
+///
+/// `sample_success` is a float, but *counting* with one is a mistake that hides
+/// well: adding 0.1 ten times gives 0.9999999999999999, so a one-in-ten rate
+/// would emit its tenth event on the eleventh message and stay a message behind
+/// for the life of the process. Converting the rate to an exact ratio once and
+/// then counting in integers hits the requested rate for as long as the loop
+/// runs.
+///
+/// A million is far finer than any rate an operator writes in a config file —
+/// six decimal places — and leaves `seen * numerator` nowhere near overflowing
+/// the `u128` it is computed in.
+const RATE_DENOMINATOR: u64 = 1_000_000;
+
 impl LifecycleEmission {
     pub fn new(per_message: bool, sample_success: f64) -> Self {
         Self {
@@ -34,62 +48,85 @@ impl LifecycleEmission {
         self.per_message && self.sample_success > 0.0 && self.sample_success.is_finite()
     }
 
-    /// One event in every `n` successes, or `None` when disabled.
-    fn interval(&self) -> Option<u64> {
+    /// The rate as successes emitted per [`RATE_DENOMINATOR`] successes seen, or
+    /// `None` when disabled.
+    ///
+    /// Rounded rather than truncated, and floored at one: a positive rate that
+    /// samples nothing is indistinguishable from `lifecycle = "summary"`, and
+    /// the operator who set it asked to see *something*.
+    fn numerator(&self) -> Option<u64> {
         if !self.emits_success_event() {
             return None;
         }
         if self.sample_success >= 1.0 {
-            return Some(1);
+            return Some(RATE_DENOMINATOR);
         }
-        // `sample_success` is validated to `0.0..=1.0` and non-zero here, so the
-        // reciprocal is finite and at least 1.
-        let every = (1.0 / self.sample_success).round();
-        Some(if every < 1.0 { 1 } else { every as u64 })
+        let scaled = (self.sample_success * RATE_DENOMINATOR as f64).round();
+        Some((scaled as u64).max(1))
     }
 
     /// A sampler that realizes this rate.
     pub fn sampler(&self) -> LifecycleSampler {
         LifecycleSampler {
-            interval: self.interval(),
+            numerator: self.numerator(),
             seen: 0,
+            emitted: 0,
         }
     }
 }
 
 /// Decides which successes get an event, at the configured rate.
 ///
-/// Deterministic rather than random: it emits every `n`-th success instead of
-/// rolling a die per message. That hits the requested rate exactly over any
-/// window, needs no RNG dependency in the worker, and — unlike Bernoulli
-/// sampling — cannot go a long stretch emitting nothing on a low rate, which is
-/// precisely when an operator turned sampling on to see *something*.
+/// Deterministic rather than random: it keeps the running count of successes and
+/// of events, and emits whatever the rate says is owed. After `N` successes it
+/// has emitted `⌊N × rate⌋` events — never ahead of the rate and never a whole
+/// event behind it, at any `N`. That needs no RNG dependency in the worker and —
+/// unlike Bernoulli sampling — cannot go a long stretch emitting nothing on a
+/// low rate, which is precisely when an operator turned sampling on to see
+/// *something*.
+///
+/// # Why owed-count rather than every `n`-th
+///
+/// The obvious implementation samples every `n`-th success, with `n` the rounded
+/// reciprocal of the rate. It silently rounds the operator's request to the
+/// nearest ratio expressible that way: `0.75` becomes every 1st — everything —
+/// and `0.66` becomes every 2nd, which is half. Both are wrong in the direction
+/// that costs money, and neither is visible from the config file. Tracking the
+/// count owed instead honours any rate in `0.0..=1.0`.
 ///
 /// Counting is per sampler, so each scheduler samples its own stream.
 #[derive(Clone, Debug)]
 pub struct LifecycleSampler {
     /// `None` disables emission entirely.
-    interval: Option<u64>,
+    numerator: Option<u64>,
     seen: u64,
+    emitted: u64,
 }
 
 impl LifecycleSampler {
     /// Records `successes` and returns how many events to emit for them.
     ///
     /// Takes a batch rather than a single message because schedulers work in
-    /// cycles; carrying `seen` across calls is what keeps the rate honest when
-    /// batches are smaller than the sampling interval.
+    /// cycles; carrying the counts across calls is what keeps the rate honest
+    /// when batches are smaller than one event's worth of successes.
     pub fn take(&mut self, successes: usize) -> usize {
-        let Some(interval) = self.interval else {
+        let Some(numerator) = self.numerator else {
             return 0;
         };
-        let successes = successes as u64;
         if successes == 0 {
             return 0;
         }
-        let before = self.seen / interval;
-        self.seen = self.seen.saturating_add(successes);
-        let after = self.seen / interval;
-        usize::try_from(after - before).unwrap_or(usize::MAX)
+
+        self.seen = self
+            .seen
+            .saturating_add(u64::try_from(successes).unwrap_or(u64::MAX));
+        // In `u128` so the multiply cannot overflow at any `seen` a process can
+        // reach, and integer division so the result never drifts from the rate.
+        let owed = u128::from(self.seen) * u128::from(numerator) / u128::from(RATE_DENOMINATOR);
+        let owed = u64::try_from(owed).unwrap_or(u64::MAX);
+
+        let emit = owed.saturating_sub(self.emitted);
+        self.emitted = owed;
+        usize::try_from(emit).unwrap_or(usize::MAX)
     }
 }

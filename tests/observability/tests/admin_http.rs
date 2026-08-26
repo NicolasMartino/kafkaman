@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use kafkaman_axum::{admin_router, AdminState, CorrelationLayer, CORRELATION_ID_HEADER};
+use kafkaman_axum::{
+    admin_router, redrive_router, AdminState, CorrelationLayer, CORRELATION_ID_HEADER,
+};
 use kafkaman_test::Harness;
 use observability_tests::{postgres_for_suite, ProductSnapshot, TestResult, SUITE};
 
@@ -34,7 +36,8 @@ async fn every_admin_route_answers_over_http() -> TestResult {
         ProductSnapshot::envelope("admin-http", "a product").try_with_idempotency_key("admin")?;
     harness.enqueue(&envelope).await?;
 
-    let base = serve(&harness).await?;
+    let server = serve(&harness, Mounted::Everything).await?;
+    let base = &server.base;
     let client = reqwest::Client::new();
 
     // Liveness and readiness answer without a body worth asserting on; what
@@ -48,12 +51,19 @@ async fn every_admin_route_answers_over_http() -> TestResult {
         );
     }
 
-    let outbox: serde_json::Value = client
-        .get(format!("{base}/outbox"))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let outbox = client.get(format!("{base}/outbox")).send().await?;
+    // The content type, because a client decodes on it. A handler returning a
+    // JSON-shaped body as `text/plain` passes every assertion below and fails
+    // in the caller.
+    assert_eq!(
+        outbox
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the summaries are a JSON API and must say so on the wire"
+    );
+    let outbox: serde_json::Value = outbox.json().await?;
     let pending = outbox
         .as_array()
         .expect("the outbox summary is a list of buckets")
@@ -113,13 +123,53 @@ async fn every_admin_route_answers_over_http() -> TestResult {
     assert_eq!(redrive["redriven"], 0);
 
     // A type this application does not carry is the caller's mistake, not a
-    // server error.
+    // server error. The body matters as much as the status: an operator reading
+    // a bare 404 cannot tell a wrong message type from a wrong path.
     let unknown = client
         .post(format!("{base}/dlq/not_a_message_type/redrive"))
         .json(&serde_json::json!({ "max_rows": 10 }))
         .send()
         .await?;
     assert_eq!(unknown.status(), 404);
+    let unknown: serde_json::Value = unknown.json().await?;
+    assert!(
+        unknown["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not_a_message_type"),
+        "the error should name the type that was not registered, got: {unknown}"
+    );
+
+    // The failure filter accepts the spelling the DLQ view prints. This is a
+    // wire-format compatibility check rather than a redrive test: the route
+    // already answered above, and what is at stake here is whether the value an
+    // operator copies out of `latest_error.type` is a value they can paste back
+    // in.
+    for spelling in ["urn:kafkaman:problem:handler", "Handler"] {
+        let filtered = client
+            .post(format!("{base}/dlq/product_snapshot/redrive"))
+            .json(&serde_json::json!({ "max_rows": 10, "failure_kind": spelling }))
+            .send()
+            .await?;
+        assert_eq!(
+            filtered.status(),
+            200,
+            "{spelling:?} names a failure class the redrive route should accept"
+        );
+    }
+
+    // An unrecognized one is refused rather than resolved to the default. On a
+    // destructive route the difference is which rows move.
+    let misspelled = client
+        .post(format!("{base}/dlq/product_snapshot/redrive"))
+        .json(&serde_json::json!({ "max_rows": 10, "failure_kind": "Handlr" }))
+        .send()
+        .await?;
+    assert_eq!(
+        misspelled.status(),
+        422,
+        "a misspelled failure class must not silently become another one"
+    );
 
     // And the bound is enforced on the wire, not merely documented.
     let unbounded = client
@@ -128,6 +178,50 @@ async fn every_admin_route_answers_over_http() -> TestResult {
         .send()
         .await?;
     assert_eq!(unbounded.status(), 400);
+    let unbounded: serde_json::Value = unbounded.json().await?;
+    assert!(
+        unbounded["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_rows"),
+        "the error should name the field that was out of range, got: {unbounded}"
+    );
+
+    Ok(())
+}
+
+/// The read-only router does not carry the destructive route.
+///
+/// This is the whole point of the split, and it is the kind of property that
+/// decays silently: adding one `.route` line to `admin_router` would hand a
+/// destructive endpoint to every deployment that mounted it for dashboards, and
+/// nothing else in the suite would notice.
+#[tokio::test]
+async fn the_read_only_router_cannot_redrive() -> TestResult {
+    let postgres = postgres_for_suite(SUITE).await?;
+    let harness = Harness::connect(postgres.url()).await?;
+    let _outbox = harness.outbox_table::<ProductSnapshot>().await?;
+    let _received = harness.received_table::<ProductSnapshot>().await?;
+
+    let server = serve(&harness, Mounted::ReadOnly).await?;
+    let base = &server.base;
+    let client = reqwest::Client::new();
+
+    let refused = client
+        .post(format!("{base}/dlq/product_snapshot/redrive"))
+        .json(&serde_json::json!({ "max_rows": 10 }))
+        .send()
+        .await?;
+    assert_eq!(
+        refused.status(),
+        404,
+        "the redrive route is absent from the read-only router, not merely unauthorized"
+    );
+
+    // The reads it does carry still answer, so this is a routing split rather
+    // than a broken router.
+    let dlq = client.get(format!("{base}/dlq")).send().await?;
+    assert_eq!(dlq.status(), 200, "inspection stays on the read-only side");
 
     Ok(())
 }
@@ -142,7 +236,8 @@ async fn every_admin_route_answers_over_http() -> TestResult {
 async fn the_correlation_header_makes_the_round_trip() -> TestResult {
     let postgres = postgres_for_suite(SUITE).await?;
     let harness = Harness::connect(postgres.url()).await?;
-    let base = serve(&harness).await?;
+    let server = serve(&harness, Mounted::Everything).await?;
+    let base = &server.base;
     let client = reqwest::Client::new();
 
     let supplied = "c0rrel4tion-from-the-caller";
@@ -174,17 +269,53 @@ async fn the_correlation_header_makes_the_round_trip() -> TestResult {
     Ok(())
 }
 
-/// Bind the admin router to a loopback port and return its base URL.
+/// Which routers a test server mounts.
+#[derive(Clone, Copy, Debug)]
+enum Mounted {
+    /// `admin_router` alone, the way a deployment that only wants dashboards
+    /// would mount it.
+    ReadOnly,
+    /// Both routers merged, the way a deployment that wants redrive too must
+    /// opt into.
+    Everything,
+}
+
+/// A running admin server on a loopback port.
+///
+/// Owns its task so the test can end it. Several of these run in one binary, and
+/// a server left running holds pool connections against a container the next
+/// test is also using — which is how a suite that passes one test at a time
+/// starts timing out when run together.
+struct AdminServer {
+    base: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AdminServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Bind an admin server to a loopback port and return it.
 ///
 /// Port zero: several of these run in one binary and a fixed port would make
 /// them fight over it.
-async fn serve(harness: &Harness) -> TestResult<String> {
+async fn serve(harness: &Harness, mounted: Mounted) -> TestResult<AdminServer> {
     let state = AdminState::new(harness.pool().clone(), Arc::new(harness.config()));
-    let app = admin_router(state).layer(CorrelationLayer::new());
+    let app = match mounted {
+        Mounted::ReadOnly => admin_router(state),
+        Mounted::Everything => admin_router(state.clone()).merge(redrive_router(state)),
+    }
+    .layer(CorrelationLayer::new());
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    Ok(format!("http://{addr}"))
+    Ok(AdminServer {
+        base: format!("http://{addr}"),
+        task,
+    })
 }

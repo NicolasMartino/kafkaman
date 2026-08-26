@@ -27,7 +27,7 @@
 //! behind the applied offset, get `Ignored`, and skip the handler — permanently.
 //! Covering the upsert makes the retry see the same state the first attempt did.
 
-use kafkaman_core::{MarkOutcome, ReceivedMeta, ReceivedRow};
+use kafkaman_core::{LifecycleSampler, MarkOutcome, ReceivedMeta, ReceivedRow};
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tracing::Instrument;
@@ -74,7 +74,32 @@ pub async fn dispatch_once(
     router: &MessageRouter,
     due_at: OffsetDateTime,
 ) -> Result<DispatchStats> {
-    dispatch_once_inner(pool, table, router, due_at, NO_HOOKS).await
+    dispatch_once_inner(pool, table, router, due_at, NO_HOOKS, None).await
+}
+
+/// [`dispatch_once`], emitting a per-message success event at the sampled rate.
+///
+/// # Why the sampler comes in here rather than staying in the loop
+///
+/// The event belongs *inside* `kafkaman.dispatch`, and that span does not
+/// outlive this call. A dispatcher loop that samples its own successes after
+/// `dispatch_once` returns emits a line that names a message type and nothing
+/// else: no trace id, no span id, no way back to the row it is about. An event
+/// about one message that cannot be traced to that message is a line in a log
+/// file; one that can is the pivot `sample_success` exists to provide. The relay
+/// carries its sampler across the same boundary for the same reason.
+///
+/// The sampler is borrowed mutably because its count carries across cycles:
+/// sampling one in ten successes has to mean one in ten over the stream, not one
+/// per call that happens to succeed.
+pub async fn dispatch_once_sampled(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    router: &MessageRouter,
+    due_at: OffsetDateTime,
+    lifecycle: &mut LifecycleSampler,
+) -> Result<DispatchStats> {
+    dispatch_once_inner(pool, table, router, due_at, NO_HOOKS, Some(lifecycle)).await
 }
 
 #[cfg(feature = "internal-hooks")]
@@ -86,7 +111,7 @@ pub async fn dispatch_once_with_observer(
     due_at: OffsetDateTime,
     hooks: &DispatchHooks,
 ) -> Result<DispatchStats> {
-    dispatch_once_inner(pool, table, router, due_at, Some(hooks)).await
+    dispatch_once_inner(pool, table, router, due_at, Some(hooks), None).await
 }
 
 async fn dispatch_once_inner(
@@ -95,6 +120,7 @@ async fn dispatch_once_inner(
     router: &MessageRouter,
     due_at: OffsetDateTime,
     hooks: Hooks<'_>,
+    lifecycle: Option<&mut LifecycleSampler>,
 ) -> Result<DispatchStats> {
     let mut tx = pool.begin().await?;
     let Some(row) = claim_received_row(&mut tx, table, due_at).await? else {
@@ -102,6 +128,53 @@ async fn dispatch_once_inner(
         return Ok(DispatchStats::default());
     };
 
+    // Parented from the ingest that stored this row, across the same kind of
+    // durable gap the relay crosses on the send side: the row may have been
+    // ingested by another process, or before this one started. Without stored
+    // context it is a root span, which is what an uningested-under-tracing row
+    // should produce.
+    let span = tracing::info_span!(
+        "kafkaman.dispatch",
+        message_type = row.message_type.as_str(),
+        messaging.system = "kafka",
+        messaging.destination.name = row.source_topic.as_str(),
+        messaging.operation.name = "process",
+        messaging.message.id = %row.message_id,
+    );
+    if let Some(trace) = &row.trace {
+        kafkaman_core::set_parent(&span, trace);
+    }
+
+    // The span opens the moment there is a row to describe, and covers
+    // everything done to it — not just the handler call.
+    //
+    // Covering only the handler is the tempting version and it loses the cases
+    // an operator is actually looking for. A row whose message type has no
+    // registered handler never reaches a handler, so it produced no span at all:
+    // the most common deployment-order failure there is, and it was invisible in
+    // the trace. A handler that fails does its failure accounting — savepoint
+    // rollback, failure record, retry scheduling — after the handler returns,
+    // which is exactly the part worth timing when a dispatcher is slow.
+    dispatch_claimed_row(pool, table, router, due_at, hooks, lifecycle, tx, row)
+        .instrument(span)
+        .await
+}
+
+/// Everything that happens to a row once it is claimed.
+///
+/// Split out so [`dispatch_once_inner`] has one `.instrument` call covering all
+/// of it, rather than a span that each branch has to remember to enter.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_claimed_row(
+    pool: &PgPool,
+    table: &ReceivedTable,
+    router: &MessageRouter,
+    due_at: OffsetDateTime,
+    hooks: Hooks<'_>,
+    lifecycle: Option<&mut LifecycleSampler>,
+    mut tx: Transaction<'_, Postgres>,
+    row: ReceivedRow,
+) -> Result<DispatchStats> {
     // The lookup stays ahead of the upsert. A replica that has not been deployed
     // yet must not silently converge a cache it has no code to derive from, so
     // an unregistered type parks its row and the cache does not advance. The
@@ -125,34 +198,18 @@ async fn dispatch_once_inner(
 
     create_dispatch_handler_savepoint(&mut tx).await?;
 
-    // Parented from the ingest that stored this row, across the same kind of
-    // durable gap the relay crosses on the send side: the row may have been
-    // ingested by another process, or before this one started. Without stored
-    // context it is a root span, which is what an uningested-under-tracing row
-    // should produce.
-    let span = tracing::info_span!(
-        "kafkaman.dispatch",
-        message_type = row.message_type.as_str(),
-        messaging.system = "kafka",
-        messaging.destination.name = row.source_topic.as_str(),
-        messaging.operation.name = "process",
-        messaging.message.id = %row.message_id,
-    );
-    if let Some(trace) = &row.trace {
-        kafkaman_core::set_parent(&span, trace);
-    }
-
-    match converge_and_dispatch(&mut tx, table, &row, router, due_at)
-        .instrument(span)
-        .await
-    {
+    match converge_and_dispatch(&mut tx, table, &row, router, due_at).await {
         Ok(outcome) => {
             tx.commit().await?;
+            // A stale or missing mark means another worker owns the row now; the
+            // work is not lost, but this cycle did not do it.
+            let processed = usize::from(outcome == MarkOutcome::Updated);
+            if processed > 0 {
+                emit_success_event(table, &row, lifecycle);
+            }
             Ok(DispatchStats {
                 claimed: 1,
-                // A stale or missing mark means another worker owns the row
-                // now; the work is not lost, but this cycle did not do it.
-                processed: usize::from(outcome == MarkOutcome::Updated),
+                processed,
                 failed: 0,
             })
         }
@@ -245,6 +302,37 @@ async fn converge_and_dispatch(
     mark_received_processed(tx, table, row.message_id, processed_at)
         .await
         .map_err(DispatchFailure::Bookkeeping)
+}
+
+/// Emit one sampled per-message success event, inside `kafkaman.dispatch`.
+///
+/// Synchronous, and deliberately: [`kafkaman_core::attach`] hands back a guard
+/// that is not `Send`, and a context held across an `await` would attribute
+/// whatever else the runtime schedules on this thread to this message.
+fn emit_success_event(
+    table: &ReceivedTable,
+    row: &ReceivedRow,
+    lifecycle: Option<&mut LifecycleSampler>,
+) {
+    let Some(sampler) = lifecycle else {
+        return;
+    };
+    if sampler.take(1) == 0 {
+        return;
+    }
+
+    // Attached, not merely parented: the log appender stamps records from the
+    // OpenTelemetry context, which the `tracing` span stack does not set on its
+    // own. Without this the event reaches the log signal with no trace id and
+    // cannot be pivoted into the trace it belongs to.
+    let span = tracing::Span::current();
+    let _scope = kafkaman_core::attach(&span);
+    tracing::info!(
+        parent: &span,
+        message_type = table.descriptor.message_type.as_str(),
+        message_id = %row.message_id,
+        "received message processed"
+    );
 }
 
 /// Record a failure in the transaction that claimed the row.

@@ -88,7 +88,7 @@ fn the_shipped_example_config_resolves_and_covers_every_section() {
     // names, since an unregistered type is itself a configuration error.
     let resolved = ResolvedConfig::from_config(
         Some(&cfg),
-        [MessageDescriptor::new("order_created", "orders").unwrap()],
+        [MessageDescriptor::new("order_snapshot", "orders").unwrap()],
     )
     .expect("the shipped example must resolve");
 
@@ -101,14 +101,14 @@ fn the_shipped_example_config_resolves_and_covers_every_section() {
     // The per-type override must actually differ from the defaults, or the
     // example is not demonstrating what it claims to.
     let defaults = resolved.retry.policy_for("unregistered_type");
-    let overridden = resolved.retry.policy_for("order_created");
+    let overridden = resolved.retry.policy_for("order_snapshot");
     assert_ne!(
         defaults.max_attempts, overridden.max_attempts,
         "the example's per-type override should demonstrate an actual override"
     );
 
     let default_observability = resolved.observability.policy_for("unregistered_type");
-    let overridden_observability = resolved.observability.policy_for("order_created");
+    let overridden_observability = resolved.observability.policy_for("order_snapshot");
     assert_ne!(
         default_observability.sample_success, overridden_observability.sample_success,
         "the example's per-type observability override should demonstrate an actual override"

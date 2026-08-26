@@ -18,7 +18,7 @@ use tracing::Instrument;
 
 #[cfg(feature = "internal-hooks")]
 use crate::hooks::{IngestCommitEvent, PostDurableWriteObserver};
-use crate::ingest_record::{ingest_failure_record, record_envelope, record_trace_context};
+use crate::ingest_record::{ingest_failure_record, record_envelope, RecordHeaders};
 use crate::metrics::IngestMetrics;
 use crate::{Error, IngestLoopStats, IngestStats, Result};
 
@@ -126,12 +126,38 @@ impl RdkafkaConsumer {
     {
         let message = self.consumer.recv().await?;
         let at = RecordLocation::of(&message);
+        // Headers are readable before the payload is, and that is what lets the
+        // span open before the work it describes. Decoding first put the decode
+        // cost outside the span and put a record that *failed* to decode outside
+        // it entirely — so the one record an operator goes looking for was the
+        // one with no span to find. The header scan is done once and handed to
+        // both the span and the decode.
+        let headers = RecordHeaders::of(&message);
+        let span = ingest_span::<P>(&at, headers.trace_context().as_ref());
+        self.ingest_decoded::<P>(pool, cfg, &message, at, &headers)
+            .instrument(span)
+            .await
+    }
 
-        match record_envelope::<P, _>(&message) {
+    /// Decode one record and route it to storage or quarantine.
+    ///
+    /// Split from [`Self::ingest_once`] only so the whole of it — decode
+    /// included — runs inside one `.instrument`, rather than each arm opening a
+    /// span of its own after the decision has already been made.
+    async fn ingest_decoded<P>(
+        &self,
+        pool: &PgPool,
+        cfg: &ResolvedConfig,
+        message: &BorrowedMessage<'_>,
+        at: RecordLocation,
+        headers: &RecordHeaders,
+    ) -> Result<IngestStats>
+    where
+        P: KafkaMessage + DeserializeOwned + Serialize,
+    {
+        match record_envelope::<P, _>(message, headers) {
             Ok(record) => {
-                let span = ingest_span::<P>(&at, record.producer_trace.as_ref());
-                self.store::<P>(pool, cfg, &message, at, &record.envelope, record.key)
-                    .instrument(span)
+                self.store::<P>(pool, cfg, message, at, &record.envelope, record.key)
                     .await
             }
             Err(err) => match err.ingest_failure_kind() {
@@ -139,9 +165,7 @@ impl RdkafkaConsumer {
                 // acknowledged, so the partition advances past it instead of
                 // every later record queueing behind one that will never parse.
                 Some(kind) => {
-                    let span = ingest_span::<P>(&at, record_trace_context(&message).as_ref());
-                    self.quarantine::<P>(pool, cfg, &message, at, kind, err.to_string())
-                        .instrument(span)
+                    self.quarantine::<P>(pool, cfg, message, at, kind, err.to_string())
                         .await
                 }
                 None => Err(err),
@@ -208,7 +232,7 @@ impl RdkafkaConsumer {
 
         self.consumer.commit_message(message, CommitMode::Sync)?;
 
-        Ok(IngestStats {
+        let stats = IngestStats {
             consumed: 1,
             inserted: usize::from(outcome == ReceivedInsertOutcome::Inserted),
             duplicates: usize::from(outcome == ReceivedInsertOutcome::DuplicateIdempotencyKey),
@@ -216,7 +240,9 @@ impl RdkafkaConsumer {
             committed: 1,
             partition: at.partition,
             offset: at.offset,
-        })
+        };
+        report_ingest_result(&stats);
+        Ok(stats)
     }
 
     /// Store an unreadable record for triage, then acknowledge it.
@@ -247,7 +273,7 @@ impl RdkafkaConsumer {
         self.count_skip(at)?;
         self.consumer.commit_message(message, CommitMode::Sync)?;
 
-        Ok(IngestStats {
+        let stats = IngestStats {
             consumed: 1,
             inserted: 0,
             duplicates: 0,
@@ -255,7 +281,9 @@ impl RdkafkaConsumer {
             committed: 1,
             partition: at.partition,
             offset: at.offset,
-        })
+        };
+        report_ingest_result(&stats);
+        Ok(stats)
     }
 
     /// Count one skip against the poison breaker, failing when it trips.
@@ -291,7 +319,7 @@ impl RdkafkaConsumer {
         // whichever meter provider is installed when it is built. Building it
         // here means a host that installs its pipeline before starting the
         // ingester is reported, regardless of what else the process did first.
-        let metrics = IngestMetrics::new(P::MESSAGE_TYPE);
+        let metrics = IngestMetrics::new(P::MESSAGE_TYPE, P::TOPIC);
 
         loop {
             let result = tokio::select! {
@@ -302,25 +330,11 @@ impl RdkafkaConsumer {
 
             match result {
                 Ok(stats) => {
+                    // The per-record result is reported by `ingest_once`, inside
+                    // the span that produced it. Reporting it here instead put
+                    // the line outside every span the record has, which is where
+                    // it stopped being findable from the trace.
                     metrics.stats(&stats);
-                    if stats.skipped > 0 {
-                        tracing::warn!(
-                            partition = stats.partition,
-                            offset = stats.offset,
-                            skipped = stats.skipped,
-                            committed = stats.committed,
-                            "Kafka ingest skipped and quarantined record"
-                        );
-                    } else {
-                        tracing::debug!(
-                            partition = stats.partition,
-                            offset = stats.offset,
-                            inserted = stats.inserted,
-                            duplicates = stats.duplicates,
-                            committed = stats.committed,
-                            "Kafka ingest stored record"
-                        );
-                    }
                     loop_stats.record_cycle(&stats);
                 }
                 Err(err @ Error::ConsecutiveSkipLimitExceeded { .. }) => {
@@ -384,4 +398,40 @@ fn ingest_span<P: KafkaMessage>(
         kafkaman_core::add_link(&span, trace);
     }
     span
+}
+
+/// Report one record's classification, inside the span that produced it.
+///
+/// Called from `store` and `quarantine`, both of which run under the
+/// `kafkaman.ingest` span `ingest_once` builds for the record. That placement is
+/// the whole point: the same lines emitted from the loop after `ingest_once`
+/// returns carry no trace context at all, because the span has closed by then
+/// and the appender stamps records from whatever context is current.
+///
+/// Synchronous, so the attached context — whose guard is not `Send` — cannot be
+/// held across an `await` and attribute unrelated work to this record.
+fn report_ingest_result(stats: &IngestStats) {
+    let span = tracing::Span::current();
+    let _scope = kafkaman_core::attach(&span);
+
+    if stats.skipped > 0 {
+        tracing::warn!(
+            parent: &span,
+            partition = stats.partition,
+            offset = stats.offset,
+            skipped = stats.skipped,
+            committed = stats.committed,
+            "Kafka ingest skipped and quarantined record"
+        );
+    } else {
+        tracing::debug!(
+            parent: &span,
+            partition = stats.partition,
+            offset = stats.offset,
+            inserted = stats.inserted,
+            duplicates = stats.duplicates,
+            committed = stats.committed,
+            "Kafka ingest stored record"
+        );
+    }
 }

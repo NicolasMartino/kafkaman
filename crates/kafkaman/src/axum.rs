@@ -34,7 +34,10 @@
 
 use std::net::SocketAddr;
 
-use axum::Router;
+// Leading `::` is load-bearing. This module is mounted as `axum_runtime` but
+// the crate root also declares `pub mod axum`, and a bare `use axum::` is
+// ambiguous between that module and the `axum` crate.
+use ::axum::Router;
 use tokio::net::TcpListener;
 
 use crate::runtime::{BuildError, CancellationToken, Runtime, RuntimeError, RuntimeTasks};

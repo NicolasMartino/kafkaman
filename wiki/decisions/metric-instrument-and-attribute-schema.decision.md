@@ -62,9 +62,9 @@ Existing instruments, unchanged in name:
 | `kafkaman.scheduler.rows` | Counter | `{row}` | `scheduler`, `message_type`, `status` |
 | `kafkaman.scheduler.errors` | Counter | `{error}` | `scheduler`, `message_type` |
 | `kafkaman.kafka.publish.records` | Counter | `{record}` | `topic`, `outcome`, `messaging.system`, `messaging.destination.name` |
-| `kafkaman.kafka.ingest.records` | Counter | `{record}` | `message_type`, `outcome`, `messaging.system` |
-| `kafkaman.kafka.ingest.commits` | Counter | `{commit}` | `message_type`, `messaging.system` |
-| `kafkaman.kafka.ingest.errors` | Counter | `{error}` | `message_type`, `reason`, `messaging.system` |
+| `kafkaman.kafka.ingest.records` | Counter | `{record}` | `message_type`, `outcome`, `messaging.system`, `messaging.destination.name` |
+| `kafkaman.kafka.ingest.commits` | Counter | `{commit}` | `message_type`, `messaging.system`, `messaging.destination.name` |
+| `kafkaman.kafka.ingest.errors` | Counter | `{error}` | `message_type`, `reason`, `messaging.system`, `messaging.destination.name` |
 
 New instruments:
 
@@ -94,33 +94,70 @@ written for the admin routes and are already index-served — the M6 review
 rewrote `received_stuck_rows` specifically to keep the query shape servable by
 the `(status, next_attempt_at, created_at)` index.
 
-Registering them as observable gauges is a callback wrapping existing, tested
-SQL. It converts a route an operator must remember to curl into a series a
-dashboard scrapes, which is the difference between data that exists and data
-somebody looks at.
+Registering them as observable gauges converts a route an operator must remember
+to curl into a series a dashboard scrapes, which is the difference between data
+that exists and data somebody looks at.
 
-Two caveats, both real:
+**Amended 2026-08-26.** This section originally described the gauges as "a
+callback wrapping existing, tested SQL", with the SDK's collection interval
+driving the query. That is not what was built, and the difference matters enough
+to record rather than edit away — a reader who took the original at face value
+would size the collection interval as though it were a database knob.
 
-- **These are aggregate queries.** The M6 documentation already warns that the
-  summary routes are built for a scrape interval measured in seconds, not for a
-  per-request probe. Registering them as gauges means the *collection interval*
-  now drives that query. The interval is the host's to configure, and the
-  documentation must say so plainly.
-- **Observable gauges fire on the SDK's schedule, not ours.** The callback must
-  be cheap, cancel-safe, and must never block the collection cycle on a database
-  that is already struggling — which is precisely when someone is looking at the
-  dashboard. Callbacks use a bounded timeout and report staleness rather than
-  hanging.
+An observable-gauge callback is synchronous, so it cannot await a query at all;
+and a callback that could would put the database on a schedule chosen for
+telemetry, stalling the collection cycle exactly when the database is already
+struggling. So `run_queue_metrics` owns the queries on its own
+`refresh_interval`, maintains a snapshot, and the callbacks read the snapshot.
+Scraping faster does not query harder.
+
+Three consequences, all real:
+
+- **These are aggregate queries.** Each refresh is a full `GROUP BY status` over
+  each table. `refresh_interval` is what decides how often that runs, and it is
+  the host's to configure.
+- **A failed or slow refresh leaves the previous snapshot in place.** The refresh
+  is bounded by a timeout; it does not clear what it could not update.
+- **Staleness is a series, not a gap.** Under cumulative temporality an
+  asynchronous gauge republishes its last value on every collection cycle whether
+  or not the callback observed anything, so declining to observe cannot produce a
+  gap. `kafkaman.queue.sample_age` reports the age of the snapshot behind every
+  other series here, and that is the condition worth alerting on.
 
 ## Attribute Mapping
 
 | kafkaman attribute | Semconv attribute emitted alongside | Note |
 | --- | --- | --- |
-| `topic` | `messaging.destination.name` | Same value, both keys |
+| `topic` | `messaging.destination.name` | Same value, both keys, on the publish series |
+| — | `messaging.destination.name` | On the ingest series, which has no kafkaman-side `topic` key: the consumer's topic is fixed by the message type, so a second key naming the same constant would only add cardinality |
 | — | `messaging.system` = `kafka` | Constant |
 | `message_type` | none | kafkaman-specific; no semconv equivalent |
 | `scheduler` | none | kafkaman-specific loop identity |
 | `status`, `outcome`, `reason` | none | Deliberately ours; semconv's `error.type` means something narrower |
+
+### Every Kafka-side series names its topic
+
+**Added 2026-08-26.** The ingest counters carried `message_type` and
+`messaging.system` and no topic at all, so `kafkaman.kafka.ingest.records` and
+`kafkaman.kafka.publish.records` had no attribute in common beyond the constant
+`messaging.system`. The obvious operator question — is this topic backing up, are
+we consuming it as fast as we publish to it — could not be asked without mapping
+message types to topics outside the telemetry.
+
+All three ingest instruments now carry `messaging.destination.name`. Adding an
+attribute changes series identity, so an existing dashboard sees the ingest
+series split until it is updated; the alternative was leaving the two halves of
+one topic's traffic permanently unjoinable.
+
+### `outcome` uses one word per state, across instruments
+
+`kafkaman.relay.publish.duration` and `kafkaman.kafka.publish.records` describe
+the same event from two heights — the relay's loop and the transport underneath
+it. They therefore share a vocabulary: a successful send is `published` on both,
+never `acknowledged` on one and `published` on the other. Two words for one state
+is invisible in either instrument alone and breaks the first query that spans
+them, which is the query an operator writes when publish latency and publish
+volume disagree.
 
 The duplication in row one is intentional and its cost is understood: one extra
 key-value per data point, bounded by the number of topics. What it buys is that a
@@ -205,7 +242,10 @@ dashboard M6 adopters have already built, for no gain over emitting both.
 - Data-point size grows by one attribute on the publish path. Bounded and
   measured; if it proves material, the mitigation is dropping our `topic` key
   rather than the standard one.
-- Gauge callbacks put the summary queries on the SDK's collection interval, which
-  is a new load pattern this library has not previously had. Documented, bounded,
-  and configurable by the host.
+- The queue summary queries are a background load this library has not previously
+  had. It is bounded by `QueueMetricsConfig::refresh_interval` and not by the
+  SDK's collection interval: the sampler refreshes a snapshot on its own
+  schedule and the callbacks read that snapshot, so a host scraping every second
+  does not thereby query the database every second. Configurable, and the
+  staleness of the snapshot is itself a reported series.
 - The double-count class of defect becomes testable rather than reviewable.

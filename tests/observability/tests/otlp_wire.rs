@@ -33,10 +33,18 @@ use observability_tests::{postgres_for_suite, relay_until_published, TestResult,
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueKind;
+use opentelemetry_proto::tonic::common::v1::KeyValue;
+use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+use opentelemetry_proto::tonic::metrics::v1::Metric;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
+use prost::Message as _;
 use tracing_subscriber::layer::SubscriberExt;
 
 /// Identifies the process in the export, so the assertions can tell kafkaman's
@@ -98,7 +106,7 @@ async fn kafkaman_telemetry_reaches_the_wire_as_metrics_traces_and_logs() -> Tes
     // client is chatty — so the batch carrying the relay's line is rarely the
     // first one to arrive.
     let posted = drain(&requests, Duration::from_secs(3));
-    let paths: Vec<&str> = posted.iter().map(|(path, _)| path.as_str()).collect();
+    let paths: Vec<&str> = posted.iter().map(|request| request.path.as_str()).collect();
     for signal in ["/v1/metrics", "/v1/traces", "/v1/logs"] {
         assert!(
             paths.contains(&signal),
@@ -106,53 +114,169 @@ async fn kafkaman_telemetry_reaches_the_wire_as_metrics_traces_and_logs() -> Tes
         );
     }
 
-    // One signal can span several exports, so the assertions look at everything
-    // that arrived for it rather than at whichever batch came first.
-    let body_for = |signal: &str| -> String {
-        posted
-            .iter()
-            .filter(|(path, _)| path == signal)
-            .map(|(_, body)| body.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let metrics = body_for("/v1/metrics");
-    assert!(
-        metrics
-            .to_ascii_lowercase()
-            .contains("application/x-protobuf"),
-        "the suite builds `http-proto` only, so exports should be protobuf"
-    );
-    assert!(
-        metrics.contains("kafkaman.scheduler.cycles"),
-        "a relay cycle's counter should be on the wire"
-    );
-    assert!(
-        metrics.contains("kafkaman.outbox.time_to_publish"),
-        "so should the histogram that only an outbox can measure"
-    );
-    assert!(
-        metrics.contains(SERVICE_NAME),
-        "exports should carry the resource the host configured"
-    );
-
-    let traces = body_for("/v1/traces");
-    for span in ["kafkaman.enqueue", "kafkaman.relay.publish"] {
+    // The transport claim first, and from the headers rather than from the body:
+    // it is a statement about how the exporter was built, and the body is the
+    // one place it cannot honestly be read.
+    for request in &posted {
         assert!(
-            traces.contains(span),
-            "the {span} span should be on the wire"
+            request
+                .content_type()
+                .eq_ignore_ascii_case("application/x-protobuf"),
+            "the suite builds `http-proto` only, so {} should be protobuf, not {:?}",
+            request.path,
+            request.content_type()
         );
     }
 
-    let logs = body_for("/v1/logs");
+    // One signal can span several exports, so each assertion below looks at
+    // everything that arrived for it rather than at whichever batch came first.
+    let decoded = |signal: &str| -> Vec<&[u8]> {
+        posted
+            .iter()
+            .filter(|request| request.path == signal)
+            .map(|request| request.body.as_slice())
+            .collect()
+    };
+
+    // --- Metrics ---
+
+    let mut instruments: Vec<(String, Kind)> = Vec::new();
+    for body in decoded("/v1/metrics") {
+        let export = ExportMetricsServiceRequest::decode(body)
+            .expect("an OTLP metrics export should be a decodable ExportMetricsServiceRequest");
+        for resource in &export.resource_metrics {
+            assert_eq!(
+                service_name(resource.resource.as_ref().map(|r| r.attributes.as_slice())),
+                Some(SERVICE_NAME.to_owned()),
+                "an export must carry the resource the host configured, or a backend \
+                 cannot tell which process it came from"
+            );
+            for scope in &resource.scope_metrics {
+                for metric in &scope.metrics {
+                    instruments.push((metric.name.clone(), kind_of(metric)));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        instruments
+            .iter()
+            .find(|(name, _)| name == "kafkaman.scheduler.cycles")
+            .map(|(_, kind)| *kind),
+        Some(Kind::Sum),
+        "a relay cycle's counter should be on the wire, and as a counter: the \
+         instrument type is part of what a backend stores, and a byte search for \
+         the name cannot tell a Sum from a Gauge that happens to be named one"
+    );
+    assert_eq!(
+        instruments
+            .iter()
+            .find(|(name, _)| name == "kafkaman.outbox.time_to_publish")
+            .map(|(_, kind)| *kind),
+        Some(Kind::Histogram),
+        "so should the histogram that only an outbox can measure"
+    );
+
+    // --- Traces ---
+
+    let mut spans = Vec::new();
+    for body in decoded("/v1/traces") {
+        let export = ExportTraceServiceRequest::decode(body)
+            .expect("an OTLP trace export should be a decodable ExportTraceServiceRequest");
+        for resource in &export.resource_spans {
+            assert_eq!(
+                service_name(resource.resource.as_ref().map(|r| r.attributes.as_slice())),
+                Some(SERVICE_NAME.to_owned())
+            );
+            for scope in &resource.scope_spans {
+                spans.extend(scope.spans.iter().cloned());
+            }
+        }
+    }
+    let span_named = |name: &str| {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("the {name} span should be on the wire"))
+    };
+    let enqueue = span_named("kafkaman.enqueue");
+    let publish = span_named("kafkaman.relay.publish");
     assert!(
-        logs.contains("relay cycle complete"),
-        "a kafkaman log line should reach the log signal, which is what makes the \
-         log-to-trace pivot possible at all"
+        !enqueue.trace_id.iter().all(|byte| *byte == 0)
+            && !enqueue.span_id.iter().all(|byte| *byte == 0),
+        "an exported span with all-zero ids is a span no backend will accept"
+    );
+    // The durable gap, asserted on the wire rather than in memory. This is the
+    // property the whole design exists for — publish happens in another task,
+    // minutes later in a real deployment — and it is exactly what a byte search
+    // for two span names cannot check: both names appear either way.
+    assert_eq!(
+        publish.trace_id, enqueue.trace_id,
+        "publish must be exported into the trace the enqueue started"
+    );
+    assert_eq!(
+        publish.parent_span_id, enqueue.span_id,
+        "and as its child, restored from the row's stored context"
+    );
+
+    // --- Logs ---
+
+    let mut bodies = Vec::new();
+    for body in decoded("/v1/logs") {
+        let export = ExportLogsServiceRequest::decode(body)
+            .expect("an OTLP log export should be a decodable ExportLogsServiceRequest");
+        for resource in &export.resource_logs {
+            for scope in &resource.scope_logs {
+                for record in &scope.log_records {
+                    if let Some(AnyValueKind::StringValue(text)) =
+                        record.body.as_ref().and_then(|body| body.value.clone())
+                    {
+                        bodies.push(text);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        bodies.iter().any(|text| text == "relay cycle complete"),
+        "a kafkaman log line should reach the log signal as a record body — which \
+         is what makes the log-to-trace pivot possible at all — but the exported \
+         bodies were {bodies:?}"
     );
 
     Ok(())
+}
+
+/// The instrument type an OTLP metric carries, which is part of what a backend
+/// stores and none of what its name says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    Sum,
+    Gauge,
+    Histogram,
+    Other,
+}
+
+fn kind_of(metric: &Metric) -> Kind {
+    match metric.data {
+        Some(MetricData::Sum(_)) => Kind::Sum,
+        Some(MetricData::Gauge(_)) => Kind::Gauge,
+        Some(MetricData::Histogram(_)) => Kind::Histogram,
+        _ => Kind::Other,
+    }
+}
+
+/// The `service.name` a resource declares, if it declares one.
+fn service_name(attributes: Option<&[KeyValue]>) -> Option<String> {
+    attributes?.iter().find_map(|attribute| {
+        if attribute.key != "service.name" {
+            return None;
+        }
+        match attribute.value.as_ref()?.value.as_ref()? {
+            AnyValueKind::StringValue(text) => Some(text.clone()),
+            _ => None,
+        }
+    })
 }
 
 /// Bind a throwaway OTLP endpoint that answers `200` to everything.
@@ -205,11 +329,11 @@ fn otlp_endpoint() -> (String, mpsc::Receiver<Vec<u8>>) {
 
 /// Whether the headers have arrived and the body is as long as they promised.
 fn request_is_complete(request: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(request);
-    let Some(headers_end) = text.find("\r\n\r\n") else {
+    let Some(headers_end) = find_headers_end(request) else {
         return false;
     };
-    let content_length = text[..headers_end]
+    let text = String::from_utf8_lossy(&request[..headers_end]);
+    let content_length = text
         .lines()
         .find_map(|line| {
             line.to_ascii_lowercase()
@@ -222,17 +346,47 @@ fn request_is_complete(request: &[u8]) -> bool {
     request.len() >= headers_end + 4 + content_length
 }
 
-/// Gather every request that arrives, as `(path, whole request)` pairs.
+/// One captured request, split into the parts the assertions ask about.
+///
+/// The body is kept as bytes rather than lossily decoded: it is protobuf, and
+/// `from_utf8_lossy` replaces every byte it cannot read with U+FFFD — which is a
+/// silent corruption of the exact thing under test. Searching that string for
+/// instrument names happened to work because the names are ASCII inside
+/// length-prefixed fields, and it could not distinguish a metric named
+/// `kafkaman.scheduler.cycles` from a log line mentioning one.
+struct Captured {
+    path: String,
+    headers: String,
+    body: Vec<u8>,
+}
+
+impl Captured {
+    fn content_type(&self) -> &str {
+        self.headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-type")
+                    .then(|| value.trim())
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Gather every request that arrives.
 ///
 /// Stops when nothing has arrived for `quiet_for`. Everything was flushed by the
 /// shutdown above, so a quiet period means the exports are done rather than that
 /// the test gave up early — which is why a few seconds is enough and why the
 /// whole wait is added to the test's runtime exactly once.
-fn drain(requests: &mpsc::Receiver<Vec<u8>>, quiet_for: Duration) -> Vec<(String, String)> {
+fn drain(requests: &mpsc::Receiver<Vec<u8>>, quiet_for: Duration) -> Vec<Captured> {
     let mut posted = Vec::new();
     while let Ok(request) = requests.recv_timeout(quiet_for) {
-        let text = String::from_utf8_lossy(&request).into_owned();
-        let path = text
+        let Some(headers_end) = find_headers_end(&request) else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..headers_end]).into_owned();
+        let path = headers
             .lines()
             .next()
             .unwrap_or_default()
@@ -240,7 +394,16 @@ fn drain(requests: &mpsc::Receiver<Vec<u8>>, quiet_for: Duration) -> Vec<(String
             .nth(1)
             .unwrap_or_default()
             .to_owned();
-        posted.push((path, text));
+        posted.push(Captured {
+            path,
+            body: request[headers_end + 4..].to_vec(),
+            headers,
+        });
     }
     posted
+}
+
+/// Where the header block ends, as a byte offset into the raw request.
+fn find_headers_end(request: &[u8]) -> Option<usize> {
+    request.windows(4).position(|window| window == b"\r\n\r\n")
 }

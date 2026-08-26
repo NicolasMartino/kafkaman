@@ -82,6 +82,7 @@ pub struct ReceivedRow {
     ///
     /// The ingest span's own context rather than the producer's: ingest links to
     /// the producer, dispatch descends from ingest.
+    #[serde(default, with = "crate::trace::optional_trace_context")]
     pub trace: Option<TraceContext>,
     pub occurred_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
@@ -192,6 +193,7 @@ pub struct OutboxRow {
     /// This is the same journey `correlation_id` makes, for the same reason: the
     /// outbox separates enqueue from publish in time, and no in-memory context
     /// survives that gap.
+    #[serde(default, with = "crate::trace::optional_trace_context")]
     pub trace: Option<TraceContext>,
     pub headers: BTreeMap<String, String>,
     pub payload: serde_json::Value,

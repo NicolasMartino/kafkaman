@@ -80,11 +80,18 @@ mod enabled {
         records: Counter<u64>,
         commits: Counter<u64>,
         errors: Counter<u64>,
-        message_type: &'static str,
+        /// Every ingest series carries the same three identity attributes, so
+        /// they are built once here rather than reassembled per record. The
+        /// topic travels under both keys for the same reason it does on the
+        /// publish side: ours keeps kafkaman's series identifiable, the standard
+        /// one lets a dashboard group them with every other messaging library —
+        /// and without it, ingest volume and publish volume cannot be compared
+        /// on the one attribute they obviously share.
+        identity: [KeyValue; 3],
     }
 
     impl IngestMetrics {
-        pub(crate) fn new(message_type: &'static str) -> Self {
+        pub(crate) fn new(message_type: &'static str, topic: &'static str) -> Self {
             let meter = global::meter("kafkaman");
             Self {
                 records: meter
@@ -104,8 +111,18 @@ mod enabled {
                     )
                     .with_unit("{error}")
                     .build(),
-                message_type,
+                identity: [
+                    KeyValue::new("message_type", message_type),
+                    KeyValue::new(MESSAGING_DESTINATION_NAME, topic),
+                    messaging_system(),
+                ],
             }
+        }
+
+        /// This loop's identity attributes plus one of its own.
+        fn attributes(&self, key: &'static str, value: &'static str) -> [KeyValue; 4] {
+            let [message_type, destination, system] = self.identity.clone();
+            [message_type, destination, system, KeyValue::new(key, value)]
         }
 
         /// Counts one consumed record under exactly one classification.
@@ -120,14 +137,8 @@ mod enabled {
             if count == 0 {
                 return;
             }
-            self.records.add(
-                count as u64,
-                &[
-                    KeyValue::new("message_type", self.message_type),
-                    KeyValue::new("outcome", outcome),
-                    messaging_system(),
-                ],
-            );
+            self.records
+                .add(count as u64, &self.attributes("outcome", outcome));
         }
 
         /// Records every counter for one ingest cycle.
@@ -155,13 +166,7 @@ mod enabled {
             if count == 0 {
                 return;
             }
-            self.commits.add(
-                count as u64,
-                &[
-                    KeyValue::new("message_type", self.message_type),
-                    messaging_system(),
-                ],
-            );
+            self.commits.add(count as u64, &self.identity);
         }
 
         /// Counts an ingest cycle that ended without a committed classification.
@@ -171,14 +176,7 @@ mod enabled {
         /// hiccup on the dashboard, which is exactly the moment the distinction
         /// matters.
         pub(crate) fn error(&self, reason: &'static str) {
-            self.errors.add(
-                1,
-                &[
-                    KeyValue::new("message_type", self.message_type),
-                    KeyValue::new("reason", reason),
-                    messaging_system(),
-                ],
-            );
+            self.errors.add(1, &self.attributes("reason", reason));
         }
     }
 }
@@ -203,7 +201,7 @@ mod disabled {
     pub(crate) struct IngestMetrics;
 
     impl IngestMetrics {
-        pub(crate) fn new(_message_type: &'static str) -> Self {
+        pub(crate) fn new(_message_type: &'static str, _topic: &'static str) -> Self {
             Self
         }
 

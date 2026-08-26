@@ -51,10 +51,10 @@ pub use changeset::{
 };
 pub use changesets::{
     AddIdempotencyKey, AddOutboxEntityKey, AddOutboxRetentionIndex, AddOutboxTraceContext,
-    AddReceivedEntityKey, AddReceivedTraceContext, CreateCacheTable, CreateOutboxTable,
-    CreateReceivedTable, InitSchema,
+    AddReceivedEntityKey, AddReceivedFailedIndex, AddReceivedFailureMetadata,
+    AddReceivedTraceContext, CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema,
 };
-pub use dispatch::dispatch_once;
+pub use dispatch::{dispatch_once, dispatch_once_sampled};
 pub use dispatch_cache::CacheApplyOutcome;
 pub use error::Error;
 pub use generated_changelog::{
@@ -84,8 +84,10 @@ pub use roles::{Role, RoleRegistry};
 pub use router::{BeforeHandlerFuture, DispatchStats, HandlerFlow, HandlerFuture, MessageRouter};
 pub use schema_sql::{
     add_idempotency_key_sql, add_idempotency_source_sql, add_outbox_entity_key_sql,
-    add_received_entity_key_sql, create_cache_table_sql, create_outbox_entity_state_index_sql,
-    create_outbox_retention_index_sql, create_outbox_state_index_sql, create_outbox_table_sql,
+    add_received_entity_key_sql, add_received_failure_metadata_sql,
+    backfill_received_failure_metadata_sql, create_cache_table_sql,
+    create_outbox_entity_state_index_sql, create_outbox_retention_index_sql,
+    create_outbox_state_index_sql, create_outbox_table_sql, create_received_failed_index_sql,
     create_received_idempotency_index_sql, create_received_state_index_sql,
     create_received_table_sql, CACHE_TEMPLATE_VERSION, OUTBOX_TEMPLATE_VERSION,
     RECEIVED_TEMPLATE_VERSION,

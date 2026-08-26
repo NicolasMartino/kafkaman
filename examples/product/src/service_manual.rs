@@ -135,9 +135,13 @@ pub async fn start(options: ServiceOptions) -> Result<RunningService, BoxError> 
     {
         let pool = pool.clone();
         let poll_interval = cfg.relay.poll_interval;
+        let lifecycle = cfg
+            .observability
+            .policy_for(OrderSnapshot::MESSAGE_TYPE)
+            .lifecycle_emission();
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
-            worker::run_dispatcher(pool, received, router, poll_interval, shutdown)
+            worker::run_dispatcher(pool, received, router, poll_interval, lifecycle, shutdown)
                 .await
                 .map_err(|err| Box::new(err) as BoxError)
         });

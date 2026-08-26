@@ -226,18 +226,37 @@ fn replay_received_update_sql(table: &ReceivedTable, replay: &Replay) -> Result<
     } else {
         ""
     };
+    // `FOR UPDATE SKIP LOCKED`, and the filter repeated in the UPDATE.
+    //
+    // Redrive is an operator action and operators repeat themselves: an
+    // impatient second click, a retried admin request, two people working the
+    // same incident. Without the lock, two redrives running at once both select
+    // the same candidates and both update them, so each reports the full
+    // `rows_affected` and the operator reads twice the number of rows that moved.
+    // Worse, if one of them carries `clear_history()` it erases the attempts and
+    // error history the other deliberately preserved for triage — the evidence
+    // is gone and nothing records that it was ever there.
+    //
+    // `SKIP LOCKED` rather than plain `FOR UPDATE` because a redrive is bounded
+    // by `max_rows`: a second caller should take the *next* rows and make
+    // progress, not queue behind the first and then re-apply to rows it already
+    // handled. Repeating the filter in the UPDATE covers the row the planner
+    // re-checks after a concurrent commit, where matching on `message_id` alone
+    // would resurrect a row that is no longer failed.
     Ok(format!(
         "WITH candidates AS (
          SELECT message_id FROM {name}
          WHERE {filter}
          ORDER BY {failure_order}
          LIMIT {max_rows}
+         FOR UPDATE SKIP LOCKED
         )
         UPDATE {name}
         SET status = {pending},
             next_attempt_at = NULL,
             processed_at = NULL{history_reset}
-        WHERE message_id IN (SELECT message_id FROM candidates)",
+        WHERE message_id IN (SELECT message_id FROM candidates)
+          AND {filter}",
         name = table.qualified_name(),
         filter = filter,
         failure_order = received_failure_order_sql(),

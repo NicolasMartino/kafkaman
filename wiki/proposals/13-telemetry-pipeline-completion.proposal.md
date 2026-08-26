@@ -226,8 +226,15 @@ proposal.
 
 ## Resolution
 
-Direction accepted 2026-08-25. The four decisions above are Accepted; execution
-is planned but not begun. The Elastic reference deployment is deliberately
+Direction accepted 2026-08-25. The four decisions above are Accepted.
+
+**Superseded on execution status, 2026-08-26.** "Execution is planned but not
+begun" was true on the day. It is not now: Phases 0-3, 5 and 6 of
+[opentelemetry-completion.plan.md](../plans/opentelemetry-completion.plan.md)
+have landed and been through two review passes. The four decisions and the
+reasoning behind them stand unchanged; only this sentence about status was
+overtaken. What remains outstanding is Phase 4's compose profile and the Elastic
+reference page below. The Elastic reference deployment is deliberately
 **not** yet documented as a procedure — see the deferral note in the plan — and
 will be filed as a reference page once the two-service example builds and the
 stack has actually been run.

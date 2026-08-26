@@ -59,6 +59,17 @@
    entity propagation should not require two extra containers to demonstrate
    entity propagation.
 
+
+**Note added 2026-08-26.** The example does not yet exist, and neither does the
+pipeline it will build. `tests/observability/otlp_wire` is the working reference
+in the meantime: it constructs a `MeterProvider`, a `TracerProvider` and a
+`LoggerProvider` over OTLP/HTTP, installs the subscriber that bridges `tracing`
+into both traces and logs, flushes all three on shutdown, and decodes the
+exported protobuf to assert what arrived. The example's wiring should match it
+rather than being derived independently — a second construction of the same
+pipeline is a second thing to get subtly wrong, and only one of the two has a
+test.
+
 ## Why Elastic
 
 The requirement that decides it: **all three signals, one backend, no

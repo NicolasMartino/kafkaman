@@ -583,14 +583,25 @@ impl Runtime {
             let pool = pool.clone();
             let router = self.router.clone();
             let poll_interval = cfg.relay.poll_interval;
+            let lifecycle = cfg
+                .observability
+                .policy_for(&consumed.message_type)
+                .lifecycle_emission();
             let received = consumed.received;
             let shutdown = shutdown.clone();
             loops.push((
                 "dispatcher",
                 Box::pin(async move {
-                    kafkaman_worker::run_dispatcher(pool, received, router, poll_interval, shutdown)
-                        .await
-                        .map_err(|err| Box::new(err) as BoxError)
+                    kafkaman_worker::run_dispatcher(
+                        pool,
+                        received,
+                        router,
+                        poll_interval,
+                        lifecycle,
+                        shutdown,
+                    )
+                    .await
+                    .map_err(|err| Box::new(err) as BoxError)
                 }),
             ));
         }

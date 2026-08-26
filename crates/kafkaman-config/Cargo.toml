@@ -6,7 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-kafkaman-core = { path = "../kafkaman-core" }
+# `default-features = false` is load-bearing, not tidiness. Cargo unifies
+# features across the graph, so this crate asking for the default `traces`
+# puts `opentelemetry` back into a `kafkaman --no-default-features` build —
+# the opt-out `kafkaman/Cargo.toml` advertises. Nothing here touches the
+# trace API; it needs the config vocabulary only.
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

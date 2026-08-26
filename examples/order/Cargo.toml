@@ -16,6 +16,9 @@ path = "src/lib.rs"
 [dependencies]
 axum.workspace = true
 example-contracts = { path = "../contracts" }
+# The OpenTelemetry SDK and OTLP exporter, held one level up so both services
+# install the same pipeline rather than each keeping a copy of it.
+example-telemetry = { path = "../telemetry" }
 # One kafkaman dependency, not two: the transport comes through the facade.
 kafkaman = { path = "../../crates/kafkaman", features = ["axum", "rdkafka"] }
 serde.workspace = true
@@ -24,7 +27,6 @@ sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 uuid.workspace = true

@@ -46,6 +46,25 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+# Raw SQL, for the one test that has to write a value the constructor refuses:
+# a `traceparent` column holding something that is not a `traceparent` can only
+# be produced by going past the type that guards it.
+sqlx.workspace = true
+# The OTLP wire types, so `otlp_wire` can decode what it captured instead of
+# searching the protobuf bytes for substrings. `gen-tonic-messages` is the prost
+# message half without the tonic transport, which is all a decoder needs.
+#
+# A test-only dependency, and allowed to be: the ownership decision confines
+# exporters and their vocabulary to `apps/` and `tests/`, and this is the `tests/`
+# half. Already in the tree behind `opentelemetry-otlp`, so it adds no
+# compilation that was not happening anyway.
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "logs",
+    "metrics",
+    "trace",
+] }
+prost = "0.14"
 # An HTTP client, because the point of `admin_http` is the hop the router-level
 # tests skip. Already in the tree behind the OTLP exporter, so it costs nothing
 # to compile.

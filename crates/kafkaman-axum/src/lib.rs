@@ -8,8 +8,10 @@
 //!
 //! # Security
 //!
-//! [`admin_router`] is unauthenticated and includes a destructive route. Mount
-//! it behind your own access control — see that function's documentation.
+//! Nothing here is authenticated. [`admin_router`] reads queue contents,
+//! including stored payloads, and [`redrive_router`] re-enqueues dead-lettered
+//! messages. They are separate functions so that mounting the destructive one is
+//! a decision rather than a side effect — see their documentation.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -168,14 +170,19 @@ impl AdminState {
     }
 }
 
-/// Operator routes for queue depth, stuck rows, DLQ inspection, and redrive.
+/// Read-only operator routes: health, queue depth, stuck rows, DLQ inspection.
+///
+/// Every route here is a `GET` and none of them change anything. The destructive
+/// redrive route is deliberately *not* included — it lives in
+/// [`redrive_router`], so that a deployment wanting dashboards does not acquire
+/// a way to re-run handlers by accident.
 ///
 /// # Security
 ///
-/// **This router has no authentication or authorization.** It exposes queue
-/// contents and a destructive `POST /dlq/{message_type}/redrive` that re-enqueues
-/// dead-lettered messages. Mount it on an internal listener, or behind your own
-/// auth middleware — never on a public route table:
+/// **This router has no authentication or authorization.** Read-only is not the
+/// same as harmless: `/dlq` returns stored payloads and failure messages, which
+/// is exactly the data most likely to be sensitive. Mount it on an internal
+/// listener, or behind your own auth middleware — never on a public route table:
 ///
 /// ```ignore
 /// let admin = admin_router(state).layer(my_auth_layer());
@@ -195,6 +202,34 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/received", get(received_summary))
         .route("/stuck", get(stuck_rows))
         .route("/dlq", get(dlq_summary))
+        .with_state(state)
+}
+
+/// The destructive route, alone, so that mounting it is a decision.
+///
+/// `POST /dlq/{message_type}/redrive` moves dead-lettered rows back to `Pending`,
+/// which re-runs their handlers against whatever side effects those handlers
+/// have. With `clear_history` it also erases the attempts and error record that
+/// explain why the rows were dead-lettered — the evidence an operator is usually
+/// in the middle of reading.
+///
+/// # Security
+///
+/// **No authentication or authorization**, like [`admin_router`], and with more
+/// to lose. Separating the two routers is what lets one auth policy cover reads
+/// and a stricter one cover writes:
+///
+/// ```ignore
+/// let admin = admin_router(state.clone())
+///     .layer(my_read_auth_layer())
+///     .merge(redrive_router(state).layer(my_write_auth_layer()));
+/// ```
+///
+/// Merging them with no layer at all reproduces exactly the surface this split
+/// exists to prevent, so do that only where the whole listener is already
+/// private.
+pub fn redrive_router(state: AdminState) -> Router {
+    Router::new()
         .route("/dlq/{message_type}/redrive", post(redrive_dlq))
         .with_state(state)
 }
@@ -434,11 +469,50 @@ pub struct RedriveRequest {
     /// Required and bounded by [`MAX_REDRIVE_ROWS`]. There is no "all" value.
     pub max_rows: i64,
     /// Redrive only rows whose most recent failure was of this kind.
+    ///
+    /// Accepts either spelling: the RFC 9457 `type` URI that
+    /// [`dlq_rows`](AdminState) prints in `latest_error.type`, or the bare
+    /// discriminant stored in `last_failure_kind`. An operator's workflow is to
+    /// read the DLQ and then redrive part of it, and a filter that refuses the
+    /// value the inspection response just showed them is a filter that gets left
+    /// off — which redrives the whole queue instead of one failure class.
+    #[serde(default, deserialize_with = "deserialize_failure_kind")]
     pub failure_kind: Option<ReceivedFailureKind>,
     /// Reset attempts and drop recorded failures. Off by default, because the
     /// history is what triage reads.
     #[serde(default)]
     pub clear_history: bool,
+}
+
+/// Resolve a redrive filter's failure kind from either wire spelling.
+///
+/// Strict, unlike the audit-record reader in `kafkaman-core` that degrades an
+/// unrecognized `type` to the default kind. That leniency is right for reading a
+/// stored problem detail written by a newer binary — the row still has to load.
+/// It would be wrong here: this value decides which rows a destructive request
+/// touches, and quietly resolving a misspelling to `Handler` redrives a
+/// different failure class than the operator named.
+fn deserialize_failure_kind<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReceivedFailureKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    ReceivedFailureKind::from_problem_type(&raw)
+        .map(Some)
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown failure_kind {raw:?}; expected one of {}",
+                ReceivedFailureKind::ALL
+                    .iter()
+                    .map(|kind| kind.discriminant())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
 }
 
 /// Result of a redrive: how many rows actually moved back to `Pending`.
@@ -450,7 +524,7 @@ pub struct RedriveResponse {
 
 /// Re-enqueue dead-lettered rows for one message type.
 ///
-/// Destructive and unauthenticated — see [`admin_router`]. Bounded by
+/// Destructive and unauthenticated — see [`redrive_router`]. Bounded by
 /// [`MAX_REDRIVE_ROWS`]; targets terminal rows only; preserves failure history
 /// unless `clear_history` is set.
 async fn redrive_dlq(
@@ -1016,6 +1090,7 @@ mod tests {
                 claim_expires_at: Some(now),
                 created_at: now,
                 age_ms: 1_000,
+                stuck_for_ms: 250,
             }],
             received: vec![ReceivedStuckRow {
                 message_type: "order_created".to_owned(),
@@ -1026,6 +1101,7 @@ mod tests {
                 created_at: now,
                 due_at: now,
                 age_ms: 2_000,
+                stuck_for_ms: 500,
             }],
             truncated: false,
         };
@@ -1036,6 +1112,14 @@ mod tests {
         assert_rfc3339_string(&value["received"][0], "created_at");
         assert_rfc3339_string(&value["received"][0], "due_at");
         assert_rfc3339_string(&value["received"][0], "next_attempt_at");
+
+        // Both durations reach the wire, and separately. `age_ms` alone told an
+        // operator how long a message had existed while looking like it told
+        // them how long the fault had lasted.
+        assert_eq!(value["outbox"][0]["age_ms"], serde_json::json!(1_000));
+        assert_eq!(value["outbox"][0]["stuck_for_ms"], serde_json::json!(250));
+        assert_eq!(value["received"][0]["age_ms"], serde_json::json!(2_000));
+        assert_eq!(value["received"][0]["stuck_for_ms"], serde_json::json!(500));
     }
 
     #[test]
@@ -1079,6 +1163,47 @@ mod tests {
         assert_eq!(parsed.max_rows, 10);
         assert!(parsed.clear_history);
         assert!(parsed.failure_kind.is_none());
+    }
+
+    #[test]
+    fn redrive_accepts_the_failure_kind_dlq_inspection_prints() {
+        // The two halves of one operator workflow: read the DLQ, redrive part of
+        // it. Inspection renders the failure as an RFC 9457 `type` URI, so a
+        // request body that only accepted the bare discriminant would reject the
+        // exact string the operator just copied — and the way out of that is to
+        // drop the filter, which redrives the whole queue.
+        let printed = ReceivedError::new(
+            ReceivedFailureKind::InvalidPayload,
+            "boom",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let printed = serde_json::to_value(&printed).expect("a problem detail should serialize");
+        let printed = printed["type"].as_str().expect("RFC 9457 names it `type`");
+
+        for spelling in [printed, "InvalidPayload"] {
+            let body = serde_json::json!({ "max_rows": 1, "failure_kind": spelling });
+            let parsed: RedriveRequest =
+                serde_json::from_value(body).expect("both spellings name one failure class");
+            assert_eq!(
+                parsed.failure_kind,
+                Some(ReceivedFailureKind::InvalidPayload)
+            );
+        }
+    }
+
+    #[test]
+    fn redrive_refuses_a_failure_kind_it_does_not_recognize() {
+        // Strict where the audit reader is lenient, and deliberately so: this
+        // value decides which rows a destructive request touches. Degrading an
+        // unknown kind to the default would redrive a different failure class
+        // than the operator named, and report success.
+        let body = serde_json::json!({ "max_rows": 1, "failure_kind": "Handlr" });
+        let err = serde_json::from_value::<RedriveRequest>(body)
+            .expect_err("a misspelled failure class must not silently become another one");
+        assert!(
+            err.to_string().contains("Handler"),
+            "the error should name the vocabulary, got {err}"
+        );
     }
 
     #[test]

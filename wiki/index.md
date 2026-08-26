@@ -46,7 +46,12 @@ durable entity propagation ledger and local cache store.
   queue depth/age/stuck inspection, sanitized Axum admin/health routes with
   bounded destructive input, correlation middleware, draining runtime
   supervision, and descriptor-driven received DLQ redrive. Includes the
-  pre-merge review remediation. Status: Active.
+  pre-merge review remediation. Corrected 2026-08-26 on four counts that had gone
+  stale: the sampler is proportional rather than every `n`-th, the destructive
+  redrive route lives in its own router, the queue gauges read a snapshot a
+  background loop maintains rather than querying from the callback, and M6 ships
+  no example-application change at all — `apps/` is byte-identical to `main`.
+  Status: Active.
 
 ## Reviews
 
@@ -602,18 +607,33 @@ durable entity propagation ledger and local cache store.
   hops, an OTel log appender, and a `tests/observability/` suite. Phase 0 is
   completed 2026-08-25: instruments are built by the loop or component that owns
   them instead of a process-wide `OnceLock`, counters declare units,
-  `tests/observability/provider_ordering` pins that an SDK installed after a relay
-  has run still collects, and the example app installs and flushes an OTLP metrics
-  pipeline of its own. Phase 1 completed the same day: latency histograms,
+  and `tests/observability/provider_ordering` pins that an SDK installed after a
+  relay has run still collects. Phase 1 completed the same day: latency histograms,
   observable queue-depth gauges behind a sampler loop, semconv messaging
   attributes, and five `tests/observability` binaries. Phases 2 and 3 followed:
   W3C trace context persisted on outbox *and* received rows through an additive
   migration, four kafkaman spans, a third Kafka header namespace, and sampled
   success events emitted inside the publish span so they carry the trace they
-  belong to. Phases 5 and 6 followed: twelve `tests/observability` binaries
+  belong to. Phases 5 and 6 followed: fourteen `tests/observability` binaries
   including an OTLP export asserted on the wire, and the M6 spec corrected.
-  Phase 4's compose profile is deferred — the example that would carry it is
-  being replaced. Status: Active.
+  Two review passes followed on 2026-08-25/26: the first verified
+  ten findings and fixed all ten, the largest being that the `metrics`/`traces`
+  opt-out was defeated by internal crates depending on `kafkaman-core` with
+  default features — now asserted on the dependency graph rather than on a build
+  that succeeds either way. The second narrowed the OpenTelemetry features per
+  axis, closed the last doors into an unvalidated `TraceContext`, moved
+  `kafkaman.ingest` ahead of envelope decoding, added the two received-table
+  changesets the DLQ queries require, and replaced `otlp_wire`'s byte-string
+  search with real protobuf decoding. Phase 4's example wiring was then ported
+  onto the rebased two-service example on 2026-08-27: the `order` and `product`
+  binaries install the host-owned metrics/traces/logs pipeline from the shared
+  `examples/telemetry` crate when an OTLP endpoint is configured, the compose
+  stack has an opt-in Elasticsearch/Kibana profile, and `just examples observe`
+  starts the observed stack. A third review pass the same day fixed a `?` inside
+  a `select!` arm that skipped both the drain and the telemetry flush on the
+  failure path, and restored four `kafkaman-axum` items an enumerated facade
+  re-export had dropped. Full Kibana visibility remains pending until the
+  observed stack is run end to end. Status: Active.
 - [plans/first-poc-outbox-publisher.plan.md](plans/first-poc-outbox-publisher.plan.md)
   - Smallest durable-send slice: per-type outbox table, minimal `migrate()`,
   claim-lease relay, publisher, Axum example, and crash/idempotency gates. Status:
