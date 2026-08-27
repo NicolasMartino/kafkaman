@@ -196,6 +196,13 @@ durable entity propagation ledger and local cache store.
     now scopes its advisory lock to a transaction, so a cancelled migration
     cannot leave a pooled connection holding it — and requires a pool of at
     least two connections. Status: Active.
+- [compatibility/kafkaman-otel-surface.compat.md](compatibility/kafkaman-otel-surface.compat.md)
+  - The `kafkaman-otel` public surface, purely additive and in a new crate:
+    nothing existing changed shape. Records why there is no `kafkaman::otel`, the
+    companion versioning that ties the crate to `opentelemetry` 0.32, why there
+    is no `tls` feature (declaring one would make every `--all-features` build in
+    the workspace compile `aws-lc-rs`), and the adopter-side one-liner that gets
+    TLS anyway. Status: Active.
 - [compatibility/m6-observability-operability-api.compat.md](compatibility/m6-observability-operability-api.compat.md)
   - M6 public API/config/dependency changes: `ResolvedConfig.observability`,
     observability config types, SQL queue inspection and runtime redrive helpers,
@@ -249,6 +256,14 @@ durable entity propagation ledger and local cache store.
 
 ## Decisions
 
+- [decisions/kafkaman-otel-extraction.decision.md](decisions/kafkaman-otel-extraction.decision.md)
+  - Ships the pipeline as `crates/kafkaman-otel`, an opt-in leaf crate the facade
+    deliberately does not re-export — a `kafkaman::otel` would put the SDK into
+    `crates/kafkaman`'s graph and fail the boundary check. Amends
+    pipeline-ownership item 6 from two exporter locations to three, and adds a
+    `cargo tree` assertion that the facade cannot reach the crate, so the
+    omission from the forbidden list is enforced rather than trusted.
+    Status: Accepted.
 - [decisions/telemetry-pipeline-ownership.decision.md](decisions/telemetry-pipeline-ownership.decision.md)
   - Host owns the OpenTelemetry SDK; library crates depend on the API crate only.
   Instruments move from a process-wide `OnceLock` to per-run-loop construction,
@@ -265,9 +280,11 @@ durable entity propagation ledger and local cache store.
   publish span stays causally linked to the enqueue that created it; consumer
   spans link rather than parent. Status: Accepted.
 - [decisions/telemetry-backend-and-example-topology.decision.md](decisions/telemetry-backend-and-example-topology.decision.md)
-  - Elastic as the reference backend (not a required one); the example exports
-  direct to Elasticsearch over OTLP/HTTP with no collector, while the collector is
-  documented as the production topology. Status: Accepted.
+  - Elastic as the reference backend (not a required one); the collector is the
+  production topology. Amended 2026-08-27: the example runs a collector too. The
+  direct path was reversed on measurement — Elasticsearch's native `/_otlp`
+  endpoint is metrics-only, so the example had been discarding every span and log
+  record. Status: Accepted.
 - [decisions/missing-handler-dispatch-policy.decision.md](decisions/missing-handler-dispatch-policy.decision.md)
   - Missing handlers are row-level durable dispatch failures recorded under the
     claimed row lock, parking the row without head-of-line blocking younger
@@ -592,6 +609,15 @@ durable entity propagation ledger and local cache store.
     emitting `kafkaman-entity-key` on every record the moment a derive omitted it.
     Narrowing that condition is a prerequisite for the derive's default, not a
     follow-up. Status: Proposed.
+- [proposals/17-kafkaman-otel-convenience-crate.proposal.md](proposals/17-kafkaman-otel-convenience-crate.proposal.md)
+  - Extracts the 243-line OpenTelemetry pipeline the example services install
+    into an opt-in `kafkaman-otel` crate, with a two-tier surface: one call for
+    the common case, and a builder that hands back layers for a host that owns
+    its subscriber. Triggered by the Phase 4 condition that deferred it — the
+    wiring turned out to be the same file twice, byte for byte. Names the cost it
+    accepts: every signature is an `opentelemetry` 0.32 type, so the crate breaks
+    when that line breaks, and the fallback is copying the source.
+    Status: Accepted.
 - [proposals/13-telemetry-pipeline-completion.proposal.md](proposals/13-telemetry-pipeline-completion.proposal.md)
   - Completes OpenTelemetry from instrumentation-only to a working pipeline:
   metrics, traces, logs, W3C context across the outbox and Kafka hops, and an
@@ -600,6 +626,11 @@ durable entity propagation ledger and local cache store.
 
 ## Plans
 
+- [plans/kafkaman-otel-extraction.plan.md](plans/kafkaman-otel-extraction.plan.md)
+  - Five phases: the crate with a typed error and builder tier, moving the SDK
+    boundary assertion, repointing both examples, four tests the example never
+    had, and the documentation. The `tls` feature was dropped mid-flight;
+    the Outcome section records why. Status: Completed.
 - [plans/opentelemetry-completion.plan.md](plans/opentelemetry-completion.plan.md)
   - Turns M6's OpenTelemetry instrumentation into a working pipeline: SDK-backed
   export, the provider-ordering fix, latency histograms and queue-depth gauges,
@@ -626,14 +657,18 @@ durable entity propagation ledger and local cache store.
   changesets the DLQ queries require, and replaced `otlp_wire`'s byte-string
   search with real protobuf decoding. Phase 4's example wiring was then ported
   onto the rebased two-service example on 2026-08-27: the `order` and `product`
-  binaries install the host-owned metrics/traces/logs pipeline from the shared
-  `examples/telemetry` crate when an OTLP endpoint is configured, the compose
-  stack has an opt-in Elasticsearch/Kibana profile, and `just examples observe`
-  starts the observed stack. A third review pass the same day fixed a `?` inside
-  a `select!` arm that skipped both the drain and the telemetry flush on the
-  failure path, and restored four `kafkaman-axum` items an enumerated facade
-  re-export had dropped. Full Kibana visibility remains pending until the
-  observed stack is run end to end. Status: Active.
+  binaries install the host-owned metrics/traces/logs pipeline from the
+  `kafkaman-otel` crate when an OTLP endpoint is configured, the compose
+  stack has an opt-in OTLP-collector/Elasticsearch/Kibana profile, and
+  `just examples observe` starts the observed stack. A third review pass the same
+  day fixed a `?` inside a `select!` arm that skipped both the drain and the
+  telemetry flush on the failure path, and restored four `kafkaman-axum` items an
+  enumerated facade re-export had dropped. The end-to-end exit was then finally
+  run on 2026-08-27 — and failed: Elasticsearch's `/_otlp` is metrics-only, so
+  the example had been discarding every span and log record, and the queue gauges
+  had never been sampled at all because nothing called `run_queue_metrics`. Both
+  are fixed; all three signals and 13 of 15 instruments now verified end to end.
+  Only a packaged Kibana data view and dashboard remain. Status: Active.
 - [plans/first-poc-outbox-publisher.plan.md](plans/first-poc-outbox-publisher.plan.md)
   - Smallest durable-send slice: per-type outbox table, minimal `migrate()`,
   claim-lease relay, publisher, Axum example, and crash/idempotency gates. Status:

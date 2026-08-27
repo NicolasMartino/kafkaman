@@ -59,8 +59,10 @@ opt-out:
         exit 1
       fi
     done
-    # The other half of the ownership boundary: no crate under `crates/` may
-    # depend on an SDK or an exporter, at any feature combination. A library that
+    # The other half of the ownership boundary: no crate an adopter can reach
+    # through the facade may depend on an SDK or an exporter, at any feature
+    # combination. That is every crate below — `kafkaman-otel` is the deliberate
+    # exception, handled after this loop. A library that
     # links the SDK decides the host's pipeline for it — which provider, which
     # exporter, which shutdown — and there is no way for the host to take that
     # back. `--all-features` is the strongest form of the question.
@@ -73,6 +75,20 @@ opt-out:
         fi
       done
     done
+    # kafkaman-otel is absent from that list on purpose: it is the one crate
+    # under `crates/` whose whole job is to hold the exporter, per
+    # wiki/decisions/kafkaman-otel-extraction.decision.md. The list is therefore
+    # an allowlist by omission, which is worth saying so nobody "fixes" it.
+    #
+    # What keeps that safe is the assertion below rather than the omission
+    # above. The boundary is not "no exporter under crates/" — it is that
+    # nothing an adopter gets by depending on `kafkaman` links an SDK. So ask
+    # that question directly: the facade must not reach kafkaman-otel at all.
+    if cargo tree -p kafkaman -e normal --all-features -i kafkaman-otel >/dev/null 2>&1; then
+      echo "kafkaman reaches kafkaman-otel; the facade must not re-export it" >&2
+      echo "see wiki/decisions/kafkaman-otel-extraction.decision.md decision 3" >&2
+      exit 1
+    fi
     # And the third question, which the two above cannot ask: when
     # `opentelemetry` *is* linked, is it linked narrowly? Cargo features are
     # additive and a host can never subtract one, so a library crate that
@@ -107,7 +123,8 @@ opt-out:
       echo "something in the graph widened the axis; a host cannot undo it" >&2
       exit 1
     fi
-    echo "opt-out holds: no opentelemetry without metrics or traces, no SDK in crates/,"
+    echo "opt-out holds: no opentelemetry without metrics or traces, no SDK reachable"
+    echo "from the facade (kafkaman-otel excluded by design and asserted unreachable),"
     echo "and a metrics build links the metrics API alone"
 
 # Every feature combination that ships.
@@ -173,11 +190,31 @@ examples arg="demo":
         echo "Tear it down with: just examples down"
         ;;
       observe)
-        # Direct to Elasticsearch's native OTLP/HTTP endpoint. The exporter
-        # appends /v1/metrics, /v1/traces, and /v1/logs to this base path.
-        OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp \
+        # To the collector, not to Elasticsearch. Elasticsearch's native `/_otlp`
+        # endpoint serves metrics only — `/v1/traces` and `/v1/logs` answer 400
+        # `no handler found` — and it discards explicit-bucket histograms without
+        # reporting anything. The collector speaks all three signals and owns the
+        # Elasticsearch mapping. See examples/otel-collector.yaml.
+        OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
           "${compose[@]}" --profile services --profile observability \
             up -d --build --wait --wait-timeout 900
+        # `--wait` proves the collector container started, not that it is
+        # listening: the image is distroless, so no healthcheck can run inside it
+        # and compose has to gate on `service_started`. Probe the health
+        # extension from here instead. A collector that started and then failed
+        # its configuration looks like a healthy stack silently dropping
+        # everything, which is precisely the failure this profile was rebuilt to
+        # stop happening quietly.
+        health="http://127.0.0.1:${OTEL_HEALTH_PORT:-13133}"
+        for _ in $(seq 30); do
+          if curl -fsS "$health" >/dev/null 2>&1; then break; fi
+          sleep 1
+        done
+        if ! curl -fsS "$health" >/dev/null 2>&1; then
+          echo "the OTLP collector is not answering on $health after 30s" >&2
+          echo "logs: docker compose -f examples/compose.yaml logs otel-collector" >&2
+          exit 1
+        fi
         examples/smoke.sh
         echo ""
         echo "The observed stack is still running:"
@@ -187,9 +224,9 @@ examples arg="demo":
         echo "  message UI:  just examples ui"
         echo ""
         echo "Kibana ships with no data view for the kafkaman signals yet, so it"
-        echo "opens empty. Discover -> create a data view over the indices"
-        echo "Elasticsearch's OTLP endpoint writes to; a packaged dashboard is"
-        echo "still pending (wiki/plans/opentelemetry-completion.plan.md)."
+        echo "opens empty. Discover -> create a data view over '*-generic.otel-*',"
+        echo "which covers all three signals the collector writes; a packaged"
+        echo "dashboard is still pending (wiki/plans/opentelemetry-completion.plan.md)."
         echo ""
         echo "Tear it down with: just examples down"
         ;;

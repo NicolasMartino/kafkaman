@@ -492,6 +492,13 @@ impl Runtime {
     }
 
     /// Construct every loop and start it, under a fresh cancellation token.
+    ///
+    /// The loops are one relay per published type, one ingester and one
+    /// dispatcher per consumed type, a purger when `[retention]` is configured,
+    /// and — under the `metrics` feature, when this runtime owns any outbox or
+    /// received table — a single queue-depth sampler covering all of them. Count
+    /// on the roles you declared, not on a fixed number: the sampler in
+    /// particular appears or not depending on a feature.
     pub fn into_tasks(self) -> Result<RuntimeTasks, BuildError> {
         self.into_tasks_with(CancellationToken::new())
     }
@@ -500,10 +507,33 @@ impl Runtime {
     ///
     /// Use this to compose the runtime's drain with something else — an HTTP
     /// server's graceful shutdown, or a signal handler the host installed.
+    ///
+    /// See [`into_tasks`](Self::into_tasks) for which loops are assembled.
     pub fn into_tasks_with(self, shutdown: CancellationToken) -> Result<RuntimeTasks, BuildError> {
         let pool = self.context.pool().clone();
         let cfg = Arc::clone(self.context.config());
         let mut loops: Vec<(&'static str, LoopFuture)> = Vec::new();
+
+        // Cloned before the role loops below take ownership of the originals.
+        //
+        // Gated with the sampler they feed: `run_queue_metrics` lives behind
+        // kafkaman-worker's `metrics` feature, and cloning two vectors for a loop
+        // that will not be built is waste the compiler would warn about.
+        //
+        // The queue sampler is derived here rather than left to the host because
+        // it takes `OutboxTable` and `ReceivedTable` handles, and naming those is
+        // exactly what `tests/distributed-cache/tests/boot_surface.rs` forbids a
+        // blessed boot file from doing. A host that wanted queue depth could not
+        // obtain it without giving up the property the builder exists to provide,
+        // which is why the example ran without these gauges for as long as it did.
+        #[cfg(feature = "metrics")]
+        let queue_outbox: Vec<OutboxTable> = self.published.clone();
+        #[cfg(feature = "metrics")]
+        let queue_received: Vec<ReceivedTable> = self
+            .consumed
+            .iter()
+            .map(|plan| plan.received.clone())
+            .collect();
 
         for outbox in self.published {
             let publisher = RdkafkaPublisher::from_brokers(&self.brokers).map_err(|source| {
@@ -602,6 +632,62 @@ impl Runtime {
                     )
                     .await
                     .map_err(|err| Box::new(err) as BoxError)
+                }),
+            ));
+        }
+
+        // Queue depth and age, sampled once for every table this runtime derived.
+        //
+        // Behind `metrics` because the sampler is: a build with the feature off
+        // has no gauges to feed and must not pay for the Postgres queries.
+        //
+        // Skipped when the runtime declared no roles at all, so a runtime with
+        // nothing to sample does not open a Postgres connection every interval to
+        // ask about no tables.
+        #[cfg(feature = "metrics")]
+        if !queue_outbox.is_empty() || !queue_received.is_empty() {
+            // `pool` is not cloned: this is its last use, and the sampler is the
+            // final loop assembled.
+            let shutdown = shutdown.clone();
+            // `max_queue_age` is shared with the inspection routes deliberately:
+            // the flag it sets means the same thing in both places, and two
+            // spellings of one threshold is one too many.
+            let queue_cfg = kafkaman_worker::QueueMetricsConfig {
+                max_queue_age: cfg.observability.defaults.max_queue_age,
+                ..Default::default()
+            };
+            loops.push((
+                "queue-metrics",
+                Box::pin(async move {
+                    match kafkaman_worker::run_queue_metrics(
+                        pool,
+                        queue_outbox,
+                        queue_received,
+                        queue_cfg,
+                        shutdown.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(()),
+                        // The gauges register process-wide, so a second runtime in
+                        // one process cannot have its own sampler — which is the
+                        // case `tests/distributed-cache` creates by starting both
+                        // example services in one test binary. The first runtime's
+                        // series stay correct and keep exporting; only this
+                        // runtime's tables go uncovered. Failing here would turn a
+                        // reduction in telemetry into an outage, so the loop parks
+                        // until shutdown like any other.
+                        Err(kafkaman_worker::Error::QueueMetricsAlreadyRunning) => {
+                            tracing::warn!(
+                                "another kafkaman runtime in this process is already sampling \
+                                 queue depth; this runtime's outbox and received tables are not \
+                                 covered by the queue gauges"
+                            );
+                            shutdown.cancelled().await;
+                            Ok(())
+                        }
+                        Err(err) => Err(Box::new(err) as BoxError),
+                    }
                 }),
             ));
         }

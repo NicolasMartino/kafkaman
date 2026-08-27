@@ -25,6 +25,12 @@
    `MeterProvider`, `TracerProvider`, and log appender; applications choose the
    exporter and its version.
 
+   **Amended 2026-08-27 — read this as "no *facade-reachable* crate".**
+   `crates/kafkaman-otel` holds an SDK and an exporter deliberately. It is a leaf
+   nothing depends on but the example binaries, and the facade does not re-export
+   it, so the substance — an adopter who depends on `kafkaman` never links an SDK
+   — is unchanged and is now asserted directly. See *Amendments*.
+
 2. **kafkaman resolves telemetry through the global provider.**
    Instruments come from `global::meter("kafkaman")`; spans come from the host's
    `tracing` subscriber. kafkaman never installs a provider, never sets a global,
@@ -54,6 +60,7 @@
 
 6. **Exporter dependencies live in exactly two places.**
    `apps/` and `tests/`. This is checkable mechanically and should be checked.
+   *Amended 2026-08-27 — see below: a third place, `crates/kafkaman-otel`.*
 
 ## Amendments
 
@@ -81,6 +88,36 @@ is that "the API crate" becomes "the API crate and its `tracing` bridge".
 It is behind the default-on `traces` feature with a no-op twin, matching
 `metrics`, so an adopter who wants no OpenTelemetry dependency at all still has
 one flag to reach for.
+
+### 2026-08-27 — a third place for exporters: `crates/kafkaman-otel`
+
+Decision 6 says exporter dependencies live in exactly two places, `apps/` and
+`tests/`. A third is added, and it is recorded here rather than taken quietly.
+
+The pipeline the example services install was found duplicated byte-for-byte
+across both of them, which is the condition
+`wiki/plans/opentelemetry-completion.plan.md` Phase 4 step 4 named as the trigger
+for extracting a convenience crate. It is now `crates/kafkaman-otel`, and it
+depends on `opentelemetry_sdk`, `opentelemetry-otlp`, and
+`opentelemetry-appender-tracing`.
+
+**Decision 1 is untouched, and this is the reason the amendment is narrow.** The
+constraint that matters is not "no exporter under `crates/`" — it is *no exporter
+in anything an adopter gets by depending on `kafkaman`*. `kafkaman-otel` depends
+on no other kafkaman crate, nothing in the workspace depends on it but the two
+examples, and the facade deliberately does not re-export it. It is a leaf. An
+adopter who never names it never sees an SDK, which is the property decision 1
+exists to protect.
+
+Mechanically: `just opt-out` still checks the seven facade-reachable crates
+under `crates/`, and `kafkaman-otel` is deliberately absent from that list.
+The list is therefore an allowlist by omission, and carries a comment saying so,
+because a list with one conspicuous gap invites a well-meaning correction that
+would break the build for the wrong reason.
+
+The full reasoning, the rejected alternative of a facade re-export, and the
+version-pinning cost this accepts are in
+`wiki/decisions/kafkaman-otel-extraction.decision.md`.
 
 ## The Hazard
 
@@ -175,4 +212,7 @@ Revisit if the API gains the capability.
   starts a loop, and asserts the loop's records reach the exporter. This fails
   against the `OnceLock` implementation and passes against the loop-owned one.
 - A test asserts `--no-default-features` builds and records nothing.
-- The lint gate asserts no crate under `crates/` depends on an exporter.
+- The lint gate asserts no facade-reachable crate depends on an exporter, and —
+  since the 2026-08-27 amendment — that `kafkaman` does not reach
+  `kafkaman-otel`, which is the form of the claim that actually protects an
+  adopter.

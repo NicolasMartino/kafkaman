@@ -34,6 +34,9 @@
    time-series data streams itself. One fewer service in the compose stack, one
    fewer configuration file, and it demonstrates the native path.
 
+   **Amended 2026-08-27 — reversed.** The premise was false: Elasticsearch's
+   `/_otlp` endpoint is metrics-only. See *Amendments*.
+
 4. **The production recommendation is a collector.**
    Documented explicitly and separately from the example, so nobody reads a
    compose file as an architecture recommendation. See *Why the Example and
@@ -44,6 +47,10 @@
    misconfiguration in the whole plan and it fails in a confusing way, so it is
    stated in the decision, in the example configuration comments, and in the
    troubleshooting section of the eventual reference page.
+
+   **Still holds after the 2026-08-27 amendment**, for a different reason:
+   `kafkaman-otel` builds an OTLP/HTTP exporter and offers no gRPC path, so the
+   collector listens on 4318 and never on 4317.
 
 6. **The stack extends the example's existing compose file.**
    The two-service example already has `examples/compose.yaml` with `postgres`,
@@ -72,6 +79,13 @@ test.
 
 ## Why Elastic
 
+> **Amended 2026-08-27.** The sentence below — "natively over HTTP without a
+> collector" — is false for self-managed Elasticsearch: `/_otlp` serves metrics
+> only. The *conclusion* survives, because Elastic still stores all three signals
+> and is still the one backend; what was wrong is how they get there. Read the
+> paragraph as the case for Elastic as a store, not as the case against a
+> collector. See *Amendments*.
+
 The requirement that decides it: **all three signals, one backend, no
 translation layer.** Elasticsearch ingests OTLP metrics, traces, and logs
 natively over HTTP without a collector, and Kibana's APM view is built around
@@ -89,6 +103,15 @@ kafkaman.
 Jaeger plus Prometheus was rejected for the same reason, more so.
 
 ## Why the Example and Production Differ
+
+> **Amended 2026-08-27 — they no longer differ in this respect.** The example
+> runs a collector, because it turned out it could not work without one. The
+> four production reasons below still stand and are still the reason to run one
+> deliberately rather than by accident; what is gone is the claim that the
+> example demonstrates a simpler topology. It demonstrates the same one. The
+> paragraph immediately below is kept because the reasoning it records is what
+> the measurement overturned, and a decision that quietly deletes its own
+> rejected premise teaches the next reader nothing.
 
 Stating this in the decision, because a compose file is the most-copied artifact
 in any repository and will be copied into production by someone.
@@ -110,9 +133,11 @@ about:
 - **Credential surface.** Direct export puts backend credentials in every
   application. A collector reduces that to one component.
 
-The documentation presents the collector as the production topology and the
-direct path as the example's deliberate simplification. Both configurations are
-shown.
+The documentation presents the collector as the production topology. It is now
+also the example's topology, so only one configuration is shown — and the
+example's `examples/otel-collector.yaml` is a working starting point rather than
+a sketch, which is a better artifact than the two-configuration split this
+originally promised.
 
 ## What Kibana Shows, By Phase
 
@@ -164,3 +189,84 @@ in the wiki.
   testcontainer and asserting what it received — becomes possible. It is the only
   check that proves the wire format rather than our belief about it, and it stays
   opt-in like the `redpanda` feature because it is slow.
+
+## Amendments
+
+### 2026-08-27 — the example needs a collector after all
+
+Decision 3 chose a direct export topology on the strength of one factual claim,
+stated in *Why Elastic*: "Elasticsearch ingests OTLP metrics, traces, and logs
+natively over HTTP without a collector." **That claim is false for
+self-managed Elasticsearch**, and the example shipped for two days exporting two
+of three signals into a void.
+
+Measured against 9.3.5 on 2026-08-27, running the example stack:
+
+| Path | POST | GET | Meaning |
+| --- | --- | --- | --- |
+| `/_otlp/v1/metrics` | 200 | 405 | Handler exists, POST-only |
+| `/_otlp/v1/traces` | 400 | 400 | `no handler found for uri` |
+| `/_otlp/v1/logs` | 400 | 400 | `no handler found for uri` |
+| `/_otlp/v1/profiles` | 400 | 400 | `no handler found for uri` |
+
+The `405` on metrics against `400` on the rest is what makes this conclusive
+rather than a configuration guess: a `405` is a registered route rejecting a
+verb, a `400 no handler found` is no route at all.
+
+Two things made it survive review. The Rust SDK reports the failure as
+`BatchSpanProcessor.ExportError ... HTTP export failed: network error`, which
+names neither the status code nor the path, and reads like a transient
+connectivity problem. And nothing in CI or the test suite exercises this — it
+needs a running Elasticsearch, which is exactly the end-to-end verification
+`wiki/plans/opentelemetry-completion.plan.md` Phase 4 had recorded as *pending*
+the entire time. The pending item was not a formality.
+
+**Even the metrics half was partial.** Sums arrived; the three explicit-bucket
+histograms — `kafkaman.dispatch.duration`, `kafkaman.relay.publish.duration`,
+`kafkaman.outbox.time_to_publish` — did not, with no export error, no
+`_ignored` fields, and an empty failure store. The collector later named the
+cause in one line that Elasticsearch never gave: `dropping cumulative
+temporality histogram`. Elasticsearch stores delta temporality; the SDK emits
+cumulative, which is the OTLP default.
+
+**What changes.** The `observability` profile gains an
+`otel/opentelemetry-collector-contrib` service configured by
+`examples/otel-collector.yaml`. Services export to `http://otel-collector:4318`;
+the collector's `elasticsearch` exporter writes all three signals with
+`mapping.mode: otel`, and `cumulative_to_delta` converts the histograms.
+
+**What does not change.** Decisions 1, 2, 4, 6 and 7 stand, and two of them are
+strengthened rather than weakened:
+
+- Decision 2 — a reference backend is not a required backend. The temporality
+  conversion lives in the collector precisely because temporality is a property
+  of the backend, not of the instrumentation. `kafkaman-otel` gained nothing
+  Elastic-specific and still works unchanged against a cumulative backend.
+- Decision 4 — production should use a collector. The example and production
+  topologies now agree, which removes the gap *Why the Example and Production
+  Differ* was written to explain. That section is now describing a difference
+  that no longer exists.
+
+The cost decision 3 was buying — one fewer service, one fewer config file — was
+real. It was just not worth two thirds of the telemetry.
+
+### 2026-08-27 — the queue gauges were never sampled
+
+Found while verifying the above, and unrelated to the backend. `run_queue_metrics`
+had no caller outside `tests/observability`, so the five queue gauges
+(`outbox.depth`, `outbox.oldest_age`, `received.depth`, `received.oldest_age`,
+`queue.sample_age`) were never registered in a running service. Its own doc
+comment predicts the symptom exactly: "every other kafkaman series arrives
+normally and the queue series are simply absent."
+
+The host could not fix this itself. `run_queue_metrics` takes `OutboxTable` and
+`ReceivedTable`, and both are on the forbidden list in
+`tests/distributed-cache/tests/boot_surface.rs` — a blessed boot file that named
+them would fail the test asserting the builder's whole premise. So `RuntimeBuilder`
+now derives the sampler alongside the relay, ingester and dispatcher.
+
+Because the gauges register process-wide, a second runtime in one process cannot
+have its own sampler — which `tests/distributed-cache` creates by starting both
+example services in one binary. That case logs a warning and parks until
+shutdown rather than failing: reducing telemetry coverage must not become an
+outage.

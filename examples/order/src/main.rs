@@ -5,10 +5,15 @@
 //!
 //! ```text
 //! cd examples/order
-//! DATABASE_URL=postgres://postgres:postgres@localhost:5432/order_service \
-//! KAFKA_BROKERS=localhost:9092 \
+//! DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/order_service \
+//! KAFKA_BROKERS=127.0.0.1:19092 \
 //! cargo run
 //! ```
+//!
+//! `19092`, not `9092`: the broker advertises `redpanda:9092` to the compose
+//! network and `127.0.0.1:19092` to the host, and a Kafka client reconnects to
+//! whichever address it was *advertised*. Running from the host with `9092`
+//! resolves the bootstrap and then fails on an address it cannot reach.
 
 use std::net::SocketAddr;
 
@@ -44,16 +49,26 @@ async fn main() -> Result<(), BoxError> {
     // Before any kafkaman loop exists: instruments are created as each loop is
     // built, and one created ahead of the meter provider is bound to the no-op
     // provider for the life of the process.
-    let telemetry = example_telemetry::init("kafkaman-example-order")?;
+    let telemetry = kafkaman_otel::init("kafkaman-example-order")?;
 
     // Every way out of `run` — a boot failure, a dead loop, or Ctrl-C — comes
     // back through here, so the flush covers all of them. A process that exits
     // without flushing loses the telemetry explaining why it exited.
     let result = run(options).await;
-    let telemetry_result = telemetry.shutdown();
+    let flushed = telemetry.shutdown();
+
+    // `result` is returned in preference to `flushed`: what the service did wrong
+    // outranks the exporter's trouble reporting it. But a flush failure must not
+    // vanish behind it — that telemetry is what makes the *next* failure
+    // diagnosable, so when both fail the flush is logged before the run's error
+    // is propagated. The subscriber outlives this: `shutdown` tears down the
+    // providers, not the registry.
+    if let (Err(_), Err(flush)) = (&result, &flushed) {
+        tracing::error!(error = %flush, "the telemetry flush failed as well");
+    }
 
     result?;
-    telemetry_result
+    flushed.map_err(Into::into)
 }
 
 /// Own the service lifecycle, so `main` can own the telemetry lifecycle around it.

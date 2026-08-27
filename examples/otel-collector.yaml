@@ -1,0 +1,100 @@
+# OpenTelemetry Collector for the example's `observability` profile.
+#
+# Why this exists at all, since the stack was designed without it:
+# Elasticsearch's native OTLP endpoint (`/_otlp`) is metrics-only. Verified
+# against 9.3.5 on 2026-08-27 — `POST /_otlp/v1/metrics` answers 200, while
+# `/v1/traces` and `/v1/logs` answer 400 `no handler found for uri`. The Rust
+# SDK reports that as a bare "network error", so the original topology dropped
+# every span and every log record with nothing in the stack reporting a cause.
+#
+# Even the metrics half was partial: sums arrived, explicit-bucket histograms
+# were accepted and silently discarded (no export error, empty failure store).
+# So `kafkaman.dispatch.duration`, `kafkaman.relay.publish.duration` and
+# `kafkaman.outbox.time_to_publish` were absent too.
+#
+# The collector's `elasticsearch` exporter speaks all three signals and owns the
+# data-stream mapping, which is what makes the example demonstrate the whole
+# pipeline rather than a third of it. See
+# wiki/decisions/telemetry-backend-and-example-topology.decision.md, amended.
+
+receivers:
+  otlp:
+    protocols:
+      # HTTP only, deliberately. `kafkaman-otel` builds an OTLP/HTTP exporter and
+      # offers no gRPC path (kafkaman-otel-extraction decision, option E), so a
+      # gRPC listener here would be a port nothing in this stack ever connects
+      # to and a second transport nothing tests.
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # First in every pipeline, which is the only position that works: it sheds load
+  # by refusing new batches at the receiver, so anything ahead of it has already
+  # spent the memory. Without it a slow or unreachable Elasticsearch turns into
+  # unbounded queue growth and the collector is OOM-killed — taking the buffered
+  # telemetry with it, which is the failure a collector was added to prevent.
+  #
+  # Percentages rather than fixed sizes so the limits follow whatever memory the
+  # container is given, since this file ships with no resource limits of its own.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Elasticsearch stores delta-temporality metrics; the OpenTelemetry SDK emits
+  # cumulative, which is the OTLP default and the right one for a Prometheus-style
+  # backend. Without this the exporter logs
+  #   dropping cumulative temporality histogram "kafkaman.dispatch.duration"
+  # and the three kafkaman latency histograms never arrive. Against Elasticsearch's
+  # own `/_otlp` endpoint the same drop happened with no message at all, which is
+  # what made it so hard to see.
+  #
+  # Converting here rather than in `kafkaman-otel` is deliberate: temporality is a
+  # property of the backend, not of the instrumentation, and the crate stays
+  # usable against a cumulative backend unchanged. This is exactly the adaptation
+  # a collector exists to perform.
+  cumulative_to_delta: {}
+
+  # The services already batch on their side; this bounds what one Elasticsearch
+  # bulk request carries when several loops flush at once.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+    # `otel` mapping keeps OTLP's own shape — resource, scope and attributes stay
+    # separate — which is what lets Kibana correlate a span with the log records
+    # emitted inside it. The default mapping flattens that and the correlation
+    # this example exists to show is what gets lost.
+    mapping:
+      mode: otel
+    retry:
+      enabled: true
+      max_retries: 5
+
+extensions:
+  # Exposed for humans and for `just examples observe` to probe from outside.
+  # It cannot serve a compose healthcheck: the collector image is distroless —
+  # no shell, no curl, no wget — so there is nothing inside the container that
+  # could run one. The services therefore gate on `service_started` and rely on
+  # the listener binding well before they finish migrating and verifying topics.
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [elasticsearch]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, cumulative_to_delta, batch]
+      exporters: [elasticsearch]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [elasticsearch]

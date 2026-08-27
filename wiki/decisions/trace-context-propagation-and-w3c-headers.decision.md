@@ -184,8 +184,9 @@ and the row keeps them in its `headers` column for triage.
 
 ### 2026-08-25 — Formatting and parsing are done by hand
 
-The W3C propagator lives in `opentelemetry_sdk`, which no crate under `crates/`
-may depend on. `traceparent` is a fixed four-field format and `tracestate` is an
+The W3C propagator lives in `opentelemetry_sdk`, which no facade-reachable crate
+may depend on — `crates/kafkaman-otel` is the one exception and is not reachable
+from `kafkaman`, so it is no help here. `traceparent` is a fixed four-field format and `tracestate` is an
 opaque list, so `kafkaman-core::trace` implements both directly against the
 Recommendation: it accepts unknown versions with trailing fields, per the
 forward-compatibility rule, and rejects the all-zero ids and the reserved `ff`

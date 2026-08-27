@@ -1,0 +1,37 @@
+[package]
+name = "kafkaman-otel"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No `tls` feature, deliberately — see the crate docs' Transport section.
+#
+# One was written and removed. `opentelemetry-otlp/reqwest-rustls` resolves to
+# `reqwest/default-tls`, which on reqwest 0.13 is rustls with the `aws-lc-rs`
+# provider: a cmake-and-C-toolchain build dependency. Merely declaring the
+# feature puts it in the lock file's potential graph, and every `--all-features`
+# invocation in this workspace — `just lint`, the CI clippy, doc, and test jobs —
+# would then have to build it, for a capability nothing here uses.
+#
+# An adopter who needs `https://` enables it on the exporter from their own
+# manifest instead. Cargo unifies features across the graph, so it reaches the
+# `opentelemetry-otlp` this crate links, and they keep the choice of crypto
+# provider and root store, which is theirs to make rather than ours.
+
+# Deliberately depends on no kafkaman crate. `kafkaman-otel` is a leaf: nothing
+# in the workspace but the two example services depends on it, and the facade
+# does not re-export it. That is what keeps the SDK boundary checkable — see
+# wiki/decisions/kafkaman-otel-extraction.decision.md decision 2.
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

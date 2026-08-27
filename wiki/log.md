@@ -1,5 +1,186 @@
 # Wiki Log
 
+## [2026-08-28] fix | a review pass on the collector and `kafkaman-otel` work
+
+Six findings, four of which were real. Recorded together because the two that
+mattered are both *partial-state* bugs, and they were introduced within a day of
+each other by unrelated changes.
+
+**`Builder::build` installed globals as it went.** It called
+`set_meter_provider` immediately after constructing the meter, then built the
+tracer's exporter — and returned `?` if that failed. The meter provider and its
+exporter thread were then installed, running, and unreachable: no `Telemetry`
+had been returned to shut them down, and an OpenTelemetry global cannot be taken
+back. It now builds all three providers first and installs the globals only once
+nothing can fail, so an `Err` means nothing was installed and a caller may treat
+it as non-fatal. `init` got the matching fix: a lost race for the global
+subscriber now shuts the providers down before returning.
+
+**`into_tasks` returned four tasks and a test asserted three.** The queue-metrics
+sampler added on 2026-08-27 was never reconciled with
+`tests/distributed-cache/tests/runtime_builder.rs`. Docker-gated, so the fast
+gate stayed green — the same shape of gap as the exit criterion that hid the
+`/_otlp` defect, and worth noting twice for that reason.
+
+**`OTEL_METRIC_EXPORT_INTERVAL` was dead.** Found while checking a review
+suggestion that turned out to be wrong. The claim was that a zero
+`metric_interval` needed validating; `opentelemetry_sdk` 0.32
+(`periodic_reader.rs:56`) already ignores zero, so there was nothing to guard.
+But reading it showed `PeriodicReaderBuilder` reads
+`OTEL_METRIC_EXPORT_INTERVAL` for its own default — and `kafkaman-otel` called
+`with_interval` unconditionally, overriding it. An operator following the OTLP
+specification changed nothing and got no diagnostic. Precedence is now explicit
+call, then environment, then the crate's 15s default; 15s rather than the SDK's
+60s because 60s does not fit in a container stop grace period.
+
+**Documentation that had gone false in place.** Four spots still asserted "no
+crate under `crates/` depends on an SDK" and "the example exports direct with no
+collector" as present tense. The wording is now "no *facade-reachable* crate",
+which is both true and the form the gate actually asserts. In the two decisions
+the stale paragraphs are annotated where a reader meets them rather than only
+corrected in an `Amendments` section at the bottom — a correction nobody reaches
+before the claim is not a correction.
+
+**Two suggestions declined, with reasons.** The reviewer asked for
+`description`/`readme` metadata on `crates/kafkaman-otel/Cargo.toml`; no manifest
+in this workspace carries any, and adding it to one is inconsistency rather than
+completeness. And subprocess-style tests for `init` were unnecessary: a file
+under `tests/` is already its own binary, which is the isolation that was wanted,
+so `init` and endpoint-driven provider installation are now covered by two
+ordinary integration tests. One flagged finding — an untracked
+`examples/otel-collector.yaml` — was already resolved when reviewed.
+
+Also: the collector gained a `memory_limiter` first in all three pipelines, so an
+unreachable Elasticsearch sheds load instead of OOM-killing the process holding
+the buffer; `just examples observe` now probes the collector's health endpoint
+from the host, because `--wait` can only prove a distroless container *started*;
+the example binaries' `KAFKA_BROKERS` doc showed `localhost:9092`, the
+container-side address, where a host `cargo run` needs `127.0.0.1:19092`; and a
+telemetry flush failure is now logged instead of being swallowed when the run
+also failed.
+
+## [2026-08-27] fix | the example exported two of three signals into a void
+
+`just examples observe` was walked end to end for the first time, which is the
+exit criterion `wiki/plans/opentelemetry-completion.plan.md` Phase 4 had carried
+as *pending* since it was written. It failed, and it had been failing silently
+since the topology was chosen.
+
+**Elasticsearch's `/_otlp` endpoint is metrics-only.** `POST /_otlp/v1/metrics`
+answers 200; `/v1/traces` and `/v1/logs` answer 400 `no handler found for uri`.
+`telemetry-backend-and-example-topology` decision 3 chose a direct-export
+topology on the opposite claim, sourced from Elastic's documentation. Every span
+and every log record the example produced was discarded on arrival.
+
+**The error message is why nobody noticed.** The Rust SDK reports it as
+`BatchSpanProcessor.ExportError ... HTTP export failed: network error` — no
+status code, no path, indistinguishable from a container that has not finished
+starting. A `405` on the metrics path against `400` on the others is what finally
+made it conclusive: a registered route rejecting a verb versus no route at all.
+
+**Metrics were partial too, and even quieter.** The three latency histograms
+were accepted and dropped with no error, no `_ignored` fields, and an empty
+failure store. The collector named the cause in one line Elasticsearch never
+gave: `dropping cumulative temporality histogram`. Elasticsearch stores delta;
+the SDK emits cumulative.
+
+**Fixed by putting a collector in the `observability` profile.**
+`examples/otel-collector.yaml` receives OTLP/HTTP on 4318 and writes all three
+signals through the `elasticsearch` exporter with `mapping.mode: otel`;
+`cumulative_to_delta` converts the histograms. The conversion lives in the
+collector rather than in `kafkaman-otel` deliberately — temporality belongs to
+the backend, not the instrumentation, and the crate stays correct against a
+cumulative backend unchanged. That keeps decision 2 intact: the reference backend
+is still not a required one.
+
+**A second, unrelated gap surfaced while verifying.** `run_queue_metrics` had no
+caller outside `tests/observability`, so the five queue gauges were never
+registered in a running service — its own doc comment predicts the symptom.
+The host could not fix it: the function takes `OutboxTable` and `ReceivedTable`,
+both forbidden in blessed boot files by `boot_surface.rs`. `RuntimeBuilder` now
+derives the sampler like every other loop, and tolerates the process-wide
+"already running" case by parking rather than failing, because
+`tests/distributed-cache` runs two runtimes in one process.
+
+**Verified end to end**, on a clean stack: 13 of 15 instruments arriving — the
+two absent are error counters, correctly absent on a healthy run — all four span
+names across both services, span links joining the trace across the Kafka hop,
+logs arriving, and zero export errors on either side.
+
+Trace propagation was never broken. The Kafka hop shows as a *new* trace joined
+by an OTel span link, which is the messaging convention rather than a defect: one
+consumer poll can cover many producer traces, so a link is correct where
+parent-child would not be.
+
+## [2026-08-27] decision | kafkaman-otel extracted from the example pipeline
+
+Proposal, decision, plan, and compatibility note for shipping the example's
+OpenTelemetry pipeline as an opt-in crate, then the extraction itself.
+
+**The trigger fired.** `wiki/plans/opentelemetry-completion.plan.md` Phase 4 step
+4 deferred a `kafkaman-otel` crate with a written condition: extract it "only if
+the example proves it is genuinely repetitive." Earlier the same day the two
+example services were found holding byte-identical 161-line copies of the
+pipeline, which is that condition met rather than argued.
+
+**The facade cannot carry it, and now that is asserted.** The obvious home —
+`kafkaman::otel` behind a feature — would put `opentelemetry_sdk` into
+`crates/kafkaman`'s `--all-features` graph and fail the check that makes the SDK
+boundary real. `kafkaman-otel` is a leaf instead: it depends on no kafkaman
+crate, nothing but the two examples depends on it, and `just opt-out` now asserts
+directly that `kafkaman` cannot reach it. The forbidden-crate list is an
+allowlist by omission, and says so, because a list with one conspicuous gap
+invites a well-meaning correction.
+
+`wiki/decisions/telemetry-pipeline-ownership.decision.md` item 6 said exporters
+live in exactly two places. It is amended to three, following the precedent of
+its own 2026-08-25 `tracing-opentelemetry` amendment. Item 1 is untouched: the
+constraint that matters was never "no exporter under `crates/`" but "no exporter
+in anything an adopter gets by depending on `kafkaman`."
+
+**Two tiers, because one would be unusable.** `init(name)` for the common case;
+`builder(name)` for a host that already owns its subscriber, where `build()`
+installs the providers and hands back `trace_layer()` / `log_layer()` to compose.
+A crate that seizes the global subscriber is no use to anyone with a JSON layer
+or an error reporter already in place.
+
+**The `tls` feature was written and removed, and the reason generalises.**
+`opentelemetry-otlp/reqwest-rustls` resolves to `reqwest/default-tls`, which on
+`reqwest` 0.13 means rustls with the `aws-lc-rs` provider — cmake and a C
+toolchain. Cargo records a feature's dependencies in the lock file whether or not
+the feature is on, so merely *declaring* it would make every `--all-features`
+invocation here — `just lint`, and the CI clippy, doc, and test jobs — build
+`aws-lc-rs` for a capability nothing uses. An adopter enables it from their own
+manifest instead; feature unification carries it to the same exporter, and the
+crypto provider stays their choice.
+
+**The tests needed a lock, not just grouping.** Four tests, two setting
+environment variables and two asserting none are set, raced visibly — consecutive
+runs reported different failure counts. They now share a `static ENV_LOCK`
+held for each test body, with poisoning recovered. Stable over five runs.
+
+Verification:
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps`
+- `just opt-out`, including the new facade-unreachability assertion
+- `just features` (seven combinations)
+- `cargo test --workspace --lib` — 242 passed, up from 238 by exactly the four
+  new tests
+
+Not run: the Docker-backed integration suite, and `just examples observe` end to
+end. `wiki/plans/opentelemetry-completion.plan.md` Phase 4's Kibana exit stays
+pending and is unaffected by this work.
+
+Pages affected: `wiki/proposals/17-kafkaman-otel-convenience-crate.proposal.md`
+(new), `wiki/decisions/kafkaman-otel-extraction.decision.md` (new),
+`wiki/plans/kafkaman-otel-extraction.plan.md` (new),
+`wiki/compatibility/kafkaman-otel-surface.compat.md` (new),
+`wiki/decisions/telemetry-pipeline-ownership.decision.md` (amended),
+`wiki/plans/opentelemetry-completion.plan.md`, `wiki/index.md`, `wiki/log.md`,
+`crates/kafkaman-otel/` (new), `examples/order/`, `examples/product/`,
+`examples/README.md`, `Cargo.toml`, `justfile`, `.github/workflows/ci.yml`.
+
 ## [2026-08-27] review | third pass over the OTel example port
 
 Line-by-line review of the staged example port, then the fixes. Two findings

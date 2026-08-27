@@ -98,28 +98,81 @@ The first run compiles librdkafka from source and takes a few minutes; later
 ones reuse the build cache. The stack stays up afterwards so you can poke at it
 on `:3001` (order) and `:3002` (product). `just examples down` tears it down.
 
-**With OpenTelemetry export**, add Elasticsearch and Kibana:
+**With OpenTelemetry export**, add a collector, Elasticsearch and Kibana:
 
 ```bash
 just examples observe
 ```
 
 That is the same service stack plus the `observability` compose profile. The
-services export OTLP/HTTP directly to Elasticsearch at
-`http://elasticsearch:9200/_otlp`, and the Rust exporter appends
-`/v1/metrics`, `/v1/traces`, and `/v1/logs`. The plain `demo` path pins
+services export OTLP/HTTP to `http://otel-collector:4318`, and the collector
+writes all three signals to Elasticsearch. The plain `demo` path pins
 `OTEL_EXPORTER_OTLP_ENDPOINT` to the empty string, so the binaries install no
 provider and do not log failed exports into a backend that is not running — and
 so that a value you export for your own tooling is not inherited by containers
 where it would point somewhere else.
 
-Export is **plaintext HTTP only**. The workspace pins `opentelemetry-otlp` to
-its blocking `reqwest` client, which resolves without a TLS backend, and the
-runtime image carries no `ca-certificates`; an `https://` endpoint fails at run
-time with nothing failing at build time. A real deployment swaps in the
-exporter's `reqwest-rustls-client` feature and adds a root store to the image.
-The pipeline itself lives in `examples/telemetry`, shared by both binaries and
-written out in full so it can be copied rather than inferred.
+**Why a collector, when Elasticsearch ingests OTLP natively.** Because it does
+not ingest all of it. Measured against 9.3.5 on 2026-08-27:
+`POST /_otlp/v1/metrics` answers 200, while `/v1/traces` and `/v1/logs` answer
+400 `no handler found for uri`. The Rust SDK surfaces that as a bare "network
+error", so the direct topology this example used to ship dropped every span and
+every log record with nothing reporting a cause. Even metrics were partial —
+Elasticsearch wants delta temporality and the SDK emits cumulative, so the three
+kafkaman latency histograms were accepted and silently discarded.
+
+The collector answers all three, and `cumulative_to_delta` converts the
+histograms. That conversion lives in the collector rather than in `kafkaman-otel`
+on purpose: temporality is a property of the backend, not of the
+instrumentation, and the crate stays correct against a cumulative backend
+unchanged. `examples/otel-collector.yaml` carries the detail.
+
+The pipeline itself is `kafkaman-otel`, the opt-in companion crate both
+binaries depend on. It is not reachable through the `kafkaman` facade, and that
+is deliberate — the facade must not link an OpenTelemetry SDK, which
+`just opt-out` asserts. Adopters name it directly:
+
+```rust
+let telemetry = kafkaman_otel::init("order-service")?;
+// ... build the runtime, serve, drain ...
+telemetry.shutdown()?;
+```
+
+Export is **plaintext HTTP only**. The exporter's client resolves without a TLS
+backend and the runtime image carries no `ca-certificates`, so an `https://`
+endpoint fails at run time with nothing failing at build time. To change that,
+add a root store to the image and enable TLS on the exporter from your own
+manifest:
+
+```toml
+kafkaman-otel = "0.1"
+opentelemetry-otlp = { version = "0.32", features = ["reqwest-rustls"] }
+```
+
+Cargo unifies features across the graph, so that reaches the exporter
+`kafkaman-otel` links without changing any code. It is done from the adopter's
+side rather than behind a `kafkaman-otel` feature so the crypto provider stays
+your choice; see the crate docs.
+
+**Running the services on the host against the observed stack.** `just examples
+observe` publishes the collector on `127.0.0.1:4318`, so the `cargo run` shape
+below exports too — the endpoint is just the host address instead of the compose
+one. Start the stack, stop the two containers you want to replace, and run them
+yourself:
+
+```bash
+just examples observe
+docker compose -f examples/compose.yaml stop order product
+
+cd examples/order
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/order_service \
+KAFKA_BROKERS=127.0.0.1:19092 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+cargo run
+```
+
+Leave `OTEL_EXPORTER_OTLP_ENDPOINT` unset and the binary installs no provider at
+all, which is what keeps an ordinary `just examples up` loop quiet.
 
 **Infrastructure only**, when you are working on the services themselves and
 want a normal `cargo` loop:
@@ -220,14 +273,17 @@ For telemetry, `just examples observe` adds Kibana on
 <http://127.0.0.1:5601>. Elasticsearch needs noticeably more memory than the
 plain stack; override `ES_JAVA_OPTS` if Docker Desktop is tight on RAM, and use
 `KIBANA_PORT` or `ELASTICSEARCH_PORT` if the defaults are already bound.
-`ELASTIC_VERSION` moves both images together, with 9.2 as the floor — the native
-`/_otlp` endpoint does not exist before it, and an older tag shows up as 404s
-from the exporter rather than as anything compose reports.
+`ELASTIC_VERSION` moves both images together, with 9.2 as the floor — the
+collector's `otel` mapping mode writes to the `*-*.otel-*` data streams and
+relies on index templates that ship from 9.2. `OTEL_COLLECTOR_VERSION` moves the
+collector, and `OTLP_HTTP_PORT` publishes 4318 so a service you run on the host
+under `just examples up` can export to the same collector as the containers.
 
 Kibana opens **empty**: no data view for the kafkaman signals ships yet, and
-neither does a dashboard. Create one over the indices Elasticsearch's OTLP
-endpoint writes to and the metrics, spans, and correlated logs are there.
-Packaging that view is tracked in
+neither does a dashboard. The data is there — the collector writes to
+`metrics-generic.otel-default`, `traces-generic.otel-default` and
+`logs-generic.otel-default` — so a data view over `*-generic.otel-*` reaches all
+three. Packaging that view is tracked in
 `wiki/plans/opentelemetry-completion.plan.md`.
 
 Walk the lifecycle:

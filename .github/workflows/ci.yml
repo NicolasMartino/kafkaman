@@ -54,8 +54,10 @@ jobs:
               exit 1
             fi
           done
-          # No crate under crates/ may depend on an SDK or exporter at any
-          # feature combination: that choice belongs to the host process.
+          # No facade-reachable crate may depend on an SDK or exporter at any
+          # feature combination: that choice belongs to the host process. The
+          # list below is every such crate; kafkaman-otel is the deliberate
+          # exception and is asserted separately, further down.
           for crate in kafkaman kafkaman-core kafkaman-config kafkaman-sqlx \
                        kafkaman-worker kafkaman-rdkafka kafkaman-axum; do
             for forbidden in opentelemetry_sdk opentelemetry-otlp opentelemetry-appender-tracing; do
@@ -65,6 +67,15 @@ jobs:
               fi
             done
           done
+          # kafkaman-otel is absent from that list on purpose: it is the one
+          # crate under crates/ whose whole job is to hold the exporter. The
+          # list is an allowlist by omission, and what keeps that safe is the
+          # assertion below -- the boundary is that nothing an adopter gets from
+          # `kafkaman` links an SDK, so ask that question directly.
+          if cargo tree -p kafkaman -e normal --all-features -i kafkaman-otel >/dev/null 2>&1; then
+            echo "::error::kafkaman reaches kafkaman-otel; the facade must not re-export it"
+            exit 1
+          fi
           # And when opentelemetry *is* linked, it must be linked narrowly.
           # Features are additive and a host can never subtract one, so an axis
           # a library enables without using is permanent in every adopter's

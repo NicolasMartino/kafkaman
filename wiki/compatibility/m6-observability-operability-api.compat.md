@@ -301,6 +301,26 @@ configuration that can never succeed. It owns the summary queries and the gauge
 callbacks read the snapshot it maintains, because an observable-gauge callback is
 synchronous and cannot await a database round trip.
 
+**Amended 2026-08-27 — `RuntimeBuilder` now derives it.** Until then nothing
+outside `tests/observability` called `run_queue_metrics`, so the five queue
+gauges never registered in any real process. A host could not fix that itself:
+the function takes `OutboxTable` and `ReceivedTable`, both on the forbidden list
+in `tests/distributed-cache/tests/boot_surface.rs`. `Runtime::into_tasks` now
+assembles the sampler alongside the other loops whenever the runtime owns any
+outbox or received table and the `metrics` feature is on.
+
+Two consequences worth stating:
+
+- **`into_tasks` returns one more task than it used to.** Count on the roles you
+  declared rather than on a fixed number, and note that this one is
+  feature-dependent.
+- **A host that already calls `run_queue_metrics` itself keeps winning.** The
+  second sampler in a process gets `QueueMetricsAlreadyRunning`; the derived one
+  logs a warning naming the tables it could not cover and then parks on the
+  shutdown token rather than failing the runtime. Losing telemetry coverage must
+  not become an outage — and two runtimes in one process is a real shape, which
+  is how `tests/distributed-cache` runs.
+
 Two operational notes for adopters:
 
 - **Run one per process.** The gauges register with the global meter when the

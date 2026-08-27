@@ -1,7 +1,7 @@
 # OpenTelemetry Completion Plan
 
 - Document Class: Plan
-- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25 and corrected across two review passes on 2026-08-25/26; Phase 4's example pipeline and compose profile ported 2026-08-27, with full Kibana visibility verification still pending
+- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25 and corrected across two review passes on 2026-08-25/26; Phase 4's example pipeline and compose profile ported 2026-08-27, its end-to-end exit run the same day (it failed, and the fix is recorded in Phase 4), leaving only a packaged Kibana data view and dashboard outstanding
 - Date: 2026-08-25
 - Category: Observability execution
 - Scope: Turns M6's OpenTelemetry instrumentation into a working, verified, exportable telemetry pipeline — metrics, traces, and logs — and proves it end to end against a real backend.
@@ -293,19 +293,30 @@ work, which is what `sample_success` was for.
 ## Phase 4 — Wiring And Example
 
 **Steps 1 through 4 are now ported onto the rebased two-service example.** No
-exporter appears in any `crates/` manifest; the SDK and OTLP exporter are held by
-the `order` and `product` example binaries, and by `tests/observability`. Step 4
-still stands: no `kafkaman-otel` crate, because pinning adopters to our choice of
-exporter versions is a real cost in an ecosystem that releases breaking 0.x
-versions in lockstep.
+exporter appears in any *facade-reachable* crate: the SDK and the OTLP exporter
+are held by `crates/kafkaman-otel`, by the `order` and `product` example
+binaries through it, and by `tests/observability`.
 
-The 2026-08-27 port put the example's own pipeline in the shared
-`examples/telemetry` crate, which both service binaries depend on, and
+Step 4 was reversed on the same day it was written. It deferred a `kafkaman-otel`
+crate "only if the example proves it is genuinely repetitive"; the example proved
+it by containing the pipeline twice, byte for byte, so the crate was extracted
+under the condition step 4 itself set. The version-pinning cost it named was not
+avoided — it was accepted explicitly, and the crate is versioned as a companion
+rather than as part of kafkaman. See
+`wiki/decisions/kafkaman-otel-extraction.decision.md`.
+
+The 2026-08-27 port put the example's own pipeline in a shared crate both
+service binaries depend on — first `examples/telemetry`, extracted the same day
+into the shipped `kafkaman-otel` (see
+`wiki/decisions/kafkaman-otel-extraction.decision.md`) — and
 extended `examples/compose.yaml` with an `observability` profile containing
 Elasticsearch and Kibana. The binaries install no provider when every OTLP
 endpoint variable is absent or blank, so the default example remains quiet; `just
-examples observe` supplies `OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp`
-and starts the observed stack.
+examples observe` supplies an endpoint and starts the observed stack.
+
+That endpoint was `http://elasticsearch:9200/_otlp` as ported, and is
+`http://otel-collector:4318` since the exit run below found the direct topology
+loses traces and logs entirely.
 
 `tests/observability/otlp_wire` is the working reference for that port: it builds
 a `MeterProvider`, a `TracerProvider`, and a `LoggerProvider` over OTLP/HTTP,
@@ -331,16 +342,48 @@ instrument names, span names, and log lines on the wire.
    collector; the collector is documented as the production topology. Rationale
    in `wiki/decisions/telemetry-backend-and-example-topology.decision.md`. A
    Kibana dashboard artifact is still pending.
+
+   **Reversed 2026-08-27.** The direct path silently discarded traces and logs;
+   the example now runs an OTLP collector in the `observability` profile. See
+   *Exit exercised 2026-08-27* below.
 4. **A `kafkaman-otel` convenience crate is deferred, not rejected.** One call
    that builds the standard pipeline is attractive, but it pins adopters to our
    choice of exporter crate versions — a real cost in an ecosystem that releases
    breaking 0.x versions in lockstep. Document the wiring first; extract the
    crate only if the example proves it is genuinely repetitive.
 
-**Exit still pending:** run `just examples observe`, walk the smoke lifecycle,
-and confirm kafkaman metrics, traces, and correlated logs are visible in Kibana.
-Kibana currently opens with no data view over the OTLP indices, so packaging one
-is part of clearing this exit rather than a separate nicety.
+   **Condition met, and the crate extracted, 2026-08-27.** The example carried
+   the pipeline twice, byte for byte — which is what "genuinely repetitive" was
+   written to detect. The version-pinning cost was accepted rather than dodged;
+   see `wiki/decisions/kafkaman-otel-extraction.decision.md`.
+
+**Exit exercised 2026-08-27, and it failed.** `just examples observe` was run end
+to end for the first time. Metrics arrived; traces and logs did not, because
+Elasticsearch's `/_otlp` endpoint is metrics-only — `/v1/traces` and `/v1/logs`
+answer 400 `no handler found for uri`. Three latency histograms were dropped on
+top of that, silently, for emitting cumulative rather than delta temporality. The
+five queue gauges were absent for an unrelated reason: `run_queue_metrics` had no
+caller outside `tests/observability`.
+
+This is the clearest argument in this plan for running an exit criterion rather
+than reasoning about it. Everything upstream — the instruments, the spans, the
+propagation, the shutdown ordering, the tests — was correct, and the example
+still exported two of three signals into a void for two days, because the one
+step nothing automated had never been taken.
+
+**Fixed the same day.** The `observability` profile gained an OpenTelemetry
+Collector (`examples/otel-collector.yaml`), `RuntimeBuilder` now derives the
+queue-metrics sampler, and
+`wiki/decisions/telemetry-backend-and-example-topology.decision.md` carries the
+amendment and the measurements. Re-verified on a clean stack: 13 of 15
+instruments arriving (the two absent are error counters, correct on a healthy
+run), all four span names across both services, span links joining the trace
+across the Kafka hop, logs arriving, zero export errors.
+
+**Exit still pending, narrowed:** a packaged Kibana data view and dashboard. The
+data is now all present and reachable — a data view over `*-generic.otel-*`
+covers all three signals — but Kibana still opens empty, and shipping that view
+is what remains of this exit.
 
 ## Phase 5 — The Test Suite
 

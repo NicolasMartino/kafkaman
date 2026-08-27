@@ -232,9 +232,10 @@ async fn build_starts_no_loops(cluster: &Cluster) -> TestResult {
     let tasks = runtime.into_tasks()?;
     assert_eq!(
         tasks.len(),
-        3,
+        4,
         "one relay for the published type, one ingester and one dispatcher for the \
-         consumed one — and no purger, because these roles declare no `[retention]`"
+         consumed one, plus the queue-depth sampler that covers both — and no \
+         purger, because these roles declare no `[retention]`"
     );
     tasks.shutdown().await?;
     Ok(())

@@ -8,10 +8,11 @@
 #       The above plus the provisioner and both services, built from
 #       examples/Dockerfile. One command, nothing else installed.
 #
-#   OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp \
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
 #   docker compose -f examples/compose.yaml --profile services --profile observability up -d --wait
-#       The service stack plus Elasticsearch and Kibana. Elasticsearch's native
-#       OTLP endpoint is HTTP-only; the Rust exporter appends /v1/{signal}.
+#       The service stack plus an OpenTelemetry Collector, Elasticsearch and
+#       Kibana. The services speak OTLP/HTTP to the collector, which owns the
+#       Elasticsearch mapping for all three signals.
 #
 # `just examples up`, `just examples demo`, and `just examples down` wrap these.
 #
@@ -128,20 +129,42 @@ services:
       redpanda:
         condition: service_healthy
 
-  # Elasticsearch and Kibana are the reference telemetry backend for the
-  # example, not a dependency of the propagation demo itself. They stay behind a
-  # profile because Elasticsearch wants real memory and a user should not have
-  # to run it just to see two services exchange snapshots.
+  # The telemetry backend for the example, not a dependency of the propagation
+  # demo itself. It stays behind a profile because Elasticsearch wants real
+  # memory and a user should not have to run it just to see two services
+  # exchange snapshots.
   #
-  # The services export directly to Elasticsearch's native OTLP/HTTP endpoint:
-  # OTEL_EXPORTER_OTLP_ENDPOINT=http://elasticsearch:9200/_otlp. Do not point the
-  # Rust exporter at port 4317 or 4318 here; there is no collector in this
-  # example topology, and Elasticsearch's endpoint lives on its HTTP port.
+  # The services export OTLP/HTTP to the collector, which writes to
+  # Elasticsearch: OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318.
+  #
+  # They used to export straight to Elasticsearch's native `/_otlp` endpoint,
+  # and that silently lost two thirds of the telemetry. See the collector's own
+  # comment header, examples/otel-collector.yaml, for the measurements.
+  otel-collector:
+    profiles: ["observability"]
+    image: otel/opentelemetry-collector-contrib:${OTEL_COLLECTOR_VERSION:-0.159.0}
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      # 4318 is OTLP/HTTP. Published so a service running on the host under
+      # `just examples up` can export to the same collector as the containers.
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+      # The health_check extension, for a human or a script. Compose cannot use
+      # it: the collector image is distroless, so no healthcheck can run inside
+      # the container.
+      - "${OTEL_HEALTH_PORT:-13133}:13133"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: on-failure:3
+
   elasticsearch:
     profiles: ["observability"]
-    # 9.2 is the floor, not a preference: the native `/_otlp` endpoint the
-    # services export to does not exist before it, and an older tag fails as
-    # 404s from the exporter rather than as anything compose reports.
+    # 9.2 is the floor. Nothing exports to `/_otlp` any more, so the original
+    # reason no longer applies; what needs it now is the collector's `otel`
+    # mapping mode, which writes to the `*-*.otel-*` data streams and relies on
+    # the index templates that ship from 9.2.
     image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-9.3.5}
     environment:
       discovery.type: single-node
@@ -259,6 +282,14 @@ services:
       elasticsearch:
         condition: service_healthy
         required: false
+      # `service_started` rather than `service_healthy` because the image is
+      # distroless and cannot be probed from inside. The race it leaves is
+      # closed in practice by the Elasticsearch gate above: both wait on that,
+      # and the collector binds its listener in milliseconds while a service
+      # still has to connect to Postgres, migrate, and verify its topics.
+      otel-collector:
+        condition: service_started
+        required: false
     healthcheck:
       # /health returns 204 and checks nothing, so this is a "process is
       # serving" signal rather than a readiness probe. It is still worth
@@ -334,6 +365,14 @@ services:
       # 30-60s, and the gap is spent logging failed exports.
       elasticsearch:
         condition: service_healthy
+        required: false
+      # `service_started` rather than `service_healthy` because the image is
+      # distroless and cannot be probed from inside. The race it leaves is
+      # closed in practice by the Elasticsearch gate above: both wait on that,
+      # and the collector binds its listener in milliseconds while a service
+      # still has to connect to Postgres, migrate, and verify its topics.
+      otel-collector:
+        condition: service_started
         required: false
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:3001/health"]

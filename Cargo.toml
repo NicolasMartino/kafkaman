@@ -8,11 +8,11 @@ members = [
     "crates/kafkaman-axum",
     "crates/kafkaman-test",
     "crates/kafkaman",
+    "crates/kafkaman-otel",
     "examples/contracts",
     "examples/order",
     "examples/product",
     "examples/provision",
-    "examples/telemetry",
     "tests/durable-send",
     "tests/distributed-cache",
     "tests/observability",
@@ -38,10 +38,14 @@ axum = "0.8"
 # `opentelemetry_sdk`'s own defaults, and a host that wants OpenTelemetry's
 # internal diagnostics without the SDK can add the feature itself.
 opentelemetry = { version = "0.32", default-features = false }
-# The SDK and the exporter never appear in a `crates/` manifest — the host owns
-# the pipeline, and the example app is a host. The observability suite adds the
-# `testing` feature on top of this.
-# See wiki/decisions/telemetry-pipeline-ownership.decision.md.
+# The host owns the pipeline, so the SDK and the exporter stay out of every
+# crate an adopter reaches through the `kafkaman` facade. The one exception is
+# `crates/kafkaman-otel`, whose entire job is to hold them: it is a leaf nothing
+# in the workspace depends on but the example binaries, which is what keeps the
+# boundary checkable rather than merely stated. `just opt-out` asserts both
+# halves. The observability suite adds the `testing` feature on top of this.
+# See wiki/decisions/telemetry-pipeline-ownership.decision.md and its
+# 2026-08-27 amendment.
 opentelemetry_sdk = { version = "0.32", features = ["metrics", "trace", "logs"] }
 # Attribute-key constants only: no runtime, no SDK, so a library crate may
 # depend on it. The messaging keys kafkaman emits are still experimental
