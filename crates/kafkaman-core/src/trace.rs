@@ -374,7 +374,27 @@ mod enabled {
     /// span is not recording, or when the process is simply not inside a span —
     /// all of which are ordinary states, not failures.
     pub fn capture() -> Option<TraceContext> {
-        span_context_of(&tracing::Span::current()).map(|context| TraceContext {
+        capture_of(&tracing::Span::current())
+    }
+
+    /// The trace context of `span` specifically.
+    ///
+    /// # Why this exists beside [`capture`]
+    ///
+    /// [`capture`] reads whichever span happens to be current, and the three
+    /// callers that *persist* what it returns all mean one particular span: the
+    /// `kafkaman.enqueue`, `kafkaman.ingest`, or `kafkaman.relay.publish` that
+    /// names the phase. Nothing enforced that. Any span opened between the phase
+    /// span and the capture — an `#[instrument]` on an inner function, a
+    /// middleware, a retry wrapper — silently became the context written to the
+    /// outbox row, the received row, and the `traceparent` header other services
+    /// parse. The row still looked well-formed; it just pointed at a private
+    /// function instead of the documented phase.
+    ///
+    /// So the callers that persist name their span, and stop depending on what
+    /// the call stack happens to look like.
+    pub fn capture_of(span: &tracing::Span) -> Option<TraceContext> {
+        span_context_of(span).map(|context| TraceContext {
             traceparent: format!(
                 "00-{}-{}-{:02x}",
                 context.trace_id(),
@@ -487,6 +507,10 @@ mod disabled {
         None
     }
 
+    pub fn capture_of(_span: &tracing::Span) -> Option<TraceContext> {
+        None
+    }
+
     pub fn set_parent(_span: &tracing::Span, _context: &TraceContext) {}
 
     pub fn add_link(_span: &tracing::Span, _context: &TraceContext) {}
@@ -497,7 +521,13 @@ mod disabled {
 }
 
 #[cfg(feature = "traces")]
-pub use enabled::{add_link, attach, capture as capture_trace_context, set_parent};
+pub use enabled::{
+    add_link, attach, capture as capture_trace_context, capture_of as capture_trace_context_of,
+    set_parent,
+};
 
 #[cfg(not(feature = "traces"))]
-pub use disabled::{add_link, attach, capture as capture_trace_context, set_parent};
+pub use disabled::{
+    add_link, attach, capture as capture_trace_context, capture_of as capture_trace_context_of,
+    set_parent,
+};

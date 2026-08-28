@@ -98,6 +98,7 @@ pub(crate) fn handler_failure_disposition(error: &Error) -> FailureDisposition {
 /// consistent with the row's status. If the savepoint rollback itself fails the
 /// transaction is unusable, so the whole thing is abandoned and the failure is
 /// recorded on a fresh connection — losing the atomicity, but not the record.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn rollback_handler_and_record_received_failure(
     mut tx: Transaction<'_, Postgres>,
     pool: &PgPool,
@@ -120,6 +121,7 @@ pub(crate) async fn rollback_handler_and_record_received_failure(
     record_received_failure(&mut conn, table, failure).await
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn create_dispatch_handler_savepoint(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<()> {
@@ -129,6 +131,7 @@ pub(crate) async fn create_dispatch_handler_savepoint(
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn rollback_to_dispatch_handler_savepoint(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query("ROLLBACK TO SAVEPOINT kafkaman_dispatch_handler")
         .execute(&mut **tx)
@@ -148,6 +151,7 @@ pub(crate) fn dispatch_failure_stats(outcome: MarkOutcome) -> DispatchStats {
 
 /// Run the observer installed in `slot`, if the caller supplied any hooks.
 #[cfg(feature = "internal-hooks")]
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn run_dispatch_hook(
     hooks: Option<&DispatchHooks>,
     slot: DispatchHookSlot,

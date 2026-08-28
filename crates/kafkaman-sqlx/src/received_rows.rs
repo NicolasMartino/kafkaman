@@ -9,6 +9,7 @@
 use kafkaman_core::{MarkOutcome, ReceiveStatus, ReceivedError, ReceivedRow};
 use sqlx::PgConnection;
 use time::OffsetDateTime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::dispatch_failure::FailureDisposition;
@@ -20,6 +21,7 @@ use crate::{ReceivedTable, Result};
 ///
 /// `FOR UPDATE SKIP LOCKED` is what lets several dispatchers share one table:
 /// a row another worker holds is passed over rather than waited on.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn claim_received_row(
     conn: &mut PgConnection,
     table: &ReceivedTable,
@@ -41,10 +43,19 @@ pub(crate) async fn claim_received_row(
         pending = ReceiveStatus::Pending.sql_literal(),
         retryable = ReceiveStatus::Retryable.sql_literal(),
     );
-    let row = sqlx::query(&sql).bind(due_at).fetch_optional(conn).await?;
+    let row = sqlx::query(&sql)
+        .bind(due_at)
+        .fetch_optional(conn)
+        .instrument(kafkaman_core::db_poll_span!(
+            "SELECT",
+            table.qualified_name(),
+            "claim received row",
+        ))
+        .await?;
     row.map(received_row_from_pg).transpose()
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn mark_received_processed(
     conn: &mut PgConnection,
     table: &ReceivedTable,
@@ -62,6 +73,11 @@ pub(crate) async fn mark_received_processed(
         .bind(message_id)
         .bind(processed_at)
         .execute(&mut *conn)
+        .instrument(kafkaman_core::db_span!(
+            "UPDATE",
+            table.qualified_name(),
+            "mark received processed",
+        ))
         .await?;
 
     if result.rows_affected() == 1 {
@@ -104,6 +120,7 @@ impl ReceivedFailureRecord {
 }
 
 /// Append a failure to a row's audit trail and schedule or exhaust its retry.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn record_received_failure(
     conn: &mut PgConnection,
     table: &ReceivedTable,
@@ -130,6 +147,11 @@ pub(crate) async fn record_received_failure(
         .bind(failure.occurred_at)
         .bind(failure.disposition.kind.discriminant())
         .execute(&mut *conn)
+        .instrument(kafkaman_core::db_span!(
+            "UPDATE",
+            table.qualified_name(),
+            "record received failure",
+        ))
         .await?;
 
     if result.rows_affected() == 1 {
@@ -144,6 +166,7 @@ pub(crate) async fn record_received_failure(
 /// The distinction matters to the caller. A stale claim means another worker
 /// owns the row and will finish it; a missing row means the work is not coming
 /// back and nothing else will report that.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn mark_miss_outcome(
     conn: &mut PgConnection,
     table: &ReceivedTable,
@@ -156,6 +179,11 @@ async fn mark_miss_outcome(
     let exists = sqlx::query(&sql)
         .bind(message_id)
         .fetch_optional(conn)
+        .instrument(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "classify received mark miss",
+        ))
         .await?
         .is_some();
 

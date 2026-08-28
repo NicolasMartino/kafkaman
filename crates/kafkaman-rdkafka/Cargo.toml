@@ -19,6 +19,12 @@ traces = ["kafkaman-core/traces", "kafkaman-sqlx/traces", "kafkaman-worker/trace
 
 [dependencies]
 async-trait.workspace = true
+# `default-features = false` is defensive rather than load-bearing:
+# `kafkaman-config` declares no features today, and the guard that keeps
+# `opentelemetry` out of a facade opt-out build is its own
+# `kafkaman-core = { default-features = false }` pin. `just opt-out` is what
+# proves that, not this line.
+kafkaman-config = { path = "../kafkaman-config", default-features = false }
 kafkaman-core = { path = "../kafkaman-core", default-features = false }
 kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
 kafkaman-worker = { path = "../kafkaman-worker", default-features = false }

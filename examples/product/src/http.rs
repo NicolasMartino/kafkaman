@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use example_contracts::ProductStatus;
 use kafkaman::sqlx::enqueue;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use utoipa::OpenApi;
@@ -50,6 +51,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/products/{product_id}", get(read_product))
         .route("/products/{product_id}/discontinue", post(discontinue))
         .with_state(state)
+        .layer(kafkaman::axum::CorrelationLayer::new())
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -164,7 +166,16 @@ async fn create_product(
         version: 1,
     };
 
-    let mut tx = state.pool.begin().await.map_err(internal("begin"))?;
+    let mut tx = state
+        .pool
+        .begin()
+        .instrument(kafkaman::db_span!(
+            "BEGIN",
+            "products",
+            "open product write transaction",
+        ))
+        .await
+        .map_err(internal("begin"))?;
     sqlx::query(
         "INSERT INTO products (product_id, name, price_cents, status, on_hand, available, version)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -177,6 +188,7 @@ async fn create_product(
     .bind(product.available)
     .bind(product.version)
     .execute(&mut *tx)
+    .instrument(kafkaman::db_span!("INSERT", "products", "insert product"))
     .await
     .map_err(|err| {
         if is_unique_violation(&err) {
@@ -192,7 +204,14 @@ async fn create_product(
         .await
         .map_err(|err| ProductError::Internal(format!("enqueue snapshot: {err}")))?;
 
-    tx.commit().await.map_err(internal("commit"))?;
+    tx.commit()
+        .instrument(kafkaman::db_span!(
+            "COMMIT",
+            "products",
+            "commit product write transaction",
+        ))
+        .await
+        .map_err(internal("commit"))?;
     Ok((StatusCode::CREATED, Json(product)))
 }
 
@@ -208,6 +227,7 @@ async fn list_products(
         "SELECT {PRODUCT_COLUMNS} FROM products ORDER BY created_at, product_id"
     ))
     .fetch_all(&state.pool)
+    .instrument(kafkaman::db_span!("SELECT", "products", "list products"))
     .await
     .map_err(internal("list products"))?;
 
@@ -237,6 +257,7 @@ async fn read_product(
     ))
     .bind(product_id)
     .fetch_optional(&state.pool)
+    .instrument(kafkaman::db_span!("SELECT", "products", "read product"))
     .await
     .map_err(internal("read product"))?
     .ok_or(ProductError::NotFound)?;
@@ -262,13 +283,23 @@ async fn discontinue(
     State(state): State<AppState>,
     Path(product_id): Path<Uuid>,
 ) -> Result<Json<ProductRecord>, ProductError> {
-    let mut tx = state.pool.begin().await.map_err(internal("begin"))?;
+    let mut tx = state
+        .pool
+        .begin()
+        .instrument(kafkaman::db_span!(
+            "BEGIN",
+            "products",
+            "open product write transaction",
+        ))
+        .await
+        .map_err(internal("begin"))?;
 
     let row = sqlx::query(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products WHERE product_id = $1 FOR UPDATE"
     ))
     .bind(product_id)
     .fetch_optional(&mut *tx)
+    .instrument(kafkaman::db_span!("SELECT", "products", "lock product"))
     .await
     .map_err(internal("read product"))?
     .ok_or(ProductError::NotFound)?;
@@ -277,7 +308,14 @@ async fn discontinue(
     // A repeated request is a no-op, not a conflict, and must not enqueue a
     // second snapshot of state nothing changed.
     if current.status == ProductStatus::Discontinued {
-        tx.commit().await.map_err(internal("commit"))?;
+        tx.commit()
+            .instrument(kafkaman::db_span!(
+                "COMMIT",
+                "products",
+                "commit product no-op transaction",
+            ))
+            .await
+            .map_err(internal("commit"))?;
         return Ok(Json(current));
     }
 
@@ -290,6 +328,11 @@ async fn discontinue(
     .bind(String::from(ProductStatus::Discontinued))
     .bind(product_id)
     .fetch_one(&mut *tx)
+    .instrument(kafkaman::db_span!(
+        "UPDATE",
+        "products",
+        "discontinue product"
+    ))
     .await
     .map_err(internal("update product"))?;
     let updated = product_from_row(&row).map_err(internal("decode product"))?;
@@ -300,6 +343,13 @@ async fn discontinue(
         .await
         .map_err(|err| ProductError::Internal(format!("enqueue snapshot: {err}")))?;
 
-    tx.commit().await.map_err(internal("commit"))?;
+    tx.commit()
+        .instrument(kafkaman::db_span!(
+            "COMMIT",
+            "products",
+            "commit product write transaction",
+        ))
+        .await
+        .map_err(internal("commit"))?;
     Ok(Json(updated))
 }

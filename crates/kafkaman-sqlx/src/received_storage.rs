@@ -2,6 +2,7 @@ use kafkaman_core::{Envelope, KafkaMessage, ReceiveStatus, ReceivedIngestFailure
 use serde::Serialize;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::schema_sql::received_ingest_failures_table_name;
@@ -22,11 +23,23 @@ where
     P: KafkaMessage + Serialize,
 {
     Ok(matches!(
-        insert_received_with_outcome(tx, cfg, evt, source_partition, source_offset, key).await?,
+        insert_received_with_outcome(
+            tx,
+            cfg,
+            evt,
+            source_partition,
+            source_offset,
+            key,
+            // Ambient capture is right here: this helper has no phase span of its
+            // own, and its callers are test harnesses driving a receive by hand.
+            kafkaman_core::capture_trace_context(),
+        )
+        .await?,
         ReceivedInsertOutcome::Inserted
     ))
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn insert_received_with_outcome<P>(
     tx: &mut Transaction<'_, Postgres>,
     cfg: &ResolvedConfig,
@@ -34,6 +47,7 @@ pub async fn insert_received_with_outcome<P>(
     source_partition: i32,
     source_offset: i64,
     key: Option<&[u8]>,
+    trace: Option<kafkaman_core::TraceContext>,
 ) -> Result<ReceivedInsertOutcome>
 where
     P: KafkaMessage + Serialize,
@@ -59,7 +73,6 @@ where
     // headers, so a header-sourced entity key does not survive a broker round
     // trip.
     let entity_key = evt.payload.entity_key();
-    let trace = kafkaman_core::capture_trace_context();
 
     let sql = format!(
         "INSERT INTO {name} (
@@ -100,6 +113,11 @@ where
         )
         .bind(evt.occurred_at)
         .execute(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "INSERT",
+            table.qualified_name(),
+            "insert received row",
+        ))
         .await?;
 
     if result.rows_affected() == 1 {
@@ -109,6 +127,7 @@ where
     received_insert_conflict_outcome(tx, &table, evt.message_id, &idempotency_key_hex).await
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn received_insert_conflict_outcome(
     tx: &mut Transaction<'_, Postgres>,
     table: &ReceivedTable,
@@ -125,6 +144,11 @@ async fn received_insert_conflict_outcome(
         .bind(message_id)
         .bind(idempotency_key)
         .fetch_all(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "classify received insert conflict",
+        ))
         .await?;
 
     let mut saw_message_id = false;
@@ -144,6 +168,7 @@ async fn received_insert_conflict_outcome(
     }
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn insert_received_ingest_failure(
     tx: &mut Transaction<'_, Postgres>,
     cfg: &ResolvedConfig,
@@ -169,11 +194,17 @@ pub async fn insert_received_ingest_failure(
         .bind(failure.kind.discriminant())
         .bind(failure.error.as_str())
         .execute(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "INSERT",
+            table.as_str(),
+            "insert received ingest failure",
+        ))
         .await?;
 
     Ok(result.rows_affected() == 1)
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn received_ingest_failure_by_source(
     pool: &PgPool,
     cfg: &ResolvedConfig,
@@ -194,6 +225,11 @@ pub async fn received_ingest_failure_by_source(
         .bind(source_partition)
         .bind(source_offset)
         .fetch_optional(pool)
+        .instrument(kafkaman_core::db_span!(
+            "SELECT",
+            table.as_str(),
+            "read received ingest failure",
+        ))
         .await?;
 
     row.map(received_ingest_failure_row_from_pg).transpose()

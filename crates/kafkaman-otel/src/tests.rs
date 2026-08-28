@@ -1,6 +1,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::Layer as _;
 
 use super::{
     builder, endpoint_configured, env_is_nonempty, METRIC_EXPORT_INTERVAL, OTLP_ENDPOINT,
@@ -193,14 +194,81 @@ fn layers_compose_into_a_host_owned_registry() {
 
     let telemetry = builder("test-service").build().expect("build must succeed");
 
+    let filter = || tracing_subscriber::EnvFilter::new("info");
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info"))
-        .with(tracing_subscriber::fmt::layer())
-        .with(telemetry.trace_layer())
-        .with(telemetry.log_layer());
+        .with(tracing_subscriber::fmt::layer().with_filter(filter()))
+        .with(
+            telemetry
+                .trace_layer()
+                .map(|layer| layer.with_filter(filter())),
+        )
+        .with(
+            telemetry
+                .log_layer()
+                .map(|layer| layer.with_filter(filter())),
+        );
 
     let _guard = tracing::subscriber::set_default(subscriber);
     tracing::info!("composed into a host-owned registry");
 
     telemetry.shutdown().expect("shutdown must succeed");
+}
+
+/// A registry-wide filter bounds the layers added after it, too.
+///
+/// This pins a fact about `tracing-subscriber`, not about this crate, and it is
+/// here because getting it wrong once cost a wrong explanation in a
+/// compatibility document. [`init`](super::init) gives each layer its own
+/// `EnvFilter` so a host can bound exported telemetry differently from stdout —
+/// **not** because the older registry-wide filter leaked debug spans into the
+/// OpenTelemetry layers. It did not, and this is how that stays known.
+///
+/// What actually keeps scheduler polling out of the default export is that those
+/// spans are `debug`, asserted end to end over real OTLP bytes by
+/// `tests/example-telemetry`.
+#[test]
+fn a_registry_wide_filter_also_bounds_the_layers_added_after_it() {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::Layer;
+
+    #[derive(Clone, Default)]
+    struct Opened(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Opened {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .expect("no test panics while holding this")
+                .push(attrs.metadata().name().to_owned());
+        }
+    }
+
+    let opened = Opened::default();
+    // The shape `init` used before each layer carried its own filter: one
+    // `EnvFilter` on the registry, then unfiltered layers after it.
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(opened.clone());
+
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _info = tracing::info_span!("an_info_span").entered();
+        let _debug = tracing::debug_span!("a_debug_span").entered();
+    }
+
+    let seen = opened.0.lock().expect("no test panics while holding this");
+    assert_eq!(
+        *seen,
+        vec!["an_info_span".to_owned()],
+        "an unfiltered layer added after a registry-wide `info` filter must still \
+         not see a debug span"
+    );
 }

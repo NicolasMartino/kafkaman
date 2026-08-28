@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use kafkaman_config::KafkaTraceHandoff;
 use kafkaman_core::{Envelope, KafkaMessage, ReceivedIngestFailureKind};
 use kafkaman_sqlx::{
     insert_received_ingest_failure, insert_received_with_outcome, ReceivedInsertOutcome,
@@ -133,10 +134,23 @@ impl RdkafkaConsumer {
         // one with no span to find. The header scan is done once and handed to
         // both the span and the decode.
         let headers = RecordHeaders::of(&message);
-        let span = ingest_span::<P>(&at, headers.trace_context().as_ref());
-        self.ingest_decoded::<P>(pool, cfg, &message, at, &headers)
-            .instrument(span)
-            .await
+        let trace_handoff = cfg
+            .observability
+            .policy_for(P::MESSAGE_TYPE)
+            .kafka_trace_handoff;
+        let span = ingest_span::<P>(&at, headers.trace_context().as_ref(), trace_handoff);
+        // Captured from the ingest span by name. What lands in the received row's
+        // `traceparent` is the phase, not whichever inner function happened to be
+        // on the stack when the insert ran.
+        let trace = kafkaman_core::capture_trace_context_of(&span);
+        let result = self
+            .ingest_decoded::<P>(pool, cfg, &message, at, &headers, trace)
+            .instrument(span.clone())
+            .await;
+        if let Err(err) = &result {
+            kafkaman_core::record_error(&span, err);
+        }
+        result
     }
 
     /// Decode one record and route it to storage or quarantine.
@@ -144,6 +158,7 @@ impl RdkafkaConsumer {
     /// Split from [`Self::ingest_once`] only so the whole of it — decode
     /// included — runs inside one `.instrument`, rather than each arm opening a
     /// span of its own after the decision has already been made.
+    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
     async fn ingest_decoded<P>(
         &self,
         pool: &PgPool,
@@ -151,13 +166,14 @@ impl RdkafkaConsumer {
         message: &BorrowedMessage<'_>,
         at: RecordLocation,
         headers: &RecordHeaders,
+        trace: Option<kafkaman_core::TraceContext>,
     ) -> Result<IngestStats>
     where
         P: KafkaMessage + DeserializeOwned + Serialize,
     {
         match record_envelope::<P, _>(message, headers) {
             Ok(record) => {
-                self.store::<P>(pool, cfg, message, at, &record.envelope, record.key)
+                self.store::<P>(pool, cfg, message, at, &record.envelope, record.key, trace)
                     .await
             }
             Err(err) => match err.ingest_failure_kind() {
@@ -174,6 +190,10 @@ impl RdkafkaConsumer {
     }
 
     /// Write the receive row, then acknowledge the record.
+    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    // One more than clippy's threshold, and the same trade `dispatch_claimed_row`
+    // makes: the alternative is a struct that exists only to carry them.
+    #[allow(clippy::too_many_arguments)]
     async fn store<P>(
         &self,
         pool: &PgPool,
@@ -182,6 +202,7 @@ impl RdkafkaConsumer {
         at: RecordLocation,
         envelope: &Envelope<P>,
         key: Option<Vec<u8>>,
+        trace: Option<kafkaman_core::TraceContext>,
     ) -> Result<IngestStats>
     where
         P: KafkaMessage + Serialize,
@@ -194,6 +215,7 @@ impl RdkafkaConsumer {
             at.partition,
             at.offset,
             key.as_deref(),
+            trace,
         )
         .await?;
 
@@ -251,6 +273,7 @@ impl RdkafkaConsumer {
     /// on the following line cannot roll it back — the record's diagnosis
     /// survives even when the loop stops. Redelivery after a trip re-runs this,
     /// which the `(topic, partition, offset)` primary key absorbs.
+    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
     async fn quarantine<P>(
         &self,
         pool: &PgPool,
@@ -371,11 +394,13 @@ impl RdkafkaConsumer {
 
 /// The span one consumed record is processed in.
 ///
-/// It **links** to the producer rather than descending from it. A consumer polls
-/// a batch that may hold records from many unrelated traces, so parenting would
-/// attach whatever else was in the batch to whichever trace happened to be
-/// first; messaging semantic conventions prescribe a link for exactly this
-/// shape. Without a producer context it is simply a root span, which is what an
+/// By default it **links** to the producer rather than descending from it. A
+/// consumer can poll a batch that holds records from many unrelated traces, so
+/// parenting would attach unrelated work to whichever trace happened to be
+/// first; messaging semantic conventions prescribe a link for that shape.
+/// `KafkaTraceHandoff::Parented` is the explicit single-record opt-in for
+/// backends that should display one distributed waterfall across the broker hop.
+/// Without a producer context it is simply a root span, which is what an
 /// uninstrumented producer should yield.
 ///
 /// The receive row written inside this span stores *this* span's context, not
@@ -384,9 +409,13 @@ impl RdkafkaConsumer {
 fn ingest_span<P: KafkaMessage>(
     at: &RecordLocation,
     producer_trace: Option<&kafkaman_core::TraceContext>,
+    trace_handoff: KafkaTraceHandoff,
 ) -> tracing::Span {
     let span = tracing::info_span!(
         "kafkaman.ingest",
+        "otel.kind" = "consumer",
+        "otel.status_code" = tracing::field::Empty,
+        "otel.status_description" = tracing::field::Empty,
         message_type = P::MESSAGE_TYPE,
         messaging.system = "kafka",
         messaging.destination.name = P::TOPIC,
@@ -395,7 +424,10 @@ fn ingest_span<P: KafkaMessage>(
         messaging.kafka.offset = at.offset,
     );
     if let Some(trace) = producer_trace {
-        kafkaman_core::add_link(&span, trace);
+        match trace_handoff {
+            KafkaTraceHandoff::Linked => kafkaman_core::add_link(&span, trace),
+            KafkaTraceHandoff::Parented => kafkaman_core::set_parent(&span, trace),
+        }
     }
     span
 }

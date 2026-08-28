@@ -16,6 +16,7 @@ use crate::{Publisher, Result};
 /// hold a transaction open across network calls. Publishing is sequential
 /// because claim order is publish order, and per-entity ordering is what the
 /// convergence guard downstream depends on.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn relay_once<P: Publisher>(
     pool: &PgPool,
     publisher: &P,
@@ -47,7 +48,18 @@ async fn relay_once_inner<P: Publisher>(
 ) -> Result<RelayStats> {
     cfg.validate()?;
 
-    let mut tx = pool.begin().await.map_err(kafkaman_sqlx::Error::from)?;
+    // Debug rather than info, beside `claim_batch`'s own span: this transaction
+    // opens and closes on every cycle whether or not a row is due, so at the
+    // default filter it would be most of what an idle service exports.
+    let mut tx = pool
+        .begin()
+        .instrument(kafkaman_core::db_poll_span!(
+            "BEGIN",
+            table.qualified_name(),
+            "open outbox claim transaction"
+        ))
+        .await
+        .map_err(kafkaman_sqlx::Error::from)?;
     let claimed = claim_batch(
         &mut tx,
         table,
@@ -56,7 +68,14 @@ async fn relay_once_inner<P: Publisher>(
         cfg.batch_limit,
     )
     .await?;
-    tx.commit().await.map_err(kafkaman_sqlx::Error::from)?;
+    tx.commit()
+        .instrument(kafkaman_core::db_poll_span!(
+            "COMMIT",
+            table.qualified_name(),
+            "commit outbox claim transaction"
+        ))
+        .await
+        .map_err(kafkaman_sqlx::Error::from)?;
 
     let mut stats = RelayStats {
         claimed: claimed.len(),
@@ -71,6 +90,9 @@ async fn relay_once_inner<P: Publisher>(
         // uninstrumented enqueue should produce.
         let span = tracing::info_span!(
             "kafkaman.relay.publish",
+            "otel.kind" = "producer",
+            "otel.status_code" = tracing::field::Empty,
+            "otel.status_description" = tracing::field::Empty,
             message_type = table.descriptor.message_type.as_str(),
             messaging.system = "kafka",
             messaging.destination.name = row.row.topic.as_str(),
@@ -102,22 +124,37 @@ async fn relay_once_inner<P: Publisher>(
         // another worker owns the row now. Counted, not failed.
         let outcome = match published {
             Ok(_) => {
-                let outcome = mark_published(pool, table, row.message_id(), row.claim_id).await?;
+                let marked = mark_published(pool, table, row.message_id(), row.claim_id)
+                    .instrument(span.clone())
+                    .await;
+                if let Err(err) = &marked {
+                    kafkaman_core::record_error(&span, err);
+                }
+                let outcome = marked?;
                 if outcome == MarkOutcome::Updated {
                     stats.published += 1;
                 }
                 outcome
             }
             Err(err) => {
-                let outcome = mark_publish_failed(
+                // Rendered once: it is both the span's status description and
+                // the `last_error` column the retry writes.
+                let description = err.to_string();
+                kafkaman_core::record_error(&span, &description);
+                let marked = mark_publish_failed(
                     pool,
                     table,
                     row.message_id(),
                     row.claim_id,
-                    &err.to_string(),
+                    &description,
                     cfg.retry_after,
                 )
-                .await?;
+                .instrument(span.clone())
+                .await;
+                if let Err(err) = &marked {
+                    kafkaman_core::record_error(&span, err);
+                }
+                let outcome = marked?;
                 if outcome == MarkOutcome::Updated {
                     stats.failed += 1;
                 }

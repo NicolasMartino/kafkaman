@@ -1,0 +1,40 @@
+[package]
+name = "example-telemetry-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# The container scaffolding and the real provisioner, not a reimplementation of
+# either. `Cluster` starts Postgres and Redpanda and calls `example_provision`
+# as a library, so a change to what provisioning means reaches this gate rather
+# than passing it by. Depended on sideways, the way `observability-tests`
+# depends on `durable-send-tests`.
+distributed-cache-tests = { path = "../distributed-cache" }
+# The capture server, shared with `tests/observability/otlp_wire` rather than
+# written a second time.
+otlp-capture = { path = "../otlp-capture" }
+# For decoding what was captured. Same features as the observability suite: the
+# prost message half, without the tonic transport a decoder does not need.
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "logs",
+    "metrics",
+    "trace",
+] }
+prost = "0.14"
+# A safe `kill`, which is the whole reason this is here rather than `libc`.
+# `unsafe_code` is forbidden workspace-wide, and sending SIGINT is the one step
+# this gate cannot do without: `Child::kill` sends SIGKILL, and a forced kill
+# proves nothing about provider flushing. rustix is already in the dependency
+# graph, so this adds a feature rather than a compilation.
+rustix = { version = "1", features = ["process"] }
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

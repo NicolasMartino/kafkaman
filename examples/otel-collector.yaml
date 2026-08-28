@@ -1,4 +1,5 @@
-# OpenTelemetry Collector for the example's `observability` profile.
+# Elastic Agent in OpenTelemetry collector mode for the example's
+# `observability` profile.
 #
 # Why this exists at all, since the stack was designed without it:
 # Elasticsearch's native OTLP endpoint (`/_otlp`) is metrics-only. Verified
@@ -12,10 +13,15 @@
 # So `kafkaman.dispatch.duration`, `kafkaman.relay.publish.duration` and
 # `kafkaman.outbox.time_to_publish` were absent too.
 #
-# The collector's `elasticsearch` exporter speaks all three signals and owns the
-# data-stream mapping, which is what makes the example demonstrate the whole
-# pipeline rather than a third of it. See
-# wiki/decisions/telemetry-backend-and-example-topology.decision.md, amended.
+# The Elasticsearch exporter speaks all three signals and owns the data-stream
+# mapping, which is what makes the example demonstrate the whole pipeline rather
+# than a third of it. The `elasticapm` processor and connector are Elastic
+# distribution components, which is why compose runs Elastic Agent in OTel mode
+# rather than the upstream contrib collector. Raw OTel documents still go to the
+# `*-generic.otel-*` streams for the saved dashboard; APM enrichment is added
+# beside that path so Kibana's Applications/APM views can render service traces.
+# See wiki/decisions/telemetry-backend-and-example-topology.decision.md,
+# amended.
 
 receivers:
   otlp:
@@ -41,6 +47,38 @@ processors:
     limit_percentage: 80
     spike_limit_percentage: 20
 
+  # Bounded local resource attributes make Kibana's environment selectors useful
+  # without pushing application-specific identity into library code.
+  #
+  # `deployment.environment.name` is the OpenTelemetry semantic convention.
+  # `service.environment` is not — it is Elastic's own field, set here because
+  # some Kibana views still read it. Both are constants, so neither adds
+  # cardinality, and both stay in the gateway where backend-specific vocabulary
+  # belongs.
+  resource/local:
+    attributes:
+      - key: deployment.environment.name
+        value: local
+        action: upsert
+      - key: service.environment
+        value: local
+        action: upsert
+
+  # Kibana APM reads `service.name` from the resource, which is the correct
+  # OpenTelemetry model, but the trace waterfall does not always put that value
+  # next to each individual span row. Duplicate the bounded service name onto the
+  # span attributes for this example stack so a span's detail panel and Discover
+  # columns can identify the producing service without changing span names.
+  transform/span_service_name:
+    # `ignore` rather than `propagate`: a span this statement cannot handle should
+    # cost that span its duplicated attribute, not cost the whole batch its
+    # export. A usability transform must never be able to drop telemetry.
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(span.attributes["service.name"], resource.attributes["service.name"]) where resource.attributes["service.name"] != nil
+
   # Elasticsearch stores delta-temporality metrics; the OpenTelemetry SDK emits
   # cumulative, which is the OTLP default and the right one for a Prometheus-style
   # backend. Without this the exporter logs
@@ -53,7 +91,21 @@ processors:
   # property of the backend, not of the instrumentation, and the crate stays
   # usable against a cumulative backend unchanged. This is exactly the adaptation
   # a collector exists to perform.
-  cumulative_to_delta: {}
+  cumulativetodelta: {}
+
+  # Compose polls each service's `/health` every two seconds, so health probes
+  # are by a wide margin the highest-volume span in the stack and say nothing
+  # about the demo. Dropped here rather than in `kafkaman-axum`, because which
+  # routes are worth tracing is a deployment decision, not a library one — and
+  # dropped by route template, which is bounded, rather than by raw path.
+  #
+  # This bounds what Elasticsearch stores. It does not bound what the services
+  # export; for that, see `OTEL_TRACES_SAMPLER` in examples/README.md.
+  filter/health:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
 
   # The services already batch on their side; this bounds what one Elasticsearch
   # bulk request carries when several loops flush at once.
@@ -61,8 +113,18 @@ processors:
     timeout: 5s
     send_batch_size: 512
 
+  # Converts portable OpenTelemetry traces into the derived service/transaction
+  # data Kibana's APM views expect. This processor is intentionally in the
+  # example gateway, not in kafkaman crates, so library users keep choosing their
+  # own backend and exporter.
+  elasticapm: {}
+
+connectors:
+  # The connector derives aggregated APM metrics from the enriched trace stream.
+  elasticapm: {}
+
 exporters:
-  elasticsearch:
+  elasticsearch/otel:
     endpoints: ["http://elasticsearch:9200"]
     # `otel` mapping keeps OTLP's own shape — resource, scope and attributes stay
     # separate — which is what lets Kibana correlate a span with the log records
@@ -75,11 +137,12 @@ exporters:
       max_retries: 5
 
 extensions:
-  # Exposed for humans and for `just examples observe` to probe from outside.
-  # It cannot serve a compose healthcheck: the collector image is distroless —
-  # no shell, no curl, no wget — so there is nothing inside the container that
-  # could run one. The services therefore gate on `service_started` and rely on
-  # the listener binding well before they finish migrating and verifying topics.
+  # Exposed for humans and for `just examples observe` and `just examples all`
+  # to probe from outside. Compose gates the services on `service_started` for
+  # this container and relies on the listener binding well before they finish
+  # migrating and verifying topics; the recipes then probe this endpoint from the
+  # host, because a collector that started and a collector that loaded its
+  # pipelines are different things.
   health_check:
     endpoint: 0.0.0.0:13133
 
@@ -88,13 +151,22 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
-      exporters: [elasticsearch]
+      processors: [memory_limiter, filter/health, resource/local, transform/span_service_name, batch, elasticapm]
+      exporters: [elasticsearch/otel, elasticapm]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, cumulative_to_delta, batch]
-      exporters: [elasticsearch]
+      processors: [memory_limiter, resource/local, cumulativetodelta, batch]
+      exporters: [elasticsearch/otel]
+    metrics/aggregated-otel-metrics:
+      receivers: [elasticapm]
+      processors: [memory_limiter, batch]
+      exporters: [elasticsearch/otel]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
-      exporters: [elasticsearch]
+      processors: [memory_limiter, resource/local, batch]
+      # `elasticapm` beside the store, matching the layout in the image's own
+      # `otel_samples/gateway.yml`: the connector correlates log records with the
+      # traces they were emitted inside, which is the pivot this example exists
+      # to demonstrate. The raw records still go to `*-generic.otel-*` for the
+      # saved dashboard.
+      exporters: [elasticsearch/otel, elasticapm]

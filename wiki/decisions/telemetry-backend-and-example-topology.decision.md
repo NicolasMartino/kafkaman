@@ -270,3 +270,35 @@ have its own sampler — which `tests/distributed-cache` creates by starting bot
 example services in one binary. That case logs a warning and parks until
 shutdown rather than failing: reducing telemetry coverage must not become an
 outage.
+
+### 2026-08-29 — the collector became Elastic Agent in OpenTelemetry mode
+
+The APM waterfall work needed Kibana's Applications views, not only Discover and
+a saved dashboard. Elastic documents the `elasticapm` processor and connector as
+what derives the service, transaction, and span-destination fields those views
+read, and neither component ships in `otel/opentelemetry-collector-contrib`.
+
+**What changes.** The `observability` profile's collector image becomes
+`docker.elastic.co/elastic-agent/elastic-agent`, run with
+`ELASTIC_AGENT_OTEL=true` against the same `examples/otel-collector.yaml`. The
+config gains `elasticapm` as both processor and connector, an aggregated-metrics
+pipeline fed by the connector, a bounded `deployment.environment.name` resource
+attribute, and a span-level copy of the resource `service.name` for Discover
+rows. The temporality processor is spelled `cumulativetodelta` in this
+distribution; the earlier `cumulative_to_delta` in this document describes the
+contrib collector it replaced. `ELASTIC_VERSION` now moves the collector image
+with Elasticsearch and Kibana, so the gateway can never run a different
+generation from the store it writes to.
+
+Two costs, both accepted and both recorded in `examples/compose.yaml`: the image
+is an order of magnitude larger than the contrib collector's, and the pipeline is
+now backend-specific in a way the contrib one was not. `just examples demo` still
+pays for neither, and decision 2 still holds — the enrichment lives in the
+reference deployment's gateway, not in any crate under `crates/`.
+
+**What is also new, and is not about Elastic.** The traces pipeline drops spans
+whose `http.route` is `/health`. Compose polls each service's health endpoint
+every two seconds, so those spans would be the highest-volume thing in the stack
+and say nothing about the demo. Dropping them is a deployment decision, which is
+why it is here and not in `kafkaman-axum`, and it is done by route template
+rather than raw path so the filter itself stays bounded.

@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{MatchedPath, Path, State};
 use axum::http::header::HeaderName;
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -47,6 +47,11 @@ use uuid::Uuid;
 
 /// Request/response header carrying the correlation id across a service hop.
 pub const CORRELATION_ID_HEADER: &str = "x-correlation-id";
+
+/// The `http.route` reported for a request that matched no route.
+///
+/// Bounded on purpose: see the comment in [`CorrelationService::call`].
+const UNMATCHED_ROUTE: &str = "<unmatched>";
 
 /// Longest client-supplied correlation id accepted before one is generated
 /// instead.
@@ -143,10 +148,42 @@ where
             .extensions_mut()
             .insert(CorrelationId::new(correlation_id.clone()));
 
-        let span = tracing::info_span!("http.request", correlation_id = %correlation_id);
+        // `http.route` and the exported span name are what a backend groups
+        // transactions by, so both stay bounded. A request that matched no route
+        // has no template to report, and reporting its raw path instead would
+        // mint one transaction group per URL a scanner invents.
+        let route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or(UNMATCHED_ROUTE, MatchedPath::as_str);
+        // The raw path is still worth having; it just belongs in a field nothing
+        // groups by. Borrowed from `request` rather than cloned: the span macro
+        // copies every value in as it builds the span, which is before the call
+        // below moves the request.
+        let otel_name = format!("{} {route}", request.method());
+        let span = tracing::info_span!(
+            "http.request",
+            "otel.name" = otel_name.as_str(),
+            "otel.kind" = "server",
+            "otel.status_code" = tracing::field::Empty,
+            "otel.status_description" = tracing::field::Empty,
+            "http.request.method" = %request.method(),
+            "http.route" = route,
+            "url.path" = request.uri().path(),
+            "http.response.status_code" = tracing::field::Empty,
+            correlation_id = %correlation_id,
+        );
         let future = self.inner.call(request);
         Box::pin(async move {
-            let mut response = future.instrument(span).await?;
+            let mut response = future.instrument(span.clone()).await?;
+            let status = response.status();
+            span.record("http.response.status_code", i64::from(status.as_u16()));
+            // 5xx only. A 4xx is the server correctly refusing a bad request, and
+            // marking those failed makes an APM error rate track client mistakes
+            // rather than service health.
+            if status.is_server_error() {
+                kafkaman_core::record_error(&span, &format_args!("HTTP {}", status.as_u16()));
+            }
             if let Ok(value) = HeaderValue::from_str(&correlation_id) {
                 response
                     .headers_mut()
@@ -236,6 +273,7 @@ pub fn redrive_router(state: AdminState) -> Router {
 
 /// Liveness: the process is up and serving. Touches no dependency on purpose,
 /// so a database blip cannot cause an orchestrator to kill a healthy process.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
@@ -244,6 +282,7 @@ async fn health() -> Json<serde_json::Value> {
 ///
 /// Deliberately narrower than "kafkaman is healthy" — it does not verify that
 /// tables exist, that migrations are current, or that workers are running.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn ready(State(state): State<AdminState>) -> Response {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
@@ -271,6 +310,7 @@ async fn ready(State(state): State<AdminState>) -> Response {
 ///
 /// `now` is sampled once for the whole request so every table's age is measured
 /// against the same clock.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn outbox_summary(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<OutboxStatusSummary>>, AdminError> {
@@ -290,6 +330,7 @@ async fn outbox_summary(
 
 /// Received-table depth per message type and status. Same cost and ordering
 /// rationale as [`outbox_summary`].
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn received_summary(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<ReceivedStatusSummary>>, AdminError> {
@@ -322,6 +363,7 @@ pub struct StuckResponse {
 
 /// Expired outbox claims and overdue received rows, using each message type's
 /// configured `stuck_after` threshold.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn stuck_rows(State(state): State<AdminState>) -> Result<Json<StuckResponse>, AdminError> {
     const LIMIT_PER_TYPE: i64 = 100;
 
@@ -414,6 +456,7 @@ pub struct DlqRowSummary {
 ///
 /// Two queries per message type — an exact count plus a bounded page — because
 /// the count must stay honest when the listing is truncated.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn dlq_summary(State(state): State<AdminState>) -> Result<Json<Vec<DlqSummary>>, AdminError> {
     const ROW_LIMIT_PER_TYPE: i64 = 50;
 
@@ -527,6 +570,7 @@ pub struct RedriveResponse {
 /// Destructive and unauthenticated — see [`redrive_router`]. Bounded by
 /// [`MAX_REDRIVE_ROWS`]; targets terminal rows only; preserves failure history
 /// unless `clear_history` is set.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn redrive_dlq(
     State(state): State<AdminState>,
     Path(message_type): Path<String>,
@@ -704,6 +748,7 @@ impl RuntimeServer {
     /// runtime mid-cycle and cut in-flight publishes, which is exactly the
     /// failure an outbox exists to prevent. Use
     /// [`RuntimeServer::with_runtime_drain_timeout`] to change the bound.
+    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
     pub async fn with_runtime(
         self,
         tasks: Vec<RuntimeTask>,
@@ -926,6 +971,184 @@ mod tests {
             .await
             .expect("test bodies are small and finite");
         String::from_utf8(bytes.to_vec()).expect("test bodies are utf-8")
+    }
+
+    /// Captures the field values of every `http.request` span opened while it is
+    /// installed, so the route assertions below read what a backend would.
+    #[derive(Clone, Default)]
+    struct RecordedRoutes(Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for RecordedRoutes
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "http.request" {
+                return;
+            }
+            #[derive(Default)]
+            struct Fields {
+                route: String,
+                name: String,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    match field.name() {
+                        "http.route" => self.route = value.to_owned(),
+                        "otel.name" => self.name = value.to_owned(),
+                        _ => {}
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            let mut fields = Fields::default();
+            attrs.record(&mut fields);
+            self.0
+                .lock()
+                .expect("no test panics while holding this")
+                .push((fields.route, fields.name));
+        }
+    }
+
+    /// Drives one request through a real router with the layer applied, and
+    /// returns the `(http.route, otel.name)` its span recorded.
+    async fn recorded_route(uri: &str) -> (String, String) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let recorded = RecordedRoutes::default();
+        let app = axum::Router::new()
+            .route(
+                "/products/{product_id}",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(CorrelationLayer::new());
+
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(recorded.clone()),
+            );
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let _ = app.oneshot(request).await.unwrap();
+        }
+
+        let mut seen = recorded
+            .0
+            .lock()
+            .expect("no test panics while holding this")
+            .clone();
+        assert_eq!(seen.len(), 1, "one request should open one span");
+        seen.remove(0)
+    }
+
+    /// Records the name of every span opened while it is installed.
+    #[derive(Clone, Default)]
+    struct RecordedSpans(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for RecordedSpans
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .expect("no test panics while holding this")
+                .push(attrs.metadata().name().to_owned());
+        }
+    }
+
+    /// The `kafkaman::internal` tier is off by default and on by its own target.
+    ///
+    /// [`health`] stands in for all of it: it is the one annotated function in
+    /// this crate that touches nothing, and the attribute is identical on every
+    /// other one. What is being pinned is the directive `examples/README.md`
+    /// documents — including that reaching the tier does **not** require turning
+    /// on `debug` for everything, which would drown it in `sqlx` and `rdkafka`
+    /// output.
+    #[tokio::test]
+    async fn the_internal_span_tier_is_gated_by_its_own_target() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // Per-layer filtering, because that is what `kafkaman_otel::init` does:
+        // it gives each layer its own `EnvFilter` rather than putting one on the
+        // registry. A directive that works globally and not per layer would be a
+        // directive that works in this test and not in a real service.
+        async fn spans_opened_under(directive: &str) -> Vec<String> {
+            use tracing_subscriber::Layer as _;
+
+            let recorded = RecordedSpans::default();
+            {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::registry().with(
+                        recorded
+                            .clone()
+                            .with_filter(tracing_subscriber::EnvFilter::new(directive)),
+                    ),
+                );
+                let _ = health().await;
+            }
+            let names = recorded
+                .0
+                .lock()
+                .expect("no test panics while holding this")
+                .clone();
+            names
+        }
+
+        assert!(
+            !spans_opened_under("info")
+                .await
+                .contains(&"health".to_owned()),
+            "the default filter must not open internal-tier spans"
+        );
+        assert!(
+            spans_opened_under("info,kafkaman::internal=debug")
+                .await
+                .contains(&"health".to_owned()),
+            "the documented directive must open them"
+        );
+    }
+
+    /// A matched request reports the template, not the URL it was reached by.
+    ///
+    /// This also pins that `MatchedPath` is visible to a layer added with
+    /// `Router::layer`, which is the only reason the template is available at
+    /// all — the layer wraps each route, so routing has already happened.
+    #[tokio::test]
+    async fn a_matched_request_reports_its_route_template() {
+        let (route, name) = recorded_route("/products/6f9619ff-8b86-d011-b42d-00cf4fc964ff").await;
+        assert_eq!(route, "/products/{product_id}");
+        assert_eq!(name, "GET /products/{product_id}");
+    }
+
+    /// An unmatched request reports a constant.
+    ///
+    /// `http.route` and the exported span name are what a backend groups
+    /// transactions by. Falling back to the raw path would mint one transaction
+    /// group per URL a scanner invents, which is unbounded cardinality from
+    /// unauthenticated input. The path itself is still recorded, as `url.path`,
+    /// which nothing groups by.
+    #[tokio::test]
+    async fn an_unmatched_request_reports_a_bounded_route() {
+        for uri in ["/nope", "/totally/made/up/12345", "/products"] {
+            let (route, name) = recorded_route(uri).await;
+            assert_eq!(route, UNMATCHED_ROUTE, "{uri} should not become a route");
+            assert_eq!(name, "GET <unmatched>", "{uri} should not become a group");
+        }
     }
 
     #[tokio::test]

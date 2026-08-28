@@ -33,6 +33,12 @@ dlq = "table"
 [retry.messages.order_snapshot]
 max_attempts = 8
 
+[observability.defaults]
+# Demo-oriented trace shape: kafkaman's library default is `linked`, but this
+# example processes one record at a time and opts into a single APM waterfall
+# across the Kafka hop.
+kafka_trace_handoff = "parented"
+
 # Checked at boot, before the pool is opened and before any loop is spawned.
 #
 # Spelled out rather than left to the default, which is the same value: this is

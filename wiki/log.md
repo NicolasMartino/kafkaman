@@ -1,4 +1,566 @@
+## [2026-08-29] implement | method-level timing: handler span, internal tier, and the capture bug it found
+
+Asked whether every Rust method could be added to the waterfall. It cannot, in
+the form a JVM agent gives: Rust has no runtime agent to rewrite anything at
+load, inlining erases most small functions from a release build, and a waterfall
+of tens of thousands of spans is not a waterfall. Recorded that reasoning in
+proposal 20 rather than leaving it to be rediscovered, and built three tiers
+instead.
+
+**Continuous profiling was measured and not adopted.** The reference stack's
+Elastic Agent ships a `profiling` receiver, and it does work here: past three
+obstacles — the alpha `service.profilesSupport` feature gate, `CAP_SYSLOG` for
+kallsyms which needs `user: "0"` and not merely `privileged`, and mounting
+debugfs/tracefs inside the container because Docker Desktop's linuxkit VM mounts
+neither — it loaded its eBPF tracer and produced 303 events, 263 stack traces and
+a 13,046-frame flamegraph, with `order` and `product` among the profiled
+executables. Two things stopped it. All 78 frames from the Rust binaries were
+unsymbolised, because Elastic symbolises native code through a separate
+`pf-elastic-symbolizer` service that ships in the image but is not wired up; and
+this Kibana has no profiling plugin at all. A privileged root collector plus a
+symbolizer plus no UI is more than the demo stack should carry. Nothing from the
+spike reached the repository, and the one dynamic Elasticsearch setting was
+reverted.
+
+**`kafkaman.handler` closes the one real gap at the default filter.** Both
+handler positions are spanned, and handler errors are recorded there rather than
+on `kafkaman.dispatch` — which is the first time a failing handler is
+distinguishable from failing kafkaman bookkeeping, since a handler error that
+schedules a retry is a successful dispatch cycle by contract.
+
+**The `kafkaman::internal` tier uncovered a latent bug worth more than the
+feature.** Annotating kafkaman's own functions broke the durable trace shape
+twice. `capture_trace_context()` reads the *ambient* span, and three call sites
+persist or transmit what it returns: the outbox row's traceparent, the received
+row's, and the Kafka header other services parse. Each meant the phase span;
+nothing enforced it. Annotating `enqueue_inner` put its span id in the outbox
+row; annotating `Publisher::publish` wrapped the very capture meant to read the
+caller's span, putting a wrong span id on the wire.
+
+Fixing it by exclusion failed instructively: a name-based transitive analysis of
+which functions can reach a capture removed 68 of 85 annotations, because `new`,
+`run`, `get` and `handle` collide across unrelated types. Shipping the 17
+survivors would have been shipping a heuristic, so the tier was reverted whole
+and the cause fixed. `capture_trace_context_of(&span)` names the span; enqueue
+and ingest capture from their phase span and thread the value down, and the
+publisher captures at the `Publisher::publish` boundary where the relay's
+`.instrument` guarantees the right span is current. The `Publisher` trait and
+`insert_received` keep their signatures.
+
+The tier then re-applied mechanically: 74 functions, fifteen deliberate
+exclusions in four categories. The two broker-backed trace tests run with it live
+and are the regression test for the interaction, with a structural guard that
+fails them if the tier stops being exercised.
+
+Measured afterwards against the live stack, which corrected a documented
+estimate. One request goes from 17 spans to 25, with real per-function durations
+and the durable shape intact. But an *idle* service produces 2322 spans in two
+minutes with the tier on against 5 without it — the volume is the scheduler loops
+polling every cycle, not request work. The docs had estimated "several hundred
+per request", which both understated the cost and blamed the wrong thing; they
+now carry the measurement. Worth recording the method too: `docker compose up
+--force-recreate` reuses the image, so the first attempt measured a binary built
+before the attributes existed and concluded, wrongly, that the tier did not fire.
+
+Verification passed: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo test --workspace --lib`,
+`cargo test -p observability-tests --features redpanda --test trace_propagation
+--test trace_parented_handoff` (failing twice before the capture fix, passing
+after), `just examples telemetry-test`, `just opt-out`, and `cargo check -p
+kafkaman --no-default-features`.
+
+Pages affected: `crates/kafkaman-core/src/{trace.rs,lib.rs}`,
+`crates/kafkaman-sqlx/src/{dispatch.rs,outbox_enqueue.rs,received_storage.rs}`,
+`crates/kafkaman-rdkafka/src/{publisher.rs,consumer.rs}`,
+`crates/kafkaman-axum/src/lib.rs`, `crates/kafkaman-worker/src/*`,
+`tests/observability/src/lib.rs`,
+`tests/example-telemetry/tests/binary_telemetry.rs`, `examples/README.md`,
+`crates/kafkaman-otel/src/lib.rs`,
+`wiki/proposals/20-method-level-timing.proposal.md`,
+`wiki/decisions/method-level-timing-and-span-depth.decision.md`,
+`wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`,
+`wiki/plans/method-level-timing.plan.md`,
+`wiki/compatibility/m6-observability-operability-api.compat.md`, `wiki/index.md`,
+`wiki/log.md`.
+
+## [2026-08-29] review | line-by-line review of the APM waterfall worktree, and its fixes
+
+Reviewed all 47 changed files before commit and applied every finding.
+
+Three mattered. The recorded *reason* for the `kafkaman-otel` layer-filter change
+was wrong: reproducing the pre-change composition showed that a registry-wide
+`EnvFilter` does bound the layers added after it, so it was never leaking debug
+spans into the OpenTelemetry layer. What kept scheduler polling out of the export
+was the `debug_span!` demotion made in the same change. The compatibility note
+and the entry above are corrected, the change is kept for its real merit — a host
+can bound exports differently from stdout — and
+`a_registry_wide_filter_also_bounds_the_layers_added_after_it` now pins the
+semantics.
+
+Second, `kafkaman-axum` reported the raw URI path as `http.route` and as the
+exported span name when no route matched, so a 404 scan would have minted one APM
+transaction group per invented URL. The fallback is now the bounded constant
+`<unmatched>`.
+
+Third, decision 8 of the trace-shape decision — sampling and retention are part
+of the feature — was neither implemented nor documented. `examples/README.md`
+gained "Keeping the trace volume honest" covering `RUST_LOG`,
+`OTEL_TRACES_SAMPLER`, and the collector, and the collector now drops `/health`
+spans, which compose was producing every two seconds per service.
+
+The rest were structural: the `db.query` span shape collapsed from three
+hand-rolled copies into `kafkaman_core::db_span!` / `db_poll_span!` (macros, so
+the exported name is a compile-time `concat!` rather than a `format!` on every
+statement); five inline error-status blocks became `kafkaman_core::record_error`
+with a 256-byte bound on the description; the relay and dispatcher claim
+transactions gained poll spans, taking the gate's negative assertion from three
+summaries to seven; `trace_propagation` and `trace_parented_handoff` now share
+one drive and differ only in the handoff argument; the parented gate asserts the
+ingest span carries no link, since parented and linked are alternatives;
+`trace-handoffs.sh` skips a handoff whose producer trace is not indexed yet
+instead of printing a URL with empty segments; `just examples handoffs` checks
+Elasticsearch first; the observability policy structs became `Copy`; the
+collector's service-name transform runs `error_mode: ignore`; and the Elastic
+Agent swap was recorded as an amendment to the decision that owns the example
+topology, which had not mentioned it.
+
+Verification passed: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo test --workspace --lib`,
+`cargo test -p kafkaman-otel`, `cargo test -p observability-tests --features
+redpanda --test trace_propagation --test trace_parented_handoff`, `just opt-out`,
+`cargo check -p kafkaman --no-default-features`, `just examples telemetry-test`,
+`docker compose config` over all three profiles, and `just examples all` from a
+fully removed stack.
+
+Pages affected: `crates/kafkaman-core/src/span.rs`,
+`crates/kafkaman-core/src/lib.rs`, `crates/kafkaman-sqlx/src/*`,
+`crates/kafkaman-worker/src/relay.rs`, `crates/kafkaman-rdkafka/Cargo.toml`,
+`crates/kafkaman-axum/src/lib.rs`, `crates/kafkaman-config/src/observability.rs`,
+`crates/kafkaman-otel/src/{lib.rs,tests.rs}`, `examples/{order,product}/src/*`,
+`examples/otel-collector.yaml`, `examples/compose.yaml`,
+`examples/trace-handoffs.sh`, `examples/kibana-dashboard.sh`,
+`examples/README.md`, `justfile`, `tests/observability/*`,
+`tests/example-telemetry/*`,
+`wiki/decisions/telemetry-backend-and-example-topology.decision.md`,
+`wiki/compatibility/m6-observability-operability-api.compat.md`,
+`wiki/plans/apm-waterfall-traces.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
 # Wiki Log
+
+## [2026-08-29] update | service name copied onto example trace spans
+
+Adjusted the example OpenTelemetry collector pipeline so each trace span gets a
+span attribute `service.name` copied from the OpenTelemetry resource attribute
+of the same name. Elasticsearch's `otel` mapping stores that copy as
+`attributes.service.name`. This keeps the canonical service identity in the
+resource and preserves the stable span names, while making individual span rows
+and detail views easier to identify in Kibana.
+
+The saved Kibana dashboard now includes `attributes.service.name` in the Kafka
+handoff and recent-waterfall Discover panels, with `resource.attributes.service.name`
+left beside it for comparison. The example README records the distinction.
+
+Verification passed: `rtk docker compose -f examples/compose.yaml --profile
+services --profile observability --profile ui config`, collector recreation with
+`rtk docker compose -f examples/compose.yaml --profile observability up -d
+--force-recreate --wait --wait-timeout 900 otel-collector`, collector log
+inspection after startup, a direct product-create HTTP request through
+`rtk proxy curl`, Elasticsearch query over trace
+`afd987a59bfd174c6120c55d6cf090e0` showing all 17 spans with both
+`resource.attributes.service.name` and `attributes.service.name`, and `rtk bash
+examples/kibana-dashboard.sh` after escalation for local Kibana access.
+
+Pages affected: `examples/otel-collector.yaml`,
+`examples/kibana-dashboard.sh`, `examples/README.md`,
+`wiki/compatibility/m6-observability-operability-api.compat.md`,
+`wiki/plans/apm-waterfall-traces.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-29] implement | parented Kafka trace handoff for APM waterfall
+
+Implemented the opt-in consolidated trace mode. `kafkaman-config` now exposes
+`KafkaTraceHandoff` through `observability.*.kafka_trace_handoff = "linked" |
+"parented"`, with omitted config resolving to `linked`. `kafkaman-rdkafka`
+reads the effective per-message policy when opening `kafkaman.ingest`: linked
+mode preserves the OpenTelemetry span-link default, while parented mode sets the
+propagated producer context as the ingest parent. The received row still stores
+the ingest span context, so dispatch and dispatch SQL descend from ingest in
+both modes.
+
+The product and order example configs set `kafka_trace_handoff = "parented"` so
+`just examples all` produces one Elastic APM trace for the demo path:
+`POST /products` -> product SQL -> `kafkaman.enqueue` -> outbox SQL ->
+`kafkaman.relay.publish` -> `kafkaman.ingest` -> `kafkaman.dispatch` -> order
+cache SQL -> mark received processed -> mark outbox published. The dashboard
+handoff panel now covers both shapes by showing `parent_span_id` for parented
+mode and `links.*` for linked mode; `just examples handoffs` remains the
+linked-mode/debug helper.
+
+Verification passed: `rtk cargo test -p kafkaman-config`, `rtk cargo test -p
+kafkaman-rdkafka`, `rtk cargo test -p observability-tests --features redpanda
+--test trace_propagation --test trace_parented_handoff -- --nocapture`, `rtk
+just opt-out`, `rtk just examples telemetry-test` after Docker escalation, `rtk bash -n
+examples/kibana-dashboard.sh`, `rtk bash -n examples/trace-handoffs.sh`, and
+`rtk just examples all` against the live compose stack. A read-only
+Elasticsearch query over the live stack showed trace
+`8031e51e27ec9dada599ad878b1000b4` containing both
+`kafkaman-example-product` and `kafkaman-example-order`, including
+`POST /products`, `kafkaman.relay.publish`, `kafkaman.ingest`,
+`kafkaman.dispatch`, order cache SQL, received processed mark, and outbox
+published mark, with ingest parented to publish and dispatch parented to
+ingest.
+
+Direct browser verification of the Kibana APM timeline could not be completed
+in this run: the in-app browser client failed under `node_repl` because
+`node:process` imports are blocked, and the direct Playwright MCP browser was
+already locked by another profile. The live Elasticsearch trace is the available
+deployment proof; browser-level APM UI automation remains residual plan work.
+
+Pages affected: `crates/kafkaman-config/src/observability.rs`,
+`crates/kafkaman-config/src/lib.rs`,
+`crates/kafkaman-rdkafka/src/consumer.rs`,
+`tests/observability/tests/trace_parented_handoff.rs`,
+`tests/example-telemetry/tests/binary_telemetry.rs`,
+`examples/order/kafkaman.toml`, `examples/product/kafkaman.toml`,
+`examples/README.md`, `README.md`, `examples/kibana-dashboard.sh`,
+`examples/trace-handoffs.sh`, `justfile`, `kafkaman.example.toml`,
+`wiki/decisions/apm-waterfall-trace-shape.decision.md`,
+`wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`,
+`wiki/compatibility/m6-observability-operability-api.compat.md`,
+`wiki/plans/apm-waterfall-traces.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-29] implement | APM waterfall traces
+
+Implemented the first APM waterfall slice from the accepted plan. HTTP requests
+now export server spans with route, method, path, response status, and error
+status fields, and the order/product example routers apply the correlation layer
+so handler work descends from those HTTP roots. The examples and `kafkaman-sqlx`
+now emit bounded `db.query` spans around business SQL and durable outbox,
+received, cache, mark, and failure-accounting statements. Recurring scheduler
+claim polls remain traceable at debug level rather than the default info level,
+so empty poll cycles do not dominate a low-traffic waterfall. The four existing
+kafkaman messaging spans keep their names and now set OTel span kind and error
+status fields; `kafkaman.relay.publish` now covers the broker call and the
+post-publish outbox mark.
+
+`kafkaman-otel::init` now applies the `RUST_LOG` filter directly to the fmt,
+trace, and log layers. The earlier sibling-filter shape kept stdout at `info`
+but still let the unfiltered OpenTelemetry trace layer export debug spans, which
+is why live Elastic showed scheduler poll spans even while the example
+containers had `RUST_LOG=info`.
+
+> **Corrected 2026-08-29 by the review-fix entry below.** That last sentence is
+> wrong. A registry-wide `EnvFilter` bounds every layer added after it, which was
+> reproduced directly. The poll spans stayed out of the export because they were
+> demoted to `debug_span!` in the same change. The layer-filter change is kept,
+> for the different reason recorded in the compatibility note.
+
+Playwright debugging of Kibana APM found the main UX defect: every HTTP route
+was grouped under the exported transaction name `http.request`, so APM's
+transaction page could select a `/health` sample with no SQL/enqueue/relay
+children. HTTP spans now keep the internal tracing span name `http.request` but
+export route-shaped OTel names such as `POST /products`; SQL spans keep the
+internal tracing span name `db.query` but export summary-shaped names such as
+`db.query insert product` and `db.query mark outbox published`.
+
+The example observability profile now runs Elastic Agent in OpenTelemetry mode
+instead of the upstream contrib collector, because the Elastic distribution
+contains the `elasticapm` processor and connector. The collector config preserves
+raw `*-generic.otel-*` exports for the saved dashboard and adds APM enrichment
+beside them. The saved dashboard trace panel now selects route spans, query
+summary spans, and `kafkaman.*` spans, and the README documents the APM services
+URL plus the linked Kafka-hop workflow.
+
+A follow-up ergonomics pass added a top-level `kafkaman async trace handoffs`
+Discover panel to the dashboard and `examples/trace-handoffs.sh`, exposed as
+`just examples handoffs`. The helper joins downstream `kafkaman.ingest`
+documents back to the upstream `kafkaman.relay.publish` span through
+`links.trace_id`/`links.span_id`, then prints direct producer and consumer APM
+waterfall URLs. This records the measured Kibana behavior: the APM timeline shows
+the span-link count, but does not reliably provide a forward navigation target
+from the producer waterfall to the downstream consumer waterfall.
+
+`tests/example-telemetry` now decodes span ids, parent ids, links, attributes,
+and OTLP span kind, and asserts a representative waterfall:
+HTTP -> business SQL -> enqueue -> outbox SQL -> relay publish -> mark SQL,
+linked to ingest -> dispatch -> cache SQL. It also asserts that the default
+info-level export does not include recurring empty scheduler poll spans.
+
+Verification passed: focused compile, `kafkaman-axum` correlation tests,
+`kafkaman-otel` tests, `example-telemetry-tests --no-run`, `just examples
+telemetry-test` (after Docker escalation, rerun after the no-default-poll-spans
+and span-kind assertions), focused clippy, `just examples all` against the live
+stack, rerun of `just examples all` after the layer-filtering fix, and
+`examples/kibana-dashboard.sh` against live Kibana, and the filtered helper
+command for `MESSAGE_TYPE=product_snapshot`, `CONSUMER_SERVICE=kafkaman-example-order`,
+and `PRODUCER_TRANSACTION='POST /products'`. Elasticsearch showed enriched trace
+documents with APM fields including `processor.event`, `transaction.name`,
+`span.type`, and `span.destination.service.resource`. A product POST trace showed
+the HTTP -> SQL -> enqueue -> outbox SQL -> relay publish -> mark-published SQL
+chain; the order ingest trace linked back to that relay publish span and showed
+received insert, dispatch, cache upsert, and processed mark. A recent
+current-source Elasticsearch count showed zero default exported `db.query` spans
+for `claim outbox batch`, `collapse stale pending outbox rows`, or `claim
+received row`.
+
+Residual work recorded in the plan: add an explicit slow-query/injected-delay
+proof if needed, add focused failure-status assertions, and capture browser-level
+APM UI evidence. A direct curl to Kibana 9.3.5's internal APM services API
+returned `400 uri [/internal/apm/services] ... not available with the current
+configuration`, even though the Elasticsearch trace documents are APM-enriched.
+
+Pages affected: `crates/kafkaman-axum/src/lib.rs`,
+`crates/kafkaman-otel/src/lib.rs`,
+`crates/kafkaman-sqlx/src/db_trace.rs`, `crates/kafkaman-sqlx/src/lib.rs`,
+`crates/kafkaman-sqlx/src/outbox_enqueue.rs`,
+`crates/kafkaman-sqlx/src/outbox_claim.rs`,
+`crates/kafkaman-sqlx/src/outbox_mark.rs`,
+`crates/kafkaman-sqlx/src/received_storage.rs`,
+`crates/kafkaman-sqlx/src/received_rows.rs`,
+`crates/kafkaman-sqlx/src/dispatch_cache.rs`,
+`crates/kafkaman-sqlx/src/dispatch.rs`,
+`crates/kafkaman-rdkafka/src/consumer.rs`,
+`crates/kafkaman-worker/src/relay.rs`, `examples/order/src/lib.rs`,
+`examples/order/src/http.rs`, `examples/product/src/lib.rs`,
+`examples/product/src/http.rs`, `examples/compose.yaml`,
+`examples/otel-collector.yaml`, `examples/kibana-dashboard.sh`,
+`examples/trace-handoffs.sh`, `justfile`,
+`examples/README.md`, `justfile`, `tests/example-telemetry/src/lib.rs`,
+`tests/example-telemetry/tests/binary_telemetry.rs`,
+`wiki/plans/apm-waterfall-traces.plan.md`,
+`wiki/compatibility/m6-observability-operability-api.compat.md`, `wiki/log.md`.
+
+## [2026-08-29] create | APM waterfall trace proposal, decision, and plan
+
+Added the APM waterfall documentation set after the Kibana dashboard/debugging
+discussion exposed the next observability step: richer trace waterfalls rather
+than more logs. The proposal accepts APM-style waterfalls as the next direction;
+the decision fixes the boundaries before implementation: waterfalls are spans,
+not logs; SDK/exporter ownership stays with the host/reference stack; inbound
+HTTP becomes the application server root; SQL timing appears as child spans; the
+existing kafkaman span names remain the durable phase vocabulary; and the
+Kafka/outbox hop stays link-based by default until a measured Kibana spike proves
+an opt-in parented mode is needed. The plan sequences the work through APM
+baseline measurement, Elastic APM enrichment, HTTP spans, SQL spans, kafkaman
+span kind/status normalization, linked-trace UX measurement, binary telemetry
+test extension, and docs closeout.
+
+Pages affected: `wiki/proposals/19-apm-waterfall-traces.proposal.md`,
+`wiki/decisions/apm-waterfall-trace-shape.decision.md`,
+`wiki/plans/apm-waterfall-traces.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-29] update | Kibana dashboard and telemetry document-volume review
+
+Added `examples/kibana-dashboard.sh`, an idempotent saved-object setup script
+that creates the `kafkaman telemetry` dashboard and the three saved Discover
+panels it embeds: recent kafkaman traces, queue metrics, and service logs.
+`just examples all` and `just examples observe` now run it instead of stopping
+at the data view.
+
+The investigation found the apparent log volume was not log volume. In the live
+stack, the shared `*-generic.otel-*` data view held thousands of documents, but
+only 10 were logs; almost all were metric points. The services export about 26
+metric series each every 15 seconds, which is roughly 208 metric documents per
+minute for the two-service example. That is normal low-cardinality time-series
+shape, but raw Discover over all three data streams makes it look like log spam.
+The dashboard therefore separates signals instead of showing a mixed table.
+Follow-up debugging found the first saved dashboard window was too short for
+this example shape: traces and logs are one-shot startup/smoke records, while
+queue metrics continue to arrive. The dashboard now saves and prints a four-hour
+URL so those trace/log records remain visible during normal post-run inspection.
+
+Pages affected: `examples/kibana-dashboard.sh` (new), `justfile`,
+`examples/README.md`, `wiki/plans/opentelemetry-completion.plan.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-29] feature | the example binaries' telemetry is now under test
+
+`tests/example-telemetry` runs `examples/order` and `examples/product` as child
+processes, points them at a local OTLP receiver, drives a real two-service flow,
+stops them with SIGINT, and asserts that all three signals arrived from both
+`service.name` resources. `just examples telemetry-test`, 23.6s. It is the first
+test in the workspace that executes either binary's `main.rs`, which is where
+`kafkaman_otel::init` is called, the signal is handled, and
+`Telemetry::shutdown()` is sequenced after the drain.
+
+The flush claim is arranged rather than hoped for. Each child runs with
+`OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_BSP_SCHEDULE_DELAY` and
+`OTEL_BLRP_SCHEDULE_DELAY` at an hour, so no scheduled export can fire inside the
+test and everything captured was forced out by shutdown. At the SDK defaults —
+15s, 5s, 1s — a Docker-backed run outlives all three and every assertion would
+have passed against a binary that never flushes.
+
+Both deliberate breaks were demonstrated against `examples/order` and both failed
+on the first run, in 13.0s each. Bypassing `kafkaman_otel::init` left
+`services ["kafkaman-example-product"]` and nothing from `order`. Skipping
+`Telemetry::shutdown()` produced the identical result — which answers a question
+the plan did not think to ask: dropping `Telemetry` does **not** flush through the
+SDK's own `Drop` impls. The `shutdown()` call is load-bearing, not
+belt-and-braces, and a binary that omits it loses everything it recorded. Both
+breaks fail on the same assertion, so its message now names a missing flush
+alongside a missing `init`: from the receiver's side, with the schedules
+stretched, the two are indistinguishable.
+
+Three things landed differently from the plan. `rustix::process::kill_process`
+rather than `libc::kill`, because `unsafe_code` is `forbid` at the workspace level
+and `forbid` cannot be lifted by a crate-local `allow` — reaching one line would
+have meant weakening the lint for every crate; rustix was already in the graph, so
+the cost was a feature rather than a compilation. `just examples telemetry-test`
+rather than `telemetry`, because `just examples all` now starts the telemetry
+stack and a bare `telemetry` arm would read as another way to bring something up.
+And the capture receiver moved to `tests/otlp-capture` rather than
+`kafkaman-test`, keeping OTLP vocabulary inside `tests/` where the ownership
+decision puts it.
+
+That receiver was 120 lines at the foot of `tests/observability/tests/otlp_wire.rs`.
+It is now shared, and hardened while moving: it answered one request per
+connection and dropped the socket, which is survivable for one process exporting a
+handful of times and is the first thing to break under two children exporting
+repeatedly, because the OTLP client pools connections and its POSTs are never
+retried. It now serves a connection until the peer closes it. `otlp_wire` passing
+unchanged is the proof the move was faithful.
+
+The ownership map is now written next to the tests that enforce it. The failure
+mode it guards against is specific: the natural place to add example telemetry
+assertions is `tests/distributed-cache`, and doing so would put two example
+applications into one process with shared, process-global OpenTelemetry state —
+a topology no operator runs.
+
+Recorded and not fixed: the examples handle SIGINT and not SIGTERM, so the gate
+is silent about what every ordinary container stop delivers.
+`examples/compose.yaml` compensates with `stop_signal: SIGINT`.
+
+Pages affected: `tests/otlp-capture/` (new), `tests/example-telemetry/` (new),
+`tests/observability/tests/otlp_wire.rs`, `tests/observability/Cargo.toml`,
+`tests/observability/src/lib.rs`, `tests/distributed-cache/src/lib.rs`,
+`Cargo.toml`, `justfile`,
+`wiki/plans/example-telemetry-integration-tests.plan.md` (closed),
+`wiki/plans/opentelemetry-completion.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-29] feature | `just examples all` and a shipped Kibana data view
+
+One command for the whole example stack, and the removal of the last manual step
+between "it is running" and "the telemetry is worth looking at".
+
+`just examples` already built both services, provisioned databases and compacted
+topics, and walked the seven-step propagation lifecycle. What it did not do was
+telemetry: `demo` pins `OTEL_EXPORTER_OTLP_ENDPOINT` empty on purpose, so the
+binaries install no provider. Telemetry lived in `observe`, the message UI in
+`ui`, and Kibana opened on nothing because no data view shipped.
+
+`all` is now the default arm and the union of all three profiles, with two
+additions that are the actual point. `examples/kibana-data-view.sh` creates a
+`kafkaman telemetry` view over `*-generic.otel-*`, the pattern the collector's
+`otel` mapping writes all three signals to, so one view in Discover pivots from a
+log record to the span it was emitted inside. It queries before creating: the
+data-views API does not treat a repeated title as a conflict, so idempotency has
+to live in the script rather than at the server. `observe` runs it too.
+
+The second addition is an unasserted volume phase in `examples/smoke.sh`, gated
+on `VOLUME_PRODUCTS` and set to 12 by `all`. The seven assertion steps are
+untouched — they are the correctness proof and stay tight — but one product
+leaves `kafkaman.dispatch.duration`, `kafkaman.relay.publish.duration` and
+`kafkaman.outbox.time_to_publish` with a single observation each and moves the
+queue gauges once. In Kibana that is indistinguishable from a broken instrument.
+The phase creates products, waits for each to reach `order`'s cache before
+ordering against it (the same rule step 3 depends on, in bulk), and settles once
+at the end so the stack is not inspected or torn down mid-propagation. It asserts
+nothing beyond writes being accepted, and its final settle runs inside a command
+substitution so `await_settled`'s `fail` cannot end a run whose assertions all
+passed.
+
+`demo` is unchanged and stays the light path: same walkthrough, no backend, no
+volume. Elasticsearch is what makes `all` slow — a gigabyte of heap and 30-60s to
+go yellow — and that trade should stay a choice.
+
+This closes the data-view half of the last outstanding item in
+`wiki/plans/opentelemetry-completion.plan.md` Phase 4. A packaged dashboard
+remains.
+
+Pages affected: `justfile`, `examples/smoke.sh`,
+`examples/kibana-data-view.sh` (new), `examples/README.md`, `README.md`,
+`wiki/plans/opentelemetry-completion.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-28] fix | a review pass on the example telemetry test documents
+
+Twelve findings against the proposal, decision, and plan written earlier today.
+The reasoning held up — every factual claim checked out against the code,
+including both `service.name` strings, the `example_order::start` /
+`example_product::start_with` call sites that bypass `main.rs`, and the `/health`
+routes the plan depends on. The weakness was uniform and elsewhere: the documents
+argued rigorously about what to test and left the mechanics that decide whether
+the gate is buildable to implementation time.
+
+Four findings would have stopped Phase 3 outright. The shutdown step named no
+signal and no mechanism, and there is no mechanism to find: the binaries handle
+SIGINT only, and `Child::kill` sends SIGKILL, so the harness needs a `libc` or
+`nix` dev-dependency to express the step the whole gate rests on. Nothing set the
+children's working directory, though both `main.rs` files call
+`Config::discover()` and would have died at boot on a config error that reads
+nothing like a telemetry failure. Binary discovery was left conditional on
+whether Cargo exposes sibling binaries; it does not, `CARGO_BIN_EXE_*` being
+scoped to the declaring package, so the `just` recipe is the path and the test
+must fail loudly rather than skip when the variables are unset.
+
+The fourth is the one that changes what the gate proves. The plan admitted its
+missing-shutdown break might be nondeterministic and proposed working around it.
+The better fix was already in the tree: `otlp_wire` runs a 3600s reader, and
+`kafkaman_otel` deliberately steps aside for `OTEL_METRIC_EXPORT_INTERVAL`
+instead of overriding it. Pushing the metric interval and both batch schedule
+delays past the test's own lifetime means nothing can arrive on a timer, so every
+captured record was forced out by `Telemetry::shutdown()`. The positive
+assertions and the deliberate break collapse into one deterministic check. At the
+SDK defaults — 15s, 5s, 1s — a Docker-backed run outlives all three and the gate
+would have passed against a binary that never flushes.
+
+Recorded rather than fixed: the examples handle SIGINT and not SIGTERM.
+`examples/compose.yaml` compensates with `stop_signal: SIGINT`, so the shipped
+demonstration is honest, but an adopter lifting these binaries into Kubernetes or
+systemd loses the drain and the flush and this gate will not warn them. That is a
+change to the examples, not to the tests, so it is a bound in the decision's
+Consequences and a Revisit If trigger rather than new plan scope.
+
+The rest were harness durability: the OTLP receiver answers one request per
+connection and drops the socket, which is fine for one process and is the likely
+flake source under two children exporting over a longer run; a panicking
+assertion would have leaked both service processes, since `Child` is not killed
+on drop; `RUST_LOG` was unset, which would have failed the log assertion for
+filter reasons that look like export failures; ports were allocated with a
+bind-then-close race; and the receiver was to be reused "in approach", which is
+how a second and then a third hand-rolled HTTP capture server appears — it is now
+moved into shared scaffolding, with `otlp_wire` passing unchanged as the proof
+the move was faithful. The plan also now names what it builds:
+`tests/example-telemetry`, package `example-telemetry-tests`, command
+`just examples telemetry`, alongside the existing `observe` it complements.
+
+No code changed. Pages affected:
+`wiki/plans/example-telemetry-integration-tests.plan.md` (rewritten),
+`wiki/decisions/example-telemetry-integration-test-boundary.decision.md`,
+`wiki/proposals/18-example-telemetry-integration-tests.proposal.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-28] decision | example telemetry integration test boundary
+
+Created the proposal, accepted decision, and active plan for the next
+observability testing step: prove the order and product example binaries'
+OpenTelemetry wiring through their real `main.rs` entry points.
+
+The gap is intentionally narrow. `tests/distributed-cache` uses the example
+service crates and real HTTP but bypasses binary telemetry setup.
+`tests/observability/otlp_wire` proves OTLP export but constructs providers
+manually and does not involve examples. `crates/kafkaman-otel/tests` proves the
+convenience crate in isolation. The missing proof is that the example binaries
+install telemetry, export all three signals, and flush on graceful shutdown.
+
+Decision recorded: use a black-box subprocess gate with a local OTLP/HTTP
+capture receiver, not an in-process extension of `tests/distributed-cache` and
+not the full Elastic/Kibana compose stack. The latter remains deployment proof;
+the new gate owns binary-level application wiring.
+
+No code changed.
+Pages affected: `wiki/proposals/18-example-telemetry-integration-tests.proposal.md`
+(new), `wiki/decisions/example-telemetry-integration-test-boundary.decision.md`
+(new), `wiki/plans/example-telemetry-integration-tests.plan.md` (new),
+`wiki/index.md`, `wiki/log.md`.
 
 ## [2026-08-28] fix | a review pass on the collector and `kafkaman-otel` work
 

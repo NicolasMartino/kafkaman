@@ -13,12 +13,18 @@
   - crates/kafkaman-sqlx/src/replay.rs
   - crates/kafkaman-worker/src/metrics.rs
   - crates/kafkaman-rdkafka/src/metrics.rs
+  - crates/kafkaman-rdkafka/src/consumer.rs
   - crates/kafkaman-axum/src/lib.rs
+  - crates/kafkaman-otel/src/lib.rs
   - crates/kafkaman/src/lib.rs
   - crates/kafkaman-core/src/lifecycle.rs
   - crates/kafkaman-core/src/status.rs
   - apps/axum-outbox/src/main.rs
   - kafkaman.example.toml
+  - examples/order/kafkaman.toml
+  - examples/product/kafkaman.toml
+  - tests/observability/tests/trace_parented_handoff.rs
+  - tests/example-telemetry/tests/binary_telemetry.rs
   - tests/durable-send/src/containers.rs
 - Related:
   - wiki/compatibility/m4-retry-backoff-runtime-api.compat.md
@@ -32,6 +38,7 @@
 - `ObservabilityPolicy`
 - `ObservabilityPolicyOverride`
 - `ObservabilityLevel`
+- `KafkaTraceHandoff`
 - `LifecycleLogging`
 - `PayloadLogging`
 - `HeaderLogging`
@@ -39,6 +46,8 @@
 - `Config::observability_config`
 
 - `ObservabilityPolicy::lifecycle_emission`
+- `ObservabilityPolicy::kafka_trace_handoff`
+- `ObservabilityPolicyOverride::kafka_trace_handoff`
 
 `kafkaman-core` adds:
 
@@ -48,6 +57,33 @@
 - `OutboxStatus::is_terminal`
 - `ReceiveStatus::is_terminal`
 - `rfc9557::option`, a serde adapter for `Option<OffsetDateTime>`.
+- `record_error`, which marks a span failed with a **bounded** description.
+- `db_span!` and `db_poll_span!`, the SQL client span shape below.
+- `capture_trace_context_of`, which captures the context of a **named** span
+  rather than of whichever span is current. See "Durable capture names its span"
+  below; this is the safe one for anything that persists what it captures.
+
+The two macros are exported from the crate root and reachable through the facade
+as `kafkaman::db_span!` / `kafkaman::db_poll_span!`. They exist because the same
+span was being hand-rolled in `kafkaman-sqlx` and in both example services, and a
+span shape that four places re-derive is a span shape that drifts — these
+attributes are a documented compatibility surface, so there is now one definition
+of them.
+
+They are macros rather than functions so the exported span name is
+`concat!("db.query ", $summary)`, built at compile time from a string literal.
+The functions they replaced called `format!` on every statement on every path,
+whether or not any subscriber had the span enabled. `$summary` must therefore be
+a literal; a caller needing a runtime summary should build the span itself.
+
+`record_error` truncates at 256 bytes on a character boundary. A status
+description is attacker-influenced the way a log line is — a database error can
+quote the value that violated a constraint — and the status exists to say what
+went wrong, which the first 256 bytes do.
+
+`kafkaman-core` also re-exports `tracing` as `__tracing`. It is `#[doc(hidden)]`
+and exists only so the two macros expand in a crate that does not depend on
+`tracing` itself. It is not public API and may disappear.
 
 `kafkaman-sqlx` adds:
 
@@ -86,6 +122,15 @@ These are additive-looking but source-breaking for existing callers:
   (summary only, no per-message events).
 - `RelayConfig` gained a `lifecycle` field. `RelayConfig::default()` and the
   config-resolution path both fill it; struct-literal construction must add it.
+- `ObservabilityPolicy` gained `kafka_trace_handoff`, and
+  `ObservabilityPolicyOverride` gained the matching optional override. Defaults
+  and config resolution fill both, but direct struct literals must add the field.
+- `insert_received_with_outcome` gained a trailing
+  `trace: Option<TraceContext>` parameter. Its caller passes the ingest span's
+  context explicitly rather than letting the function read the ambient span —
+  see below. `insert_received`, which the test harnesses and examples use, keeps
+  its signature and captures ambiently, which is correct for a caller that has no
+  phase span.
 - `Replay::message_type` was removed before any release used it. It had no
   callers.
 - `ReceivedStatusSummary`/`OutboxStatusSummary` gained `over_max_queue_age`.
@@ -103,8 +148,17 @@ uses defaults and remains backwards-compatible. If the section is present,
 unknown fields, invalid enum values, bad sampling values, zero thresholds, or
 overrides for unregistered message types fail config resolution.
 
+`observability.*.kafka_trace_handoff` accepts `linked` or `parented`. Omitted is
+`linked`, preserving the OpenTelemetry messaging default where `kafkaman.ingest`
+links to the propagated producer context. `parented` makes ingest continue the
+producer trace, intended for single-record APM waterfalls. Per-message overrides
+win over `[observability.defaults]`.
+
 `kafkaman.example.toml` now documents the section and is covered by the existing
-executable example-config test.
+executable example-config test. The shipped product and order example configs
+set `observability.defaults.kafka_trace_handoff = "parented"` so `just examples
+all` produces one Elastic APM trace across the HTTP, relay, Kafka ingest, and
+dispatch work.
 
 ## Dependency Changes
 
@@ -125,11 +179,29 @@ its own copy.
 `kafkaman-axum` does not depend on `kafkaman-config`; it reads observability
 policy through `ResolvedConfig`.
 
+`kafkaman-rdkafka` now depends directly on `kafkaman-config` to read the resolved
+`KafkaTraceHandoff` value in the consumer ingest path. The dependency is spelled
+`default-features = false`, but that is defensive rather than load-bearing:
+`kafkaman-config` declares no features, and the guard that keeps `opentelemetry`
+out of an opt-out build is its own `kafkaman-core = { default-features = false }`
+pin. `just opt-out` is what proves the contract, and it still passes.
+
 ## Semver Notes
 
 Adding `ResolvedConfig.observability` is semver-sensitive for downstream code
 that constructs `ResolvedConfig` with a struct literal. `ResolvedConfig::new` and
 builder-style helpers are the compatibility-preserving construction path.
+
+Adding `ObservabilityPolicy.kafka_trace_handoff` and
+`ObservabilityPolicyOverride.kafka_trace_handoff` has the same struct-literal
+cost for callers that construct those config structs directly. TOML users get a
+backwards-compatible default of `linked`.
+
+Both structs also gained `Copy`. `policy_for` is now called per record on the
+ingest path, and every field of both is already `Copy`, so resolving a policy is
+a map lookup and a memcpy with nothing to allocate and nothing to drop. Adding
+`Copy` is additive for callers; the only observable difference is that a moved
+value stays usable.
 
 The new SQL inspection APIs expose sanitized operational summaries. They do not
 promise full durable-row JSON shapes and deliberately do not expose payloads or
@@ -417,15 +489,251 @@ Four spans, whose names are as much a compatibility surface as the metric names:
 | --- | --- | --- |
 | `kafkaman.enqueue` | inside the caller's transaction | child of the caller's span, or a root |
 | `kafkaman.relay.publish` | per row, in the relay loop | child of the row's stored context |
-| `kafkaman.ingest` | per consumed record | root, **linked** to the producer |
+| `kafkaman.ingest` | per consumed record | root linked to the producer by default; child of producer context in `parented` mode |
 | `kafkaman.dispatch` | around handler execution | child of the received row's stored context |
 
 Each carries `messaging.system`, `messaging.destination.name`, and
 `messaging.operation.name` alongside kafkaman's own attributes.
 
-The consumer links rather than parents because it polls a batch that may hold
-records from many unrelated traces. `kafkaman.dispatch` parents rather than
-links, because by then exactly one row has been claimed.
+The consumer links rather than parents by default because it can poll a batch
+that holds records from many unrelated traces. `kafkaman.dispatch` parents
+rather than links, because by then exactly one row has been claimed.
+
+### Kafka trace handoff policy
+
+**Added 2026-08-29.** The live observability policy now includes
+`kafka_trace_handoff`, resolved from `[observability.defaults]` and
+`[observability.messages.<message_type>]`:
+
+| Value | `kafkaman.ingest` relationship | Trace shape |
+| --- | --- | --- |
+| `linked` | adds a span link to the propagated producer context | default two-trace OpenTelemetry messaging shape |
+| `parented` | sets the propagated producer context as the parent | one distributed trace for single-record APM waterfalls |
+
+The received row still stores the ingest span's context in both modes, so
+dispatch and dispatch SQL naturally remain under ingest. The acceptance contract
+for parented mode is the parent edge and shared trace id, not the presence of a
+duplicate link.
+
+### APM waterfall span additions
+
+**Added 2026-08-29.** The first HTTP/SQL/span-kind slice changed the exported
+trace schema. Dashboards and alerts that select spans by name or attribute
+should account for these additions.
+
+`kafkaman-axum::CorrelationLayer` now makes each request an OpenTelemetry server
+span. The internal tracing span remains `http.request`, while the exported OTel
+span name is route-shaped, for example `POST /products`, so Elastic APM groups
+useful transactions separately from `/health`. The span records:
+
+- `http.request.method`
+- `http.route`
+- `url.path`
+- `http.response.status_code`
+
+`http.route` and the exported span name are what a backend groups transactions
+by, so both are bounded. A request that matched no route reports
+`http.route = "<unmatched>"` rather than its raw URL: reporting the path there
+would mint one transaction group per URL a scanner invents. The raw path is still
+recorded, as `url.path`, which nothing groups by.
+
+Error status is recorded for 5xx only. A 4xx is the server correctly refusing a
+bad request, and marking those failed makes an APM error rate track client
+mistakes rather than service health.
+
+The two shipped examples now apply `CorrelationLayer` to their public routers,
+so example request handlers run under that HTTP span. A service that uses
+`kafkaman::axum::serve` directly still has to layer correlation itself; serving
+does not rewrite the router.
+
+The example applications and `kafkaman-sqlx` now emit client spans for
+representative business and durable-state SQL. The internal tracing span remains
+`db.query`, while the exported OTel span name is summary-shaped, for example
+`db.query insert product` or `db.query mark outbox published`, so Kibana's
+waterfall rows are readable. Every such span uses:
+
+- `db.system.name = "postgresql"`
+- `db.operation.name`
+- `db.collection.name`
+- `db.query.summary`
+
+No bind values, request bodies, payloads, entity ids, tenant ids, or full SQL
+text are recorded. `db.query.summary` is intentionally bounded vocabulary such
+as `insert outbox row`, `mark outbox published`, or `apply received row to
+cache`.
+
+Recurring scheduler poll statements that often claim no work use the same bounded
+schema but are emitted at `debug` level: `claim outbox batch`, `collapse stale
+pending outbox rows`, `claim received row`, and the transactions around them —
+`open outbox claim transaction`, `commit outbox claim transaction`, `open
+received claim transaction`, and `commit empty received claim transaction`. The
+default example `info` filter therefore shows lifecycle work without hundreds of
+empty poll spans, while a debug run can still inspect scheduler polling itself.
+`tests/example-telemetry` asserts that none of the seven reaches the wire at
+`info`.
+
+The existing kafkaman messaging spans keep their names and now set OpenTelemetry
+span kind/status through the tracing bridge:
+
+- `kafkaman.enqueue`: producer
+- `kafkaman.relay.publish`: producer
+- `kafkaman.ingest`: consumer
+- `kafkaman.dispatch`: consumer
+
+Failures on enqueue, relay publish/mark, ingest, and dispatch record error
+status on the owning kafkaman span, through `kafkaman_core::record_error` and so
+with a bounded description. Successful spans leave status unset except where the
+Elastic APM enrichment derives `event.outcome` and transaction result.
+
+`kafkaman.dispatch` marks ERROR only when the dispatch cycle itself could not
+complete. A handler that returns an error and gets a retry scheduled is a
+successful cycle by `dispatch_once`'s contract — the failure is recorded on the
+row and counted in `DispatchStats` — so marking the span would make an APM error
+rate count work the system is handling as designed.
+
+### Bounding exported trace volume
+
+**Added 2026-08-29.** Spans scale with traffic, and the accepted decision makes
+sampling and retention part of the feature rather than a follow-up. Three
+mechanisms, cutting at three points, none of them new API:
+
+| Knob | Bounds | Owner |
+| --- | --- | --- |
+| `RUST_LOG` | what is recorded at all | the host's subscriber |
+| `OTEL_TRACES_SAMPLER` / `_ARG` | which recorded traces are exported | the OpenTelemetry SDK, read directly |
+| collector pipeline | what the backend stores | the reference deployment |
+
+kafkaman intercepts none of them. The example collector uses the third to drop
+spans whose `http.route` is `/health`, because compose polls each service's
+health endpoint every two seconds and those spans would otherwise dominate the
+stack. `examples/README.md` documents all three under "Keeping the trace volume
+honest".
+
+### Durable capture names its span
+
+**Added 2026-08-29.** `capture_trace_context()` returns the context of whichever
+span is current. Three call sites *persist or transmit* what it returns:
+
+| Site | Where the context ends up |
+| --- | --- |
+| outbox enqueue | the outbox row's `traceparent` column |
+| received insert | the received row's `traceparent` column |
+| Kafka publish | the `traceparent` header on the wire |
+
+Each means one particular span — the `kafkaman.enqueue`, `kafkaman.ingest`, or
+`kafkaman.relay.publish` that names the phase — and nothing enforced that. Any
+span opened between the phase span and the capture silently became the stored
+context. The row stayed well-formed; it just pointed at a private function
+instead of the documented phase, and in the publish case that value went onto the
+wire for other services to parse.
+
+All three now name their span. `capture_trace_context_of(&span)` is the primitive;
+enqueue and ingest capture from their phase span and pass the value down, and the
+publisher captures at the `Publisher::publish` boundary, where the relay's
+`.instrument` guarantees the current span is still the phase span. The
+`Publisher` trait is unchanged.
+
+**The rule for anyone adding instrumentation:** a function that reads the ambient
+span must not itself be wrapped in one. Three functions are in that position —
+`RdkafkaPublisher::publish`, `publish_row`, and `insert_received` — and they are
+excluded from the internal span tier for exactly this reason.
+
+`RdkafkaPublisher::publish_row_traced` is new and public: it takes the context to
+write. `publish_row` keeps its signature and captures ambiently, which is right
+for a caller invoking it directly rather than from inside the relay.
+
+### `kafkaman.handler`
+
+**Added 2026-08-29.** A span around each application handler call, at `info`, so
+a slow handler is no longer unattributed time inside `kafkaman.dispatch`. It
+carries `otel.kind = "internal"` — the consuming happened at ingest; this is the
+application's own work — plus `message_type` and `handler.position`, which is
+`before` or `after` for the pre-upsert hook and the post-upsert handler.
+
+Handler failures record their error status here rather than on
+`kafkaman.dispatch`, which stays unmarked because a handler error that schedules
+a retry is a successful dispatch cycle by `dispatch_once`'s contract. This is the
+first span that distinguishes the two.
+
+`kafkaman.handler` is a **stable** span name.
+
+### The `kafkaman::internal` span tier
+
+**Added 2026-08-29.** 74 functions across `kafkaman-sqlx`, `kafkaman-axum`,
+`kafkaman-worker`, and `kafkaman-rdkafka` carry
+`#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]`.
+Reach them with:
+
+```
+RUST_LOG=info,kafkaman::internal=debug
+```
+
+The dedicated target exists so that reaching kafkaman's functions does not also
+enable `sqlx` and `rdkafka` debug logging. `skip_all` is not stylistic: bare
+`#[instrument]` records every argument via `Debug`, which would put envelopes,
+rows, and payload bytes into spans and violate the no-payload rule above.
+
+**These span names are not a compatibility surface.** They are function names and
+will change whenever the functions do. Build dashboards on the `kafkaman.*` phase
+spans and the `db.query` summaries.
+
+Fifteen functions are deliberately excluded, in four categories: those that build
+a phase span (a second one would nest a duplicate), those that run until shutdown
+(a span covering hours is not a waterfall row), those that read the ambient span
+(see the rule above), and bodiless trait declarations. `kafkaman-core` is
+excluded entirely — it performs no I/O, so there is no time there for a span to
+attribute.
+
+**Measured cost.** A product-create request goes from 17 spans to 25. The
+scheduler loops dominate everything else: with the tier on for one example
+service and the stack otherwise idle, that service produced 2322 spans in two
+minutes against 5 from the service without it. Nearly all of the difference is
+`claim_batch`, `claim_received_row`, and the other per-cycle functions. This tier
+is for a debugging session, not for a deployment.
+
+The relay publish span now covers the post-publish outbox mark as well as the
+broker call, so a slow or failing `mark outbox published` appears under
+`kafkaman.relay.publish` rather than as an unrelated root database span.
+
+With the example configs' `parented` handoff, Elastic APM trace samples can show
+the full demo path in one timeline:
+`POST /products` -> product SQL -> `kafkaman.enqueue` -> outbox SQL ->
+`kafkaman.relay.publish` -> `kafkaman.ingest` -> `kafkaman.dispatch` -> order
+cache SQL -> mark received processed -> mark outbox published. In `linked` mode,
+the dashboard handoff panel and `just examples handoffs` remain the debugging
+path for joining producer and consumer traces.
+
+The example collector also duplicates the OpenTelemetry resource
+`service.name` onto each trace span as the span attribute `service.name`. In
+Elasticsearch's `otel` mapping that appears as `attributes.service.name`. This
+is deliberately an example/backend usability transform, not a library span-name
+change: the canonical OpenTelemetry service identity remains the resource
+attribute, and the existing span names stay stable.
+
+### `kafkaman-otel::init` filters telemetry layers directly
+
+**Added 2026-08-29, corrected the same day.** The default `init` subscriber now
+applies the `RUST_LOG` `EnvFilter` directly to the fmt layer, the OpenTelemetry
+trace layer, and the OpenTelemetry log layer, instead of installing one filter on
+the registry.
+
+**This was first recorded here with the wrong reason.** The note claimed the
+older registry-wide filter let the unfiltered OpenTelemetry layer enable debug
+spans. It did not: in `tracing-subscriber`, a filter layer's `enabled` is ANDed
+into the subscriber's, so it bounds every layer added after it too. That is now
+pinned by `a_registry_wide_filter_also_bounds_the_layers_added_after_it` in
+`crates/kafkaman-otel/src/tests.rs`, precisely so the wrong explanation cannot
+come back.
+
+What actually keeps scheduler polling out of the default export is that those
+spans are `debug_span!` rather than `info_span!`, asserted end to end over real
+OTLP bytes by `tests/example-telemetry`.
+
+The change is therefore behaviour-neutral at the same filter, and is kept for a
+different reason: with the filter attached per layer, a host can bound exported
+telemetry differently from stdout. Composing your own subscriber now needs
+`tracing_subscriber::Layer` in scope and a `.map(|layer| layer.with_filter(..))`
+around each optional layer — see the crate docs for the current shape.
 
 ## Lifecycle Success Events Move Into The Publish Span
 

@@ -159,16 +159,68 @@ clean-containers:
                        --filter label=com.kafkaman.managed-by=testcontainers)
     if [ -n "$ids" ]; then docker rm -f $ids; else echo "nothing to clean"; fi
 
-# `demo` is the whole thing in containers; `observe` adds Elasticsearch and
-# Kibana; `up` starts only the infrastructure and leaves the services to cargo.
-# The other three attach to whichever of the two is already running.
-[doc("Drive the example stack. arg: demo (default) | observe | up | ui | logs | down")]
-examples arg="demo":
+# `all` is everything, and the default: services, the telemetry backend, the
+# message UI, a Kibana data view, and a demo run with enough traffic to be worth
+# looking at. `demo` is the same propagation walkthrough without the backend, for
+# when you do not want to pay for Elasticsearch; `observe` is `demo` plus the
+# backend but without the message UI or the volume; `up` starts only the
+# infrastructure and leaves the services to cargo. The rest attach to whichever
+# is already running.
+[doc("Drive the example stack. arg: all (default) | demo | observe | up | ui | handoffs | telemetry-test | logs | down")]
+examples arg="all":
     #!/usr/bin/env bash
     set -euo pipefail
     compose=(docker compose -f examples/compose.yaml)
     pg="${POSTGRES_PORT:-5432}"
     case "{{ arg }}" in
+      all)
+        # Every profile at once. `observe` and `ui` already compose cleanly, so
+        # this arm is their union plus the two things that turn "the stack is
+        # running" into "the telemetry is worth opening": a data view, and enough
+        # traffic to fill a histogram.
+        #
+        # Elasticsearch is what makes this slow — a gigabyte of heap and 30-60s
+        # to go yellow, which is why the timeout matches `observe`'s rather than
+        # `demo`'s. If that is not what you want, `just examples demo` is the
+        # same propagation walkthrough with nothing behind it.
+        OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+          "${compose[@]}" --profile services --profile observability --profile ui \
+            up -d --build --wait --wait-timeout 900
+        # The collector declares no healthcheck, so compose can only gate it on
+        # `service_started` and `--wait` proves nothing about its config. A
+        # collector that started and then failed its pipeline looks exactly like
+        # a healthy stack silently dropping everything, which is the failure the
+        # profile was rebuilt to stop happening quietly.
+        health="http://127.0.0.1:${OTEL_HEALTH_PORT:-13133}"
+        for _ in $(seq 30); do
+          if curl -fsS "$health" >/dev/null 2>&1; then break; fi
+          sleep 1
+        done
+        if ! curl -fsS "$health" >/dev/null 2>&1; then
+          echo "the OTLP collector is not answering on $health after 30s" >&2
+          echo "logs: docker compose -f examples/compose.yaml logs otel-collector" >&2
+          exit 1
+        fi
+        examples/kibana-dashboard.sh
+        # Volume on top of the assertions: one product leaves the latency
+        # histograms with a single observation each, which renders in Kibana as
+        # something that looks broken.
+        VOLUME_PRODUCTS="${VOLUME_PRODUCTS:-12}" examples/smoke.sh
+        echo ""
+        echo "The whole stack is running:"
+        echo "  order     http://127.0.0.1:3001/swagger-ui"
+        echo "  product   http://127.0.0.1:3002/swagger-ui"
+        echo "  Kibana    http://127.0.0.1:${KIBANA_PORT:-5601}/app/dashboards#/view/kafkaman-telemetry-dashboard?_g=(time:(from:now-4h,to:now),filters:!())"
+        echo "  APM       http://127.0.0.1:${KIBANA_PORT:-5601}/app/apm/services?rangeFrom=now-4h&rangeTo=now&environment=ENVIRONMENT_ALL"
+        echo "  messages  http://127.0.0.1:${CONSOLE_PORT:-8080}"
+        echo ""
+        echo "APM Trace samples show the product-to-order waterfall in one trace."
+        echo "The dashboard separates traces, Kafka handoffs, queue metrics, and"
+        echo "service logs so Discover's mixed OTel data view does not read like"
+        echo "log spam. Linked-mode handoff URLs: just examples handoffs"
+        echo ""
+        echo "Tear it down with: just examples down"
+        ;;
       demo)
         # The `services` profile pulls in the one-shot `provision` container,
         # which both services gate on; `--wait` treats its clean exit as
@@ -199,8 +251,8 @@ examples arg="demo":
           "${compose[@]}" --profile services --profile observability \
             up -d --build --wait --wait-timeout 900
         # `--wait` proves the collector container started, not that it is
-        # listening: the image is distroless, so no healthcheck can run inside it
-        # and compose has to gate on `service_started`. Probe the health
+        # listening: it declares no healthcheck, so compose has to gate on
+        # `service_started`. Probe the health
         # extension from here instead. A collector that started and then failed
         # its configuration looks like a healthy stack silently dropping
         # everything, which is precisely the failure this profile was rebuilt to
@@ -215,18 +267,19 @@ examples arg="demo":
           echo "logs: docker compose -f examples/compose.yaml logs otel-collector" >&2
           exit 1
         fi
+        examples/kibana-dashboard.sh
         examples/smoke.sh
         echo ""
         echo "The observed stack is still running:"
         echo "  order    http://127.0.0.1:3001/swagger-ui"
         echo "  product  http://127.0.0.1:3002/swagger-ui"
-        echo "  Kibana   http://127.0.0.1:${KIBANA_PORT:-5601}"
+        echo "  Kibana   http://127.0.0.1:${KIBANA_PORT:-5601}/app/dashboards#/view/kafkaman-telemetry-dashboard?_g=(time:(from:now-4h,to:now),filters:!())"
+        echo "  APM      http://127.0.0.1:${KIBANA_PORT:-5601}/app/apm/services?rangeFrom=now-4h&rangeTo=now&environment=ENVIRONMENT_ALL"
         echo "  message UI:  just examples ui"
         echo ""
-        echo "Kibana ships with no data view for the kafkaman signals yet, so it"
-        echo "opens empty. Discover -> create a data view over '*-generic.otel-*',"
-        echo "which covers all three signals the collector writes; a packaged"
-        echo "dashboard is still pending (wiki/plans/opentelemetry-completion.plan.md)."
+        echo "One product's worth of telemetry, so the histograms have a single"
+        echo "observation each. 'just examples all' drives volume as well."
+        echo "Linked-mode handoff URLs: just examples handoffs"
         echo ""
         echo "Tear it down with: just examples down"
         ;;
@@ -257,10 +310,46 @@ examples arg="demo":
         echo "Redpanda Console  http://127.0.0.1:${CONSOLE_PORT:-8080}"
         echo "  Topics -> products / orders to read the snapshots the services exchange."
         ;;
+      handoffs)
+        # For linked Kafka trace handoff mode, Kibana APM shows async span links
+        # but does not reliably turn the producer-side link count into a
+        # downstream consumer waterfall URL. This helper joins the indexed link
+        # documents and prints both URLs.
+        #
+        # Checked here rather than left to curl: without the observability
+        # profile the helper's first request fails with a connection error that
+        # says nothing about which command to run instead.
+        es="http://127.0.0.1:${ELASTICSEARCH_PORT:-9200}"
+        if ! curl -fsS -o /dev/null --max-time 5 "$es/_cluster/health"; then
+          echo "no Elasticsearch on $es" >&2
+          echo "start the telemetry backend first: just examples all (or observe)" >&2
+          exit 1
+        fi
+        examples/trace-handoffs.sh
+        ;;
+      telemetry-test)
+        # The automated counterpart to `observe`: not a stack to look at, but the
+        # gate that proves the example *binaries* install telemetry and flush it
+        # on shutdown. `tests/distributed-cache` starts the same services as
+        # library calls and so never reaches `main.rs`, which is where
+        # `kafkaman_otel::init` and `Telemetry::shutdown()` live.
+        #
+        # Its own containers, through testcontainers — this does not attach to
+        # whatever compose has running, and does not care whether anything is up.
+        cargo build -p example-order -p example-product
+        target=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+        # Passed in rather than discovered: `CARGO_BIN_EXE_*` is only defined for
+        # integration tests of the package declaring the binary, so the test
+        # cannot find these itself. It fails rather than skips when they are
+        # unset, which is why this recipe is the documented way to run it.
+        EXAMPLE_ORDER_BIN="$target/debug/order" \
+        EXAMPLE_PRODUCT_BIN="$target/debug/product" \
+          cargo test -p example-telemetry-tests --test binary_telemetry -- --nocapture
+        ;;
       logs)  "${compose[@]}" --profile services logs -f order product ;;
       # `-v` so the next start is genuinely clean: the volumes hold the Postgres
       # data directory and Redpanda's log, and provisioning is what rebuilds
       # both.
       down)  "${compose[@]}" --profile services --profile ui --profile observability down -v ;;
-      *) echo "usage: just examples [demo|observe|up|ui|logs|down]" >&2; exit 1 ;;
+      *) echo "usage: just examples [all|demo|observe|up|ui|handoffs|telemetry-test|logs|down]" >&2; exit 1 ;;
     esac

@@ -80,8 +80,8 @@ pub(crate) struct DecodedRecord<P> {
 /// Decode one record's payload and reserved metadata into an [`Envelope`].
 ///
 /// Takes headers the caller has already decoded rather than decoding them
-/// itself. That is not a micro-optimization: the ingest span links to the
-/// producer's trace, which lives in those headers, and the span has to be open
+/// itself. That is not a micro-optimization: the ingest span's producer
+/// handoff uses the trace context in those headers, and the span has to be open
 /// before the decode it exists to describe. Scanning the header list once and
 /// handing the result to both is what lets the ordering be right without paying
 /// for a second pass on every record.

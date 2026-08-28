@@ -134,25 +134,38 @@ services:
   # memory and a user should not have to run it just to see two services
   # exchange snapshots.
   #
-  # The services export OTLP/HTTP to the collector, which writes to
-  # Elasticsearch: OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318.
+  # The services export OTLP/HTTP to Elastic Agent running in OTel collector
+  # mode, which writes to Elasticsearch:
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318.
   #
   # They used to export straight to Elasticsearch's native `/_otlp` endpoint,
-  # and that silently lost two thirds of the telemetry. See the collector's own
-  # comment header, examples/otel-collector.yaml, for the measurements.
+  # and that silently lost two thirds of the telemetry. The next collector was
+  # the upstream contrib image, which preserved the three raw OTel signals but
+  # did not carry Elastic's APM enrichment components. Elastic Agent in OTel mode
+  # does, so Kibana's Applications/APM views can use the same local telemetry.
+  # See examples/otel-collector.yaml for the pipeline details.
+  #
+  # It is not a free swap: the Elastic Agent image is an order of magnitude
+  # larger than the contrib collector's, on top of Elasticsearch's own gigabyte
+  # of heap. `just examples demo` remains the arm that pays for none of it.
+  # `ELASTIC_VERSION` moves this image, Elasticsearch, and Kibana together,
+  # because a collector newer or older than the stack it writes to is a class of
+  # failure nobody should have to debug in an example.
   otel-collector:
     profiles: ["observability"]
-    image: otel/opentelemetry-collector-contrib:${OTEL_COLLECTOR_VERSION:-0.159.0}
-    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    image: ${ELASTIC_AGENT_IMAGE:-docker.elastic.co/elastic-agent/elastic-agent:${ELASTIC_VERSION:-9.3.5}}
+    command: ["--config", "/etc/otelcol/config.yaml"]
     volumes:
-      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    environment:
+      ELASTIC_AGENT_OTEL: "true"
+      STORAGE_DIR: /usr/share/elastic-agent
     ports:
       # 4318 is OTLP/HTTP. Published so a service running on the host under
       # `just examples up` can export to the same collector as the containers.
       - "${OTLP_HTTP_PORT:-4318}:4318"
       # The health_check extension, for a human or a script. Compose cannot use
-      # it: the collector image is distroless, so no healthcheck can run inside
-      # the container.
+      # it, since this container declares no healthcheck of its own.
       - "${OTEL_HEALTH_PORT:-13133}:13133"
     depends_on:
       elasticsearch:
@@ -282,8 +295,11 @@ services:
       elasticsearch:
         condition: service_healthy
         required: false
-      # `service_started` rather than `service_healthy` because the image is
-      # distroless and cannot be probed from inside. The race it leaves is
+      # `service_started` rather than `service_healthy` because this container
+      # declares no healthcheck, so there is no health for compose to wait on.
+      # The recipes probe the health extension from the host instead — a
+      # collector that started and then failed its pipelines is exactly what a
+      # started-but-unhealthy stack looks like. The race that leaves is
       # closed in practice by the Elasticsearch gate above: both wait on that,
       # and the collector binds its listener in milliseconds while a service
       # still has to connect to Postgres, migrate, and verify its topics.
@@ -366,8 +382,11 @@ services:
       elasticsearch:
         condition: service_healthy
         required: false
-      # `service_started` rather than `service_healthy` because the image is
-      # distroless and cannot be probed from inside. The race it leaves is
+      # `service_started` rather than `service_healthy` because this container
+      # declares no healthcheck, so there is no health for compose to wait on.
+      # The recipes probe the health extension from the host instead — a
+      # collector that started and then failed its pipelines is exactly what a
+      # started-but-unhealthy stack looks like. The race that leaves is
       # closed in practice by the Elasticsearch gate above: both wait on that,
       # and the collector binds its listener in milliseconds while a service
       # still has to connect to Postgres, migrate, and verify its topics.

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use kafkaman_core::{ClaimedOutboxRow, OutboxStatus};
 use sqlx::{Postgres, Transaction};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::outbox_mark::row_from_pg;
@@ -20,6 +21,7 @@ use crate::{OutboxTable, Result};
 /// `mark_publish_failed` match on `(message_id, claim_id)`, so a row reclaimed
 /// by another worker after a lease expiry still rejects the original worker's
 /// late mark.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn claim_batch(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
@@ -73,6 +75,11 @@ pub async fn claim_batch(
         .bind(worker_id)
         .bind(lease_for.as_secs_f64())
         .fetch_all(&mut **tx)
+        .instrument(kafkaman_core::db_poll_span!(
+            "UPDATE",
+            table.qualified_name(),
+            "claim outbox batch",
+        ))
         .await?;
 
     let mut claimed = Vec::with_capacity(rows.len());
@@ -119,6 +126,7 @@ pub async fn claim_batch(
 ///
 /// This is one statement per relay cycle, not per row, and it must be separate
 /// from the claim below: a data-modifying CTE would not see its own writes.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn collapse_stale_pending_rows(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
@@ -127,6 +135,11 @@ async fn collapse_stale_pending_rows(
     sqlx::query(&collapse_stale_pending_rows_sql_impl(table))
         .bind(limit)
         .execute(&mut **tx)
+        .instrument(kafkaman_core::db_poll_span!(
+            "UPDATE",
+            table.qualified_name(),
+            "collapse stale pending outbox rows",
+        ))
         .await?;
     Ok(())
 }

@@ -23,8 +23,8 @@ mod serde_enum;
 pub use config::{Config, FromConfigValue};
 pub use error::{ConfigError, ConfigErrors, ConfigIssue};
 pub use observability::{
-    HeaderLogging, LifecycleLogging, ObservabilityConfig, ObservabilityLevel, ObservabilityPolicy,
-    ObservabilityPolicyOverride, PayloadLogging,
+    HeaderLogging, KafkaTraceHandoff, LifecycleLogging, ObservabilityConfig, ObservabilityLevel,
+    ObservabilityPolicy, ObservabilityPolicyOverride, PayloadLogging,
 };
 pub use retry::{DlqMode, RetryConfig, RetryPolicy, RetryPolicyOverride};
 pub use schema::ConfigSchema;

@@ -37,96 +37,22 @@
 #![cfg(feature = "redpanda")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::time::Duration;
-
-use durable_send_tests::start_redpanda_harness;
-use kafkaman_core::{KafkaMessage, RelayConfig};
-use kafkaman_rdkafka::{RdkafkaConsumer, RdkafkaPublisher};
-use kafkaman_sqlx::{dispatch_once, MessageRouter};
-use observability_tests::{ProductSnapshot, TestResult, TracePipeline};
-use opentelemetry::trace::TraceContextExt;
-use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
+use kafkaman_test::kafkaman_config::KafkaTraceHandoff;
+use observability_tests::{drive_kafka_round_trip, TestResult};
 use uuid::Uuid;
 
 #[tokio::test]
 async fn one_message_produces_two_linked_traces_across_both_durable_gaps() -> TestResult {
-    let (_postgres, _redpanda, brokers, harness) = start_redpanda_harness().await?;
-    let outbox_table = harness.outbox_table::<ProductSnapshot>().await?;
-    let received_table = harness.received_table::<ProductSnapshot>().await?;
-
-    let pipeline = TracePipeline::install();
-
-    // Stands in for the span a host would already have open — an HTTP handler,
-    // a job runner. The point of the enqueue span is that it descends from
-    // whatever the caller was doing, so the trace starts before kafkaman.
-    let caller = tracing::info_span!("test.request");
-    let envelope = ProductSnapshot::envelope("traced-product", "a traced product")
-        .try_with_idempotency_key("traced-product")?;
-    // `.instrument` rather than a held `enter()` guard. The guard is `!Send` and
-    // an entered span left open across an `await` attributes whatever else runs
-    // on the thread to the caller's trace — the exact failure `kafkaman_core`'s
-    // `attach` documentation warns about, and a test that models the wrong
-    // pattern is a test somebody copies.
-    harness
-        .enqueue(&envelope)
-        .instrument(caller.clone())
-        .await?;
-    let caller_trace_id = trace_id_of(&caller);
-
-    // Publish through a real broker, from a loop, exactly as a deployment would.
-    let publisher = RdkafkaPublisher::from_brokers(&brokers)?;
-    let shutdown = CancellationToken::new();
-    let relay = tokio::spawn(kafkaman_worker::run(
-        harness.pool().clone(),
-        publisher,
-        outbox_table,
-        RelayConfig {
-            poll_interval: Duration::from_millis(50),
-            ..RelayConfig::default()
-        },
-        shutdown.clone(),
-    ));
-    await_span(&pipeline, "kafkaman.relay.publish", Duration::from_secs(30)).await;
-    shutdown.cancel();
-    relay.await??;
-
-    // Consume it back, which is where the Kafka half of the propagation lands.
-    let consumer = RdkafkaConsumer::from_brokers(
-        &brokers,
+    // The drive is shared with `trace_parented_handoff`, and the handoff mode is
+    // the only thing the two pass differently. That is the point: if the drive
+    // ever stops exercising the real ingest path, both tests notice.
+    let round_trip = drive_kafka_round_trip(
+        KafkaTraceHandoff::Linked,
         &format!("kafkaman-trace-propagation-{}", Uuid::new_v4()),
-    )?;
-    consumer.subscribe(&[ProductSnapshot::TOPIC])?;
-    let ingest_shutdown = CancellationToken::new();
-    let ingester = {
-        let pool = harness.pool().clone();
-        let cfg = harness.config();
-        let token = ingest_shutdown.clone();
-        tokio::spawn(async move {
-            consumer
-                .run_ingester::<ProductSnapshot>(&pool, &cfg, Duration::from_millis(50), token)
-                .await
-        })
-    };
-    // Stopped once its span exists, rather than after an interval someone
-    // guessed at — the span is the thing under test and also the completion
-    // signal.
-    await_span(&pipeline, "kafkaman.ingest", Duration::from_secs(30)).await;
-    ingest_shutdown.cancel();
-    let ingest_stats = ingester.await??;
-    assert_eq!(ingest_stats.consumed, 1, "one record was published");
-
-    // Dispatch it, which crosses the second durable gap.
-    let router = MessageRouter::new()
-        .handler::<ProductSnapshot>(|_conn, _meta, _msg| Box::pin(async move { Ok(()) }));
-    let dispatch = dispatch_once(
-        harness.pool(),
-        &received_table,
-        &router,
-        time::OffsetDateTime::now_utc(),
     )
     .await?;
-    assert_eq!(dispatch.processed, 1, "the handler ran");
+    let pipeline = &round_trip.pipeline;
+    let caller_trace_id = round_trip.caller_trace_id;
 
     // --- The shape ---
 
@@ -185,25 +111,4 @@ async fn one_message_produces_two_linked_traces_across_both_durable_gaps() -> Te
     );
 
     Ok(())
-}
-
-/// The trace id a `tracing` span belongs to.
-fn trace_id_of(span: &tracing::Span) -> opentelemetry::trace::TraceId {
-    use tracing_opentelemetry::OpenTelemetrySpanExt;
-    span.context().span().span_context().trace_id()
-}
-
-/// Poll until a span with `name` has been recorded.
-///
-/// The relay runs on its own schedule; waiting for the artifact it produces is
-/// the only thing this test can honestly wait on.
-async fn await_span(pipeline: &TracePipeline, name: &str, within: Duration) {
-    let deadline = std::time::Instant::now() + within;
-    while !pipeline.has_span(name) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no {name} span was recorded within {within:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }

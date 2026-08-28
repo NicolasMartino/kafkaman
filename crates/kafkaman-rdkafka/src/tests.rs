@@ -46,8 +46,8 @@ fn record(headers: OwnedHeaders) -> OwnedMessage {
 ///
 /// The two halves travel together because they come out of one pass over the
 /// headers and because the tests below care about the pair: the producer context
-/// the ingest span links to, and the user headers left once the reserved and
-/// trace namespaces have been stripped.
+/// the ingest span uses for Kafka trace handoff, and the user headers left once
+/// the reserved and trace namespaces have been stripped.
 struct Ingested {
     envelope: Envelope<ProductSnapshot>,
     producer_trace: Option<TraceContext>,
@@ -268,7 +268,7 @@ fn a_malformed_traceparent_costs_the_trace_and_nothing_else() {
 /// first. The direction is what makes it a rule rather than an accident — the
 /// later copy of a `traceparent` is either a mistake or an attempt to move a
 /// message into a trace it does not belong to, and a consumer that took it would
-/// link its ingest span to whichever trace an attacker preferred.
+/// attach its ingest span to whichever trace an attacker preferred.
 #[test]
 fn a_duplicated_traceparent_keeps_the_first_copy() {
     const FIRST: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";

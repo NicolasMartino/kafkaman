@@ -16,6 +16,8 @@ members = [
     "tests/durable-send",
     "tests/distributed-cache",
     "tests/observability",
+    "tests/otlp-capture",
+    "tests/example-telemetry",
 ]
 resolver = "2"
 

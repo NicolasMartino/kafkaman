@@ -26,6 +26,7 @@ mod message;
 mod purge_config;
 mod relay_config;
 mod rows;
+mod span;
 mod status;
 mod topics;
 mod trace;
@@ -53,12 +54,21 @@ pub use rows::{
     ClaimedOutboxRow, MarkOutcome, OutboxRow, PublishAck, PublishedRecord, ReceivedError,
     ReceivedMeta, ReceivedRow,
 };
+pub use span::record_error;
 pub use status::{OutboxStatus, ReceiveStatus};
 pub use topics::{
     reconcile, CleanupPolicy, ObservedTopic, PartitionDrift, TopicAction, TopicMode, TopicOutcome,
     TopicSpec,
 };
-pub use trace::{add_link, attach, capture_trace_context, set_parent, TraceContext, TraceScope};
+pub use trace::{
+    add_link, attach, capture_trace_context, capture_trace_context_of, set_parent, TraceContext,
+    TraceScope,
+};
+
+/// Re-exported so [`db_span!`] and [`db_poll_span!`] expand without the calling
+/// crate needing `tracing` in its own dependency list.
+#[doc(hidden)]
+pub use tracing as __tracing;
 
 #[cfg(test)]
 mod tests;

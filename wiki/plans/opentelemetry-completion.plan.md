@@ -1,7 +1,7 @@
 # OpenTelemetry Completion Plan
 
 - Document Class: Plan
-- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25 and corrected across two review passes on 2026-08-25/26; Phase 4's example pipeline and compose profile ported 2026-08-27, its end-to-end exit run the same day (it failed, and the fix is recorded in Phase 4), leaving only a packaged Kibana data view and dashboard outstanding
+- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25 and corrected across two review passes on 2026-08-25/26; Phase 4's example pipeline and compose profile ported 2026-08-27, its end-to-end exit run the same day (it failed, and the fix is recorded in Phase 4), the data view shipped 2026-08-29 with `just examples all`, leaving only a packaged Kibana dashboard outstanding
 - Date: 2026-08-25
 - Category: Observability execution
 - Scope: Turns M6's OpenTelemetry instrumentation into a working, verified, exportable telemetry pipeline — metrics, traces, and logs — and proves it end to end against a real backend.
@@ -340,8 +340,9 @@ instrument names, span names, and log lines on the wire.
    an extension of a working stack, not a new one — a material scope reduction.
    The example exports **directly to Elasticsearch over OTLP/HTTP** with no
    collector; the collector is documented as the production topology. Rationale
-   in `wiki/decisions/telemetry-backend-and-example-topology.decision.md`. A
-   Kibana dashboard artifact is still pending.
+   in `wiki/decisions/telemetry-backend-and-example-topology.decision.md`.
+   Superseded 2026-08-29: `examples/kibana-dashboard.sh` now creates the
+   dashboard artifact as part of `just examples all` and `just examples observe`.
 
    **Reversed 2026-08-27.** The direct path silently discarded traces and logs;
    the example now runs an OTLP collector in the `observability` profile. See
@@ -380,10 +381,47 @@ instruments arriving (the two absent are error counters, correct on a healthy
 run), all four span names across both services, span links joining the trace
 across the Kafka hop, logs arriving, zero export errors.
 
-**Exit still pending, narrowed:** a packaged Kibana data view and dashboard. The
-data is now all present and reachable — a data view over `*-generic.otel-*`
-covers all three signals — but Kibana still opens empty, and shipping that view
-is what remains of this exit.
+**The data view shipped 2026-08-29.** `examples/kibana-data-view.sh` creates a
+`kafkaman telemetry` view over `*-generic.otel-*` — the pattern the collector's
+`otel` mapping mode writes all three signals to — and both `just examples all`
+and `just examples observe` run it after Kibana reports available. It asks the
+data-views API what exists before creating, because that API does not treat a
+repeated title as a conflict and would otherwise accumulate duplicate views
+across runs. Kibana has a usable entry point without forcing users into raw
+Discover first.
+
+The same change added `just examples all`, which is now the default arm: every
+profile at once, plus an unasserted volume phase in `examples/smoke.sh` driving
+twelve further products through the propagation path. That phase exists for this
+exit specifically — one product leaves each latency histogram with a single
+observation, which is indistinguishable in Kibana from an instrument that is
+broken.
+
+**The binary-level proof landed 2026-08-29.** Until then this phase's only
+evidence that the examples' own telemetry wiring worked was a manual `just
+examples observe` run. `tests/example-telemetry` now runs both example binaries
+as child processes against a local OTLP receiver, drives a real two-service flow,
+stops them with SIGINT, and asserts all three signals arrived from both
+`service.name` resources — with every export schedule pushed past the test's
+lifetime, so anything captured was forced out by `Telemetry::shutdown()`.
+`just examples telemetry-test`, 23.6s. See
+`wiki/plans/example-telemetry-integration-tests.plan.md`.
+
+It found one thing worth recording here: dropping `Telemetry` does not flush.
+The `shutdown()` call this phase's contract asks for is load-bearing, not
+belt-and-braces, and a binary that omits it loses everything it recorded.
+
+**The dashboard shipped 2026-08-29.** `examples/kibana-dashboard.sh` creates
+three saved Discover panels — recent kafkaman traces, queue metrics, and service
+logs — then embeds them in the `kafkaman telemetry` dashboard. It deliberately
+does not include a mixed-signal panel: the shared data view is dominated by
+metric documents, so putting all signals in one table recreates the exact
+confusion the dashboard exists to remove. Follow-up debugging widened the saved
+dashboard time range to four hours, because traces and logs are produced by the
+startup/smoke traffic while queue metrics continue after the smoke run. Both
+`just examples all` and `just examples observe` now run the dashboard script.
+Remaining dashboard work, if any, is visual polish on top of the saved-search
+panels rather than basic discoverability.
 
 ## Phase 5 — The Test Suite
 

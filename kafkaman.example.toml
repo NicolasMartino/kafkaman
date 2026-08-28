@@ -76,6 +76,11 @@ payload = "off"
 # RESERVED. Same status as `payload`: no code path emits arbitrary user headers today.
 # Accepted: off, kafkaman-only, all. Default kafkaman-only.
 headers = "kafkaman-only"
+# LIVE. How consumer ingest spans relate to a propagated Kafka producer context.
+# "linked" follows OpenTelemetry messaging semantics and is batch-safe. "parented"
+# is an opt-in for single-record flows where your backend should draw one
+# distributed waterfall across the broker hop. Default linked.
+kafka_trace_handoff = "linked"
 # LIVE, and only meaningful with lifecycle = "per-message". Fraction of successes that
 # get an event. Sampling is deterministic and proportional, not random: after N
 # successes exactly floor(N * sample_success) events have been emitted — never more than

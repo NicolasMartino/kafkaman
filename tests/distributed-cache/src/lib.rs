@@ -10,8 +10,20 @@
 //! altitude for library behaviour and the wrong one for *wiring*: a dispatcher
 //! that is never spawned, a `CreateCacheTable` missing from a changelog, or a
 //! topic that does not match passes every one of those tests. This fixture
-//! starts both example services exactly as their binaries do and drives them
+//! starts both example services the way their binaries do and drives them
 //! over HTTP only.
+//!
+//! # What it deliberately does not cover
+//!
+//! It calls `example_order::start` and `example_product::start_with` rather than
+//! running the binaries, so it never executes `main.rs` — which is where
+//! `kafkaman_otel::init` is called, the signal is handled, and
+//! `Telemetry::shutdown()` is sequenced after the drain. Telemetry assertions
+//! therefore do not belong here, and adding them would make this suite worse:
+//! both services run in one process, OpenTelemetry subscribers and providers are
+//! process-global, and installing them here would test a topology no operator
+//! runs. `tests/example-telemetry` owns that proof and runs the binaries as
+//! child processes.
 //!
 //! # Container ownership
 //!

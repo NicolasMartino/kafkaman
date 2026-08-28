@@ -83,12 +83,18 @@ HTTP and nothing else, which is the only tier at which a wiring mistake — a
 dispatcher never spawned, a cache table missing from a changelog — is visible.
 It runs the whole lifecycle against the builder path and a hand-wired one.
 
-To watch it happen rather than read about it, `just examples demo` builds both services,
+To watch it happen rather than read about it, `just examples` builds both services,
 starts them against Postgres and Redpanda, and walks the lifecycle: an order is
 fulfilled on one service and availability drops on the other, two hops away,
 with no call between them. Each service serves a Swagger UI describing its own
-endpoints, and `just examples ui` adds Redpanda Console for reading the
-snapshots actually on the wire.
+endpoints, Redpanda Console reads the snapshots actually on the wire, and Kibana
+opens on the OpenTelemetry metrics, traces and logs the two services emitted
+doing it. The example config sets `observability.defaults.kafka_trace_handoff =
+"parented"`, so APM trace samples show the product-to-order path as one
+distributed waterfall; the library default stays `linked`, which is what
+messaging semantic conventions prescribe for batch-shaped consumers. `just
+examples demo` is the same walkthrough without the telemetry backend, for when
+Docker is tight on memory.
 
 ## Current Status
 

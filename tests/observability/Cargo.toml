@@ -65,6 +65,10 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "trace",
 ] }
 prost = "0.14"
+# The capture server `otlp_wire` used to carry privately. Shared since the
+# example telemetry gate needed the same thing, and a second hand-rolled HTTP
+# capture server is how two subtly different ones appear.
+otlp-capture = { path = "../otlp-capture" }
 # An HTTP client, because the point of `admin_http` is the hop the router-level
 # tests skip. Already in the tree behind the OTLP exporter, so it costs nothing
 # to compile.

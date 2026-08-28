@@ -10,6 +10,11 @@
 //! suite, so it gets its own binary per concern rather than sharing one with
 //! tests that do not care.
 //!
+//! What it asserts is kafkaman's own telemetry — instrument and span names,
+//! attributes, propagation, and the OTLP wire format — independent of whichever
+//! example currently ships. The example *binaries'* telemetry lifecycle is a
+//! different question with a different owner: `tests/example-telemetry`.
+//!
 //! Assertion helpers legitimately panic, so the workspace's no-panic lints are
 //! relaxed here, matching the durable-send suite.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -438,5 +443,175 @@ impl TracePipeline {
     /// Whether any span with this name has been recorded.
     pub fn has_span(&self, name: &str) -> bool {
         self.finished().iter().any(|span| span.name == name)
+    }
+}
+
+/// One message driven through both durable gaps and a real broker.
+///
+/// The drive is shared by `trace_propagation` and `trace_parented_handoff`
+/// because the *only* thing those two tests disagree about is the shape they
+/// expect at the broker hop. Two copies of the drive would let one of them start
+/// exercising a different path than the other while both still passed, which is
+/// precisely the confusion the pair exists to prevent.
+#[cfg(feature = "redpanda")]
+#[derive(Debug)]
+pub struct KafkaRoundTrip {
+    /// The installed pipeline, holding every span the drive produced.
+    ///
+    /// Kept alive by the caller: dropping it shuts the provider down, and a
+    /// flush after that collects nothing.
+    pub pipeline: TracePipeline,
+    /// The trace the caller's span opened, which `kafkaman.enqueue` must join.
+    pub caller_trace_id: opentelemetry::trace::TraceId,
+}
+
+/// Enqueue one message, relay it through Redpanda, ingest it, and dispatch it.
+///
+/// `handoff` is the consumer-side policy under test. `consumer_group` must be
+/// unique per run: a shared group splits the single partition and the loser idles
+/// while reporting healthy.
+///
+/// Returns once every span exists. The containers are dropped before returning —
+/// everything the assertions read is already in the pipeline's memory.
+#[cfg(feature = "redpanda")]
+pub async fn drive_kafka_round_trip(
+    handoff: kafkaman_test::kafkaman_config::KafkaTraceHandoff,
+    consumer_group: &str,
+) -> TestResult<KafkaRoundTrip> {
+    use durable_send_tests::start_redpanda_harness;
+    use kafkaman_core::KafkaMessage;
+    use kafkaman_rdkafka::{RdkafkaConsumer, RdkafkaPublisher};
+    use kafkaman_sqlx::{dispatch_once, MessageRouter};
+    use tracing::Instrument as _;
+
+    let (_postgres, _redpanda, brokers, harness) = start_redpanda_harness().await?;
+    let outbox_table = harness.outbox_table::<ProductSnapshot>().await?;
+    let received_table = harness.received_table::<ProductSnapshot>().await?;
+
+    let pipeline = TracePipeline::install();
+
+    // Stands in for the span a host would already have open — an HTTP handler,
+    // a job runner. The point of the enqueue span is that it descends from
+    // whatever the caller was doing, so the trace starts before kafkaman.
+    let caller = tracing::info_span!("test.request");
+    let envelope = ProductSnapshot::envelope("traced-product", "a traced product")
+        .try_with_idempotency_key("traced-product")?;
+    // `.instrument` rather than a held `enter()` guard. The guard is `!Send` and
+    // an entered span left open across an `await` attributes whatever else runs
+    // on the thread to the caller's trace — the exact failure `kafkaman_core`'s
+    // `attach` documentation warns about, and a helper that models the wrong
+    // pattern is a helper somebody copies.
+    harness
+        .enqueue(&envelope)
+        .instrument(caller.clone())
+        .await?;
+    let caller_trace_id = trace_id_of(&caller);
+
+    // Publish through a real broker, from a loop, exactly as a deployment would.
+    let publisher = RdkafkaPublisher::from_brokers(&brokers)?;
+    let shutdown = CancellationToken::new();
+    let relay = tokio::spawn(kafkaman_worker::run(
+        harness.pool().clone(),
+        publisher,
+        outbox_table,
+        RelayConfig {
+            poll_interval: Duration::from_millis(50),
+            ..RelayConfig::default()
+        },
+        shutdown.clone(),
+    ));
+    await_span(&pipeline, "kafkaman.relay.publish", Duration::from_secs(30)).await;
+    shutdown.cancel();
+    relay.await??;
+
+    // Consume it back, which is where the Kafka half of the propagation lands.
+    let consumer = RdkafkaConsumer::from_brokers(&brokers, consumer_group)?;
+    consumer.subscribe(&[ProductSnapshot::TOPIC])?;
+
+    let mut cfg = harness.config();
+    cfg.observability.defaults.kafka_trace_handoff = handoff;
+
+    let ingest_shutdown = CancellationToken::new();
+    let ingester = {
+        let pool = harness.pool().clone();
+        let token = ingest_shutdown.clone();
+        tokio::spawn(async move {
+            consumer
+                .run_ingester::<ProductSnapshot>(&pool, &cfg, Duration::from_millis(50), token)
+                .await
+        })
+    };
+    // Stopped once its span exists, rather than after an interval someone
+    // guessed at — the span is the thing under test and also the completion
+    // signal.
+    await_span(&pipeline, "kafkaman.ingest", Duration::from_secs(30)).await;
+    ingest_shutdown.cancel();
+    let ingest_stats = ingester.await??;
+    assert_eq!(ingest_stats.consumed, 1, "one record was published");
+
+    // Dispatch it, which crosses the second durable gap.
+    let router = MessageRouter::new()
+        .handler::<ProductSnapshot>(|_conn, _meta, _msg| Box::pin(async move { Ok(()) }));
+    let dispatch = dispatch_once(
+        harness.pool(),
+        &received_table,
+        &router,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
+    assert_eq!(dispatch.processed, 1, "the handler ran");
+
+    // The `kafkaman::internal` debug tier must be live for this drive, because
+    // that is what makes the assertions downstream a regression test for it.
+    //
+    // It is live because `TracePipeline` installs no filter — and this fails
+    // loudly if that ever changes, rather than letting the coverage evaporate
+    // silently. Twice during its introduction the tier moved the stored trace
+    // context off the phase span and onto a private function, so what these
+    // tests prove *while it is on* is the whole point.
+    //
+    // Detected structurally rather than by name: every deliberate span is
+    // `kafkaman.*`, `db.query <summary>`, or `METHOD /route`, so a bare
+    // identifier can only have come from `#[instrument]` on a function. That
+    // survives the renames the compatibility note promises.
+    assert!(
+        pipeline
+            .finished()
+            .iter()
+            .any(|span| !span.name.contains('.') && !span.name.contains(' ')),
+        "no internal-tier span was recorded, so these assertions no longer cover \
+         the interaction that broke the durable trace context twice. Recorded: {:?}",
+        pipeline
+            .finished()
+            .iter()
+            .map(|span| span.name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    Ok(KafkaRoundTrip {
+        pipeline,
+        caller_trace_id,
+    })
+}
+
+/// The trace id a `tracing` span belongs to.
+pub fn trace_id_of(span: &tracing::Span) -> opentelemetry::trace::TraceId {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    span.context().span().span_context().trace_id()
+}
+
+/// Poll until a span with `name` has been recorded.
+///
+/// The relay runs on its own schedule; waiting for the artifact it produces is
+/// the only thing a caller can honestly wait on.
+pub async fn await_span(pipeline: &TracePipeline, name: &str, within: Duration) {
+    let deadline = Instant::now() + within;
+    while !pipeline.has_span(name) {
+        assert!(
+            Instant::now() < deadline,
+            "no {name} span was recorded within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

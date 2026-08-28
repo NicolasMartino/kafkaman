@@ -25,6 +25,7 @@ use crate::{OutboxTable, Result};
 /// `FOR UPDATE SKIP LOCKED` keeps a sweep from blocking, or being blocked by, a
 /// relay working the same table: a row another transaction holds is left for the
 /// next batch rather than waited on.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn purge_outbox_once(
     pool: &PgPool,
     table: &OutboxTable,

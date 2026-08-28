@@ -80,8 +80,9 @@ pub struct ReceivedRow {
     /// W3C trace context of the ingest that stored this row, restored when it is
     /// dispatched. `None` when nothing was tracing at ingest.
     ///
-    /// The ingest span's own context rather than the producer's: ingest links to
-    /// the producer, dispatch descends from ingest.
+    /// The ingest span's own context rather than the producer's: however ingest
+    /// relates to the producer at the Kafka boundary, dispatch descends from
+    /// ingest.
     #[serde(default, with = "crate::trace::optional_trace_context")]
     pub trace: Option<TraceContext>,
     pub occurred_at: OffsetDateTime,

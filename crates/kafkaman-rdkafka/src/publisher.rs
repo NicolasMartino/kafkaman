@@ -49,9 +49,28 @@ impl RdkafkaPublisher {
         Ok(Self::new(producer))
     }
 
+    /// Publish `row`, capturing the current span as the context on the wire.
+    ///
+    /// Prefer [`Self::publish_row_traced`] from inside a call chain: what
+    /// "current" means here depends on what has been opened above it.
     pub async fn publish_row(&self, row: &ClaimedOutboxRow) -> Result<PublishAck> {
+        self.publish_row_traced(row, kafkaman_core::capture_trace_context())
+            .await
+    }
+
+    /// Publish `row` with `trace` as the context written to the wire.
+    ///
+    /// Naming the context rather than reading the ambient one is what keeps the
+    /// `traceparent` other services parse pointing at `kafkaman.relay.publish`,
+    /// whatever gets opened between that span and this call.
+    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    pub async fn publish_row_traced(
+        &self,
+        row: &ClaimedOutboxRow,
+        trace: Option<kafkaman_core::TraceContext>,
+    ) -> Result<PublishAck> {
         let payload = serde_json::to_vec(&row.row.payload)?;
-        let managed = managed_headers(row)?;
+        let managed = managed_headers(row, trace)?;
 
         let mut headers = OwnedHeaders::new();
         // User headers first, kafkaman's second: a user header cannot occupy a
@@ -135,7 +154,10 @@ pub(crate) fn is_trace_header(key: &str) -> bool {
 /// Two namespaces: the reserved `kafkaman-` keys, and the W3C trace keys, which
 /// deliberately carry no prefix. See
 /// `wiki/decisions/trace-context-propagation-and-w3c-headers.decision.md`.
-fn managed_headers(row: &ClaimedOutboxRow) -> Result<Vec<(&'static str, String)>> {
+fn managed_headers(
+    row: &ClaimedOutboxRow,
+    trace: Option<kafkaman_core::TraceContext>,
+) -> Result<Vec<(&'static str, String)>> {
     let mut managed = vec![
         ("kafkaman-message-id", row.row.message_id.to_string()),
         (
@@ -172,20 +194,20 @@ fn managed_headers(row: &ClaimedOutboxRow) -> Result<Vec<(&'static str, String)>
     // value of the standard is that a consumer which has never heard of kafkaman
     // still recognizes it.
     //
-    // The current span comes first, because the consumer links to *this
-    // publish*, not to the enqueue that preceded it — and the relay has already
-    // parented this span from the context stored at enqueue, so the two are in
-    // the same trace either way.
+    // The current span comes first, because the consumer-side handoff should
+    // point at *this publish*, not at the enqueue that preceded it — and the
+    // relay has already parented this span from the context stored at enqueue,
+    // so the two are in the same trace either way.
     //
     // The stored context is the fallback for the case that produces no current
     // span at all: a build with `traces` off, or a host that installs no tracer.
     // Without it such a relay strips the `traceparent` from every message it
     // forwards, breaking the trace for every downstream service that *is*
     // instrumented — a process opting out of producing spans must not thereby
-    // opt its neighbours out too. What downstream sees then is a link to the
+    // opt its neighbours out too. What downstream sees then is a handoff to the
     // enqueue rather than to the publish: one hop coarser, and still the same
     // trace.
-    if let Some(trace) = kafkaman_core::capture_trace_context().or_else(|| row.row.trace.clone()) {
+    if let Some(trace) = trace.or_else(|| row.row.trace.clone()) {
         managed.push(("traceparent", trace.traceparent().to_owned()));
         if let Some(state) = trace.tracestate() {
             managed.push(("tracestate", state.to_owned()));
@@ -198,7 +220,12 @@ fn managed_headers(row: &ClaimedOutboxRow) -> Result<Vec<(&'static str, String)>
 #[async_trait]
 impl Publisher for RdkafkaPublisher {
     async fn publish(&self, row: &ClaimedOutboxRow) -> std::result::Result<PublishAck, BoxError> {
-        self.publish_row(row)
+        // Captured here, at the trait boundary, and not one call deeper. The
+        // relay instruments *this* call with `kafkaman.relay.publish`, so the
+        // current span is the phase span exactly at this point — and pinning it
+        // here means nothing opened further in can change what goes on the wire.
+        let trace = kafkaman_core::capture_trace_context();
+        self.publish_row_traced(row, trace)
             .await
             .map_err(|err| Box::new(err) as BoxError)
     }

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::{
-    Config, HeaderLogging, LifecycleLogging, ObservabilityLevel, ObservabilityPolicy,
-    PayloadLogging,
+    Config, HeaderLogging, KafkaTraceHandoff, LifecycleLogging, ObservabilityLevel,
+    ObservabilityPolicy, PayloadLogging,
 };
 
 #[test]
@@ -14,6 +14,7 @@ fn observability_config_merges_and_validates_registered_messages() {
         lifecycle = "summary"
         payload = "off"
         headers = "kafkaman-only"
+        kafka_trace_handoff = "linked"
         sample_success = 0.0
         stuck_after = "30s"
         max_queue_age = "5m"
@@ -21,6 +22,7 @@ fn observability_config_merges_and_validates_registered_messages() {
         [observability.messages.order_created]
         level = "debug"
         lifecycle = "per-message"
+        kafka_trace_handoff = "parented"
         sample_success = 0.25
         "#,
     )
@@ -31,11 +33,16 @@ fn observability_config_merges_and_validates_registered_messages() {
     assert_eq!(observability.defaults.lifecycle, LifecycleLogging::Summary);
     assert_eq!(observability.defaults.payload, PayloadLogging::Off);
     assert_eq!(observability.defaults.headers, HeaderLogging::KafkamanOnly);
+    assert_eq!(
+        observability.defaults.kafka_trace_handoff,
+        KafkaTraceHandoff::Linked
+    );
 
     let policy = observability.policy_for("order_created");
     assert_eq!(policy.level, ObservabilityLevel::Debug);
     assert_eq!(policy.lifecycle, LifecycleLogging::PerMessage);
     assert_eq!(policy.payload, PayloadLogging::Off);
+    assert_eq!(policy.kafka_trace_handoff, KafkaTraceHandoff::Parented);
     assert_eq!(policy.sample_success, 0.25);
     assert_eq!(policy.stuck_after, Duration::from_secs(30));
     assert_eq!(policy.max_queue_age, Duration::from_secs(5 * 60));
@@ -99,12 +106,76 @@ fn an_absent_section_resolves_to_the_documented_defaults() {
         ObservabilityPolicy::default(),
         "a type with no override inherits the defaults"
     );
+    assert_eq!(
+        observability
+            .policy_for("order_created")
+            .kafka_trace_handoff,
+        KafkaTraceHandoff::Linked,
+        "omitting the field keeps the OpenTelemetry messaging default"
+    );
     assert!(
         !observability
             .policy_for("order_created")
             .lifecycle_emission()
             .emits_success_event(),
         "the default is silent"
+    );
+}
+
+#[test]
+fn kafka_trace_handoff_defaults_apply_to_every_message() {
+    let cfg = Config::parse(
+        r#"
+        [observability.defaults]
+        kafka_trace_handoff = "parented"
+        "#,
+    )
+    .unwrap();
+
+    let observability = cfg
+        .observability_config(["product_snapshot", "order_snapshot"])
+        .unwrap();
+    assert_eq!(
+        observability
+            .policy_for("product_snapshot")
+            .kafka_trace_handoff,
+        KafkaTraceHandoff::Parented
+    );
+    assert_eq!(
+        observability
+            .policy_for("order_snapshot")
+            .kafka_trace_handoff,
+        KafkaTraceHandoff::Parented
+    );
+}
+
+#[test]
+fn kafka_trace_handoff_override_wins_for_one_message() {
+    let cfg = Config::parse(
+        r#"
+        [observability.defaults]
+        kafka_trace_handoff = "parented"
+
+        [observability.messages.order_snapshot]
+        kafka_trace_handoff = "linked"
+        "#,
+    )
+    .unwrap();
+
+    let observability = cfg
+        .observability_config(["product_snapshot", "order_snapshot"])
+        .unwrap();
+    assert_eq!(
+        observability
+            .policy_for("product_snapshot")
+            .kafka_trace_handoff,
+        KafkaTraceHandoff::Parented
+    );
+    assert_eq!(
+        observability
+            .policy_for("order_snapshot")
+            .kafka_trace_handoff,
+        KafkaTraceHandoff::Linked
     );
 }
 
@@ -144,6 +215,10 @@ fn an_unknown_enum_value_names_the_legal_ones() {
         (
             "[observability.defaults]\nheaders = \"kafkaman\"\n",
             "off, kafkaman-only, or all",
+        ),
+        (
+            "[observability.defaults]\nkafka_trace_handoff = \"continued\"\n",
+            "linked or parented",
         ),
     ] {
         let cfg = Config::parse(source).unwrap();

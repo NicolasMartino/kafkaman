@@ -68,6 +68,7 @@ const NO_HOOKS: Hooks<'static> = std::marker::PhantomData;
 ///
 /// One row per call, not a batch: the caller loops, and a per-row transaction
 /// keeps a single bad handler from rolling back everything else in flight.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn dispatch_once(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -92,6 +93,7 @@ pub async fn dispatch_once(
 /// The sampler is borrowed mutably because its count carries across cycles:
 /// sampling one in ten successes has to mean one in ten over the stream, not one
 /// per call that happens to succeed.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn dispatch_once_sampled(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -104,6 +106,7 @@ pub async fn dispatch_once_sampled(
 
 #[cfg(feature = "internal-hooks")]
 #[doc(hidden)]
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn dispatch_once_with_observer(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -122,9 +125,25 @@ async fn dispatch_once_inner(
     hooks: Hooks<'_>,
     lifecycle: Option<&mut LifecycleSampler>,
 ) -> Result<DispatchStats> {
-    let mut tx = pool.begin().await?;
+    // Debug rather than info, beside `claim_received_row`'s own span: this
+    // transaction opens on every cycle whether or not a row is due, so at the
+    // default filter it would be most of what an idle service exports.
+    let mut tx = pool
+        .begin()
+        .instrument(kafkaman_core::db_poll_span!(
+            "BEGIN",
+            table.qualified_name(),
+            "open received claim transaction"
+        ))
+        .await?;
     let Some(row) = claim_received_row(&mut tx, table, due_at).await? else {
-        tx.commit().await?;
+        tx.commit()
+            .instrument(kafkaman_core::db_poll_span!(
+                "COMMIT",
+                table.qualified_name(),
+                "commit empty received claim transaction"
+            ))
+            .await?;
         return Ok(DispatchStats::default());
     };
 
@@ -135,6 +154,9 @@ async fn dispatch_once_inner(
     // should produce.
     let span = tracing::info_span!(
         "kafkaman.dispatch",
+        "otel.kind" = "consumer",
+        "otel.status_code" = tracing::field::Empty,
+        "otel.status_description" = tracing::field::Empty,
         message_type = row.message_type.as_str(),
         messaging.system = "kafka",
         messaging.destination.name = row.source_topic.as_str(),
@@ -155,9 +177,18 @@ async fn dispatch_once_inner(
     // the trace. A handler that fails does its failure accounting — savepoint
     // rollback, failure record, retry scheduling — after the handler returns,
     // which is exactly the part worth timing when a dispatcher is slow.
-    dispatch_claimed_row(pool, table, router, due_at, hooks, lifecycle, tx, row)
-        .instrument(span)
-        .await
+    let result = dispatch_claimed_row(pool, table, router, due_at, hooks, lifecycle, tx, row)
+        .instrument(span.clone())
+        .await;
+    // Only a dispatch that could not complete at all marks the span failed. A
+    // handler that returns an error and gets a retry scheduled is a *successful*
+    // dispatch cycle by this function's contract — the failure is recorded on the
+    // row and counted in `DispatchStats`, and marking the span ERROR too would
+    // make an APM error rate count work the system is handling as designed.
+    if let Err(err) = &result {
+        kafkaman_core::record_error(&span, err);
+    }
+    result
 }
 
 /// Everything that happens to a row once it is claimed.
@@ -165,6 +196,7 @@ async fn dispatch_once_inner(
 /// Split out so [`dispatch_once_inner`] has one `.instrument` call covering all
 /// of it, rather than a span that each branch has to remember to enter.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn dispatch_claimed_row(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -228,6 +260,35 @@ async fn dispatch_claimed_row(
     }
 }
 
+/// A span for one application handler call.
+///
+/// Until this existed, a slow handler was indistinguishable from slow kafkaman
+/// bookkeeping: both showed as unattributed time inside `kafkaman.dispatch`, and
+/// the handler is the one of the two an operator can do anything about.
+///
+/// `otel.kind` is `internal` rather than `consumer`, deliberately. The consuming
+/// happened at ingest; this span is the application's own work, running inside a
+/// message the process already owns.
+///
+/// `handler.position` distinguishes the pre-upsert hook from the post-upsert
+/// handler. Two values, so it stays a bounded grouping key — and the distinction
+/// matters, because only the pre-upsert position can skip the one after it.
+///
+/// Errors are recorded here rather than on `kafkaman.dispatch`. A handler that
+/// fails and gets a retry scheduled is a *successful* dispatch cycle by
+/// `dispatch_once`'s contract, so the dispatch span stays unmarked; this is the
+/// span that says the handler itself failed.
+fn handler_span(row: &ReceivedRow, position: &'static str) -> tracing::Span {
+    tracing::info_span!(
+        "kafkaman.handler",
+        "otel.kind" = "internal",
+        "otel.status_code" = tracing::field::Empty,
+        "otel.status_description" = tracing::field::Empty,
+        message_type = row.message_type.as_str(),
+        "handler.position" = position,
+    )
+}
+
 /// Where in the cycle a dispatch failed.
 ///
 /// The two are classified differently and must not be conflated: an application
@@ -262,6 +323,7 @@ impl std::fmt::Display for DispatchFailure {
 
 /// Everything inside the savepoint: both handler positions, the cache upsert
 /// between them, and the processed mark.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn converge_and_dispatch(
     tx: &mut Transaction<'_, Postgres>,
     table: &ReceivedTable,
@@ -272,10 +334,17 @@ async fn converge_and_dispatch(
     let meta = ReceivedMeta::from(row);
 
     let flow = match router.before_handler_for(&row.message_type) {
-        Some(before) => before
-            .handle(&mut *tx, meta.clone(), row.payload.clone())
-            .await
-            .map_err(DispatchFailure::Handler)?,
+        Some(before) => {
+            let span = handler_span(row, "before");
+            let result = before
+                .handle(&mut *tx, meta.clone(), row.payload.clone())
+                .instrument(span.clone())
+                .await;
+            if let Err(error) = &result {
+                kafkaman_core::record_error(&span, error);
+            }
+            result.map_err(DispatchFailure::Handler)?
+        }
         None => HandlerFlow::Continue,
     };
 
@@ -292,10 +361,15 @@ async fn converge_and_dispatch(
     let ignored = applied == CacheApplyOutcome::Ignored;
     if flow == HandlerFlow::Continue && !ignored {
         if let Some(handler) = router.handler_for(&row.message_type) {
-            handler
+            let span = handler_span(row, "after");
+            let result = handler
                 .handle(&mut *tx, meta, row.payload.clone())
-                .await
-                .map_err(DispatchFailure::Handler)?;
+                .instrument(span.clone())
+                .await;
+            if let Err(error) = &result {
+                kafkaman_core::record_error(&span, error);
+            }
+            result.map_err(DispatchFailure::Handler)?;
         }
     }
 
@@ -338,6 +412,7 @@ fn emit_success_event(
 /// Record a failure in the transaction that claimed the row.
 ///
 /// Used where nothing has run yet, so there is nothing to unwind.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn record_failure_in_claim_tx(
     mut tx: Transaction<'_, Postgres>,
     table: &ReceivedTable,
@@ -366,6 +441,7 @@ async fn record_failure_in_claim_tx(
 ///
 /// Both failing paths — the handler's own error and a failure applying its
 /// result — need exactly this, and they used to spell it out twice.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn unwind_and_record(
     pool: &PgPool,
     tx: Transaction<'_, Postgres>,

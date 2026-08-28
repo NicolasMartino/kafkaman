@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use example_contracts::{OrderStatus, ProductStatus};
 use kafkaman::sqlx::enqueue;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use utoipa::OpenApi;
@@ -64,6 +65,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/orders/{order_id}/cancel", post(cancel_order))
         .route("/products/{product_id}", get(read_cached_product))
         .with_state(state)
+        .layer(kafkaman::axum::CorrelationLayer::new())
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -180,7 +182,16 @@ async fn create_order(
     }
     let order_id = request.order_id.unwrap_or_else(Uuid::new_v4);
 
-    let mut tx = state.pool.begin().await.map_err(internal("begin"))?;
+    let mut tx = state
+        .pool
+        .begin()
+        .instrument(kafkaman::db_span!(
+            "BEGIN",
+            "orders",
+            "open order write transaction"
+        ))
+        .await
+        .map_err(internal("begin"))?;
 
     // The admission decision and the order row are taken against one snapshot of
     // the cache, inside the transaction that writes the order.
@@ -220,6 +231,7 @@ async fn create_order(
     .bind(String::from(order.status.clone()))
     .bind(order.version)
     .execute(&mut *tx)
+    .instrument(kafkaman::db_span!("INSERT", "orders", "insert order"))
     .await
     .map_err(|err| {
         if is_unique_violation(&err) {
@@ -235,7 +247,14 @@ async fn create_order(
         .await
         .map_err(|err| OrderError::Internal(format!("enqueue snapshot: {err}")))?;
 
-    tx.commit().await.map_err(internal("commit"))?;
+    tx.commit()
+        .instrument(kafkaman::db_span!(
+            "COMMIT",
+            "orders",
+            "commit order write transaction",
+        ))
+        .await
+        .map_err(internal("commit"))?;
     Ok((StatusCode::CREATED, Json(order)))
 }
 
@@ -249,6 +268,7 @@ async fn list_orders(State(state): State<AppState>) -> Result<Json<Vec<OrderReco
         "SELECT {ORDER_COLUMNS} FROM orders ORDER BY created_at, order_id"
     ))
     .fetch_all(&state.pool)
+    .instrument(kafkaman::db_span!("SELECT", "orders", "list orders"))
     .await
     .map_err(internal("list orders"))?;
 
@@ -278,6 +298,7 @@ async fn read_order(
     ))
     .bind(order_id)
     .fetch_optional(&state.pool)
+    .instrument(kafkaman::db_span!("SELECT", "orders", "read order"))
     .await
     .map_err(internal("read order"))?
     .ok_or(OrderError::NotFound)?;
@@ -344,7 +365,16 @@ async fn transition(
     Path(order_id): Path<Uuid>,
     target: OrderStatus,
 ) -> Result<Json<OrderRecord>, OrderError> {
-    let mut tx = state.pool.begin().await.map_err(internal("begin"))?;
+    let mut tx = state
+        .pool
+        .begin()
+        .instrument(kafkaman::db_span!(
+            "BEGIN",
+            "orders",
+            "open order write transaction"
+        ))
+        .await
+        .map_err(internal("begin"))?;
 
     // `FOR UPDATE` so two concurrent transitions of one order serialize. Without
     // it both could read `Placed`, both bump to version 2, and the second insert
@@ -355,6 +385,7 @@ async fn transition(
     ))
     .bind(order_id)
     .fetch_optional(&mut *tx)
+    .instrument(kafkaman::db_span!("SELECT", "orders", "lock order"))
     .await
     .map_err(internal("read order"))?
     .ok_or(OrderError::NotFound)?;
@@ -364,7 +395,14 @@ async fn transition(
     // a retried request must not be an error, and must not enqueue a second
     // snapshot of state nothing changed.
     if current.status == target {
-        tx.commit().await.map_err(internal("commit"))?;
+        tx.commit()
+            .instrument(kafkaman::db_span!(
+                "COMMIT",
+                "orders",
+                "commit order no-op transaction",
+            ))
+            .await
+            .map_err(internal("commit"))?;
         return Ok(Json(current));
     }
     if !is_legal_transition(&current.status, &target) {
@@ -384,6 +422,7 @@ async fn transition(
     .bind(String::from(target))
     .bind(order_id)
     .fetch_one(&mut *tx)
+    .instrument(kafkaman::db_span!("UPDATE", "orders", "transition order"))
     .await
     .map_err(internal("update order"))?;
     let updated = order_from_row(&row).map_err(internal("decode order"))?;
@@ -394,7 +433,14 @@ async fn transition(
         .await
         .map_err(|err| OrderError::Internal(format!("enqueue snapshot: {err}")))?;
 
-    tx.commit().await.map_err(internal("commit"))?;
+    tx.commit()
+        .instrument(kafkaman::db_span!(
+            "COMMIT",
+            "orders",
+            "commit order write transaction",
+        ))
+        .await
+        .map_err(internal("commit"))?;
     Ok(Json(updated))
 }
 

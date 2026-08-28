@@ -4,17 +4,21 @@
 - Status: Accepted
 - Date: 2026-08-25
 - Category: Messaging envelope and observability
-- Scope: Defines how W3C trace context is carried across the outbox hop and the Kafka hop, and amends the two-namespace Kafka header model to recognize W3C trace headers as a third namespace.
+- Scope: Defines how W3C trace context is carried across the outbox hop and the Kafka hop, amends the two-namespace Kafka header model to recognize W3C trace headers as a third namespace, and fixes the linked default plus parented APM opt-in for consumer handoff.
 - Sources:
   - wiki/proposals/13-telemetry-pipeline-completion.proposal.md
   - wiki/decisions/message-identity-and-header-namespace.decision.md
   - crates/kafkaman-rdkafka/src/publisher.rs
   - crates/kafkaman-rdkafka/src/ingest_record.rs
+  - crates/kafkaman-rdkafka/src/consumer.rs
+  - crates/kafkaman-config/src/observability.rs
   - crates/kafkaman-core/src/envelope.rs
+  - tests/observability/tests/trace_parented_handoff.rs
   - W3C Trace Context Recommendation
 - Related:
   - wiki/decisions/telemetry-pipeline-ownership.decision.md
   - wiki/decisions/schema-and-change-management.decision.md
+  - wiki/decisions/apm-waterfall-trace-shape.decision.md
   - wiki/roadmaps/path-to-v1.roadmap.md
   - wiki/plans/two-service-distributed-cache-example.plan.md
 
@@ -65,11 +69,12 @@ The amendment is therefore stated as narrowly as it can be.
    by an additive migration. Populated at enqueue from the ambient span, if any.
    Read at publish time to restore the originating context.
 
-6. **The consumer span links to the producer span; it does not parent from it.**
-   A consumer polls a batch that may contain records from many unrelated traces.
+6. **The consumer span links to the producer span by default.**
+   A consumer can poll a batch that contains records from many unrelated traces.
    Per messaging semantic conventions, batch consumption uses span links. Parenting
-   would attach unrelated work to whichever trace happened to be first in the
-   batch.
+   by default would attach unrelated work to whichever trace happened to be first
+   in the batch. `observability.*.kafka_trace_handoff = "parented"` is the
+   explicit single-record APM opt-in that continues the producer trace instead.
 
 7. **Absent context is normal and never an error.**
    A row enqueued outside any span, or a record from an uninstrumented producer,
@@ -104,7 +109,7 @@ design obvious rather than novel.** `correlation_id` already makes this journey:
 context follows the identical path, and the outbox row grows two nullable columns
 rather than one.
 
-The result is **two traces joined by a link**, not one trace:
+The default result is **two traces joined by a link**, not one trace:
 
 ```
 trace A (the caller's)
@@ -274,6 +279,48 @@ restores what the sender actually wrote. Kafka headers are a genuine multimap: t
 manufacture a list nobody sent — and, since each half may carry the same vendor
 key, one the grammar above now rejects.
 
+### 2026-08-29 — Parented Kafka handoff is an explicit APM opt-in
+
+The APM waterfall work measured the user-facing cost of the correct default:
+Kibana can store and show span links, but the operator path for "show this HTTP
+request through the broker into the consumer's dispatch work" is clearer when
+the single consumed record continues the producer trace. This does not change
+Decision 6's default. It adds a resolved policy field,
+`kafka_trace_handoff`, accepted under `[observability.defaults]` and
+`[observability.messages.<message_type>]`.
+
+The default value is `linked`, preserving the OpenTelemetry-safe batch shape.
+When the effective value is `parented`, `kafkaman.ingest` sets the propagated
+producer context as its parent instead of adding it as a link. The received row
+still stores the ingest span's own context, so `kafkaman.dispatch` and its SQL
+children descend from ingest exactly as before. The shipped examples choose
+`parented` so Elastic APM trace samples show the product request, outbox relay,
+order ingest, dispatch, cache write, processed mark, and product mark-published
+SQL under one trace id. Library users get that shape only by asking for it.
+
+### 2026-08-29 — capture names its span
+
+Decisions 1 and 4 say context is captured when the row is written and restored
+when it is acted on. They did not say *whose* context, because it was obvious:
+the phase span, `kafkaman.enqueue` or `kafkaman.ingest` or
+`kafkaman.relay.publish`.
+
+The code did not enforce it. `capture_trace_context()` reads whichever span is
+current, so any span opened between the phase span and the capture became the
+context written to the outbox row, the received row, and the Kafka header. The
+row still parsed; it simply named a private function instead of the phase, and
+downstream services parented from that.
+
+Instrumenting kafkaman's own internals broke it twice before the cause was clear
+— once in the outbox row, once on the wire. The fix is
+`capture_trace_context_of(&span)`: the three persisting sites name the span they
+mean. The corollary is a rule for anyone adding instrumentation later: **a
+function that reads the ambient span must not itself be wrapped in one.**
+
+This changes no part of the model above. It closes the gap between what this
+decision assumed and what the code guaranteed. Full reasoning in
+`wiki/decisions/method-level-timing-and-span-depth.decision.md`.
+
 ## Options Considered
 
 ### On the header namespace
@@ -319,9 +366,14 @@ and pretending otherwise produces traces that are wrong rather than absent.
 
 ### On consumer span shape
 
-**A. Parent the consumer span from the producer.** Rejected: incorrect for batch
-consumption, and attaches unrelated messages to an arbitrary trace.
-**B. Link.** *Accepted.* What messaging semantic conventions prescribe.
+**A. Parent the consumer span from the producer by default.** Rejected:
+incorrect for batch consumption, and attaches unrelated messages to an arbitrary
+trace.
+**B. Link by default.** *Accepted.* What messaging semantic conventions
+prescribe.
+**C. Parent as an explicit single-record APM mode.** *Accepted.* Useful for
+Kibana waterfalls when the consumer path handles one record and the operator
+needs one trace id across the broker hop.
 
 ## Consequences
 
@@ -345,17 +397,27 @@ consumption, and attaches unrelated messages to an arbitrary trace.
   than a discovery. Hosts that treat a topic as untrusted should not propagate
   context from it, and the configuration to refuse extraction is a reasonable
   future addition.
+- **The consumer handoff policy is public config.** `linked` is the default and
+  `parented` is a deliberate APM shape. Per-message overrides can change one
+  message type without changing every consumer in the process.
 - **OQ5's ratified answer gains an exception**, and the roadmap must say so
   rather than continuing to describe a two-namespace model.
 
 ## Verification
 
-- A test asserts the producer trace spans enqueue → relay publish across the
-  outbox gap, that the consumer trace spans ingest → dispatch across the receive
-  gap, that the two carry *different* trace ids, and that the ingest span links
-  back to the publish span that produced the record.
+- A test asserts the default producer trace spans enqueue → relay publish across
+  the outbox gap, that the default consumer trace spans ingest → dispatch across
+  the receive gap, that the two carry *different* trace ids, and that the ingest
+  span links back to the publish span that produced the record.
 - A test asserts `traceparent` sent by a producer never appears in the user
   headers handed to a handler.
 - A test asserts a row enqueued outside any span publishes and dispatches
   normally, with no trace context and no error.
-- A test asserts the consumer span carries a link, not a parent.
+- A test asserts the default consumer span carries a link, not a parent.
+- A test asserts `kafka_trace_handoff = "parented"` keeps enqueue, publish,
+  ingest, dispatch, and dispatch SQL in one trace and makes ingest a child of
+  the propagated producer span.
+- Both of those tests run with the `kafkaman::internal` span tier live, so they
+  also assert that extra spans nested inside a phase cannot change the context
+  that phase persists. A structural guard fails them if the tier stops being
+  exercised.

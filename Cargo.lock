@@ -779,6 +779,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-telemetry-tests"
+version = "0.1.0"
+dependencies = [
+ "distributed-cache-tests",
+ "opentelemetry-proto",
+ "otlp-capture",
+ "prost",
+ "reqwest 0.12.28",
+ "rustix",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "ferroid"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1503,6 +1518,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1550,6 +1566,7 @@ name = "kafkaman-rdkafka"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "kafkaman-config",
  "kafkaman-core",
  "kafkaman-sqlx",
  "kafkaman-worker",
@@ -1914,6 +1931,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
+ "otlp-capture",
  "prost",
  "rdkafka",
  "reqwest 0.13.4",
@@ -2027,6 +2045,14 @@ dependencies = [
  "rand 0.9.5",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "otlp-capture"
+version = "0.1.0"
+dependencies = [
+ "opentelemetry-proto",
+ "prost",
 ]
 
 [[package]]

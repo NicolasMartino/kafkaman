@@ -22,5 +22,12 @@ tower.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# Test-only, and deliberately not a dependency: the host owns the subscriber, so
+# this crate must never install one. It is here so the route-cardinality tests
+# can read the fields the span actually recorded rather than trusting the code
+# that wrote them.
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

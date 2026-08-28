@@ -1,5 +1,6 @@
 use kafkaman_core::ReceivedRow;
 use sqlx::{Postgres, Row, Transaction};
+use tracing::Instrument;
 
 use crate::{CacheTable, Error, ReceivedTable, Result};
 
@@ -37,6 +38,7 @@ pub enum CacheApplyOutcome {
     Migrated,
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn upsert_cache_from_received(
     tx: &mut Transaction<'_, Postgres>,
     table: &ReceivedTable,
@@ -69,6 +71,11 @@ pub(crate) async fn upsert_cache_from_received(
         .bind(row.source_partition)
         .bind(row.source_offset)
         .fetch_optional(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "UPSERT",
+            cache.qualified_name(),
+            "apply received row to cache",
+        ))
         .await?;
 
     if applied.is_some() {
@@ -105,6 +112,7 @@ pub(crate) async fn upsert_cache_from_received(
 /// Case 3 is why the authorization matters. Accepting *any* origin change would
 /// mean a consumer misconfigured onto the wrong topic silently overwrote a cache
 /// with another domain's state.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn classify_skipped_cache_apply(
     tx: &mut Transaction<'_, Postgres>,
     cache: &CacheTable,
@@ -119,6 +127,11 @@ async fn classify_skipped_cache_apply(
     let Some(current) = sqlx::query(&sql)
         .bind(entity_key)
         .fetch_optional(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "SELECT",
+            cache.qualified_name(),
+            "classify skipped cache apply",
+        ))
         .await?
     else {
         // No cache row at all, yet the insert did not take: the only way to get
@@ -206,6 +219,7 @@ pub(crate) fn received_entity_key(row: &ReceivedRow) -> Result<String> {
 /// reaching [`classify_skipped_cache_apply`] is an ignored replay, and making
 /// every one of those lock a row to answer a question they almost never need
 /// would be a real cost for a rare recovery.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn migrate_cache_origin(
     tx: &mut Transaction<'_, Postgres>,
     cache: &CacheTable,
@@ -219,6 +233,11 @@ async fn migrate_cache_origin(
     ))
     .bind(entity_key)
     .fetch_optional(&mut **tx)
+    .instrument(kafkaman_core::db_span!(
+        "SELECT",
+        cache.qualified_name(),
+        "lock cache origin",
+    ))
     .await?;
 
     let Some(locked) = locked else {
@@ -250,6 +269,11 @@ async fn migrate_cache_origin(
     .bind(row.source_partition)
     .bind(row.source_offset)
     .execute(&mut **tx)
+    .instrument(kafkaman_core::db_span!(
+        "UPDATE",
+        cache.qualified_name(),
+        "migrate cache origin",
+    ))
     .await?;
 
     Ok(if same_origin {

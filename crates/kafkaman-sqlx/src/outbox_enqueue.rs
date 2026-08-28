@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::lock_keys::outbox_entity_lock_key;
 use crate::{Error, OutboxTable, ResolvedConfig, Result};
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn enqueue<P>(
     tx: &mut Transaction<'_, Postgres>,
     cfg: &ResolvedConfig,
@@ -47,18 +48,33 @@ where
     // link the outbox pattern otherwise breaks.
     let span = tracing::info_span!(
         "kafkaman.enqueue",
+        "otel.kind" = "producer",
+        "otel.status_code" = tracing::field::Empty,
+        "otel.status_description" = tracing::field::Empty,
         message_type = P::MESSAGE_TYPE,
         messaging.system = "kafka",
         messaging.destination.name = P::TOPIC,
         messaging.operation.name = "create",
     );
-    enqueue_inner(conn, cfg, evt).instrument(span).await
+    // Captured from `span` by name rather than from whatever span is current
+    // inside `enqueue_inner`. The comment above has always claimed this; now it
+    // is true regardless of what nests in between.
+    let trace = kafkaman_core::capture_trace_context_of(&span);
+    let result = enqueue_inner(conn, cfg, evt, trace)
+        .instrument(span.clone())
+        .await;
+    if let Err(err) = &result {
+        kafkaman_core::record_error(&span, err);
+    }
+    result
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn enqueue_inner<P>(
     conn: &mut PgConnection,
     cfg: &ResolvedConfig,
     evt: &Envelope<P>,
+    trace: Option<kafkaman_core::TraceContext>,
 ) -> Result<()>
 where
     P: KafkaMessage + Serialize,
@@ -94,7 +110,7 @@ where
         partition_key,
         correlation_id: evt.correlation_id,
         causation_id: evt.causation_id,
-        trace: kafkaman_core::capture_trace_context(),
+        trace,
         headers,
         payload,
         occurred_at: evt.occurred_at,
@@ -115,13 +131,27 @@ where
         return Err(Error::MissingIdempotencyKey);
     };
 
-    let mut guard = conn.begin().await?;
+    let mut guard = conn
+        .begin()
+        .instrument(kafkaman_core::db_span!(
+            "BEGIN",
+            table.qualified_name(),
+            "open outbox enqueue transaction",
+        ))
+        .await?;
     lock_outbox_entity(&mut guard, &table, &entity_key).await?;
     supersede_pending_outbox_rows(&mut guard, &table, &entity_key).await?;
     insert
         .execute(&mut *guard, OutboxStatus::Pending, None)
         .await?;
-    guard.commit().await?;
+    guard
+        .commit()
+        .instrument(kafkaman_core::db_span!(
+            "COMMIT",
+            table.qualified_name(),
+            "commit outbox enqueue transaction",
+        ))
+        .await?;
     Ok(())
 }
 
@@ -143,6 +173,7 @@ struct InsertOutboxRow<'a> {
 }
 
 impl InsertOutboxRow<'_> {
+    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
     async fn execute<'c, E>(
         self,
         executor: E,
@@ -188,11 +219,17 @@ impl InsertOutboxRow<'_> {
             .bind(self.payload)
             .bind(self.occurred_at)
             .execute(executor)
+            .instrument(kafkaman_core::db_span!(
+                "INSERT",
+                self.table.qualified_name(),
+                "insert outbox row",
+            ))
             .await?;
         Ok(())
     }
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn lock_outbox_entity(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
@@ -202,10 +239,16 @@ async fn lock_outbox_entity(
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(key)
         .execute(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "lock outbox entity",
+        ))
         .await?;
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn supersede_pending_outbox_rows(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
@@ -225,6 +268,11 @@ async fn supersede_pending_outbox_rows(
     sqlx::query(&sql)
         .bind(entity_key)
         .execute(&mut **tx)
+        .instrument(kafkaman_core::db_span!(
+            "UPDATE",
+            table.qualified_name(),
+            "supersede pending outbox rows",
+        ))
         .await?;
     Ok(())
 }

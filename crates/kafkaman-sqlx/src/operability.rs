@@ -125,6 +125,7 @@ pub struct ReceivedStuckRow {
 ///
 /// `max_queue_age` only decides the `over_max_queue_age` flag; it never filters
 /// rows, so the counts stay complete regardless of the threshold.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn outbox_status_summary(
     pool: &PgPool,
     table: &OutboxTable,
@@ -163,6 +164,7 @@ pub async fn outbox_status_summary(
 
 /// Per-status row counts and oldest-row age for one received table. Carries the
 /// same cost caveat as [`outbox_status_summary`].
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn received_status_summary(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -204,6 +206,7 @@ pub async fn received_status_summary(
 /// An expired claim is not itself a fault — the relay reclaims them on the next
 /// cycle. Staying expired past the threshold is the fault, so the cutoff is
 /// applied to `claim_expires_at` rather than to `created_at`.
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn outbox_stuck_rows(
     pool: &PgPool,
     table: &OutboxTable,
@@ -268,6 +271,7 @@ pub async fn outbox_stuck_rows(
 /// the overdue set itself, not the table.
 ///
 /// [`create_outbox_retention_index_sql`]: crate::create_outbox_retention_index_sql
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn received_stuck_rows(
     pool: &PgPool,
     table: &ReceivedTable,

@@ -11,6 +11,7 @@ use crate::{migrate, Error, ResolvedConfig};
 /// Uses a lazy pool: the check must happen before anything connects, so this
 /// needs no database to prove it fires.
 #[tokio::test]
+#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn migrate_rejects_a_pool_too_small_to_hold_its_two_connections() {
     let pool = PgPoolOptions::new()
         .max_connections(1)

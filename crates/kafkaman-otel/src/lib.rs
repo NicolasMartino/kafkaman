@@ -37,6 +37,7 @@
 //!
 //! ```no_run
 //! use tracing_subscriber::layer::SubscriberExt as _;
+//! use tracing_subscriber::Layer as _;
 //! use tracing_subscriber::util::SubscriberInitExt as _;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,14 +47,47 @@
 //!     .without_logs()
 //!     .build()?;
 //!
+//! let filter = || tracing_subscriber::EnvFilter::new("info");
 //! tracing_subscriber::registry()
-//!     .with(tracing_subscriber::EnvFilter::new("info"))
-//!     .with(telemetry.trace_layer())
-//!     .with(telemetry.log_layer())
+//!     .with(tracing_subscriber::fmt::layer().with_filter(filter()))
+//!     .with(telemetry.trace_layer().map(|layer| {
+//!         layer.with_filter(filter())
+//!     }))
+//!     .with(telemetry.log_layer().map(|layer| {
+//!         layer.with_filter(filter())
+//!     }))
 //!     .init();
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Bounding what leaves the process
+//!
+//! Two knobs, and they cut at different points.
+//!
+//! `RUST_LOG` decides which spans and events are *recorded at all*. [`init`]
+//! gives each layer its own `EnvFilter` built from it, so a span below the
+//! filter costs nothing anywhere. Giving each layer its own filter rather than
+//! putting one on the registry is what lets a host bound exported telemetry
+//! differently from stdout — a registry-wide filter bounds every layer after it
+//! too, so this is about the freedom to differ, not about closing a leak.
+//!
+//! `OTEL_TRACES_SAMPLER` decides which recorded traces are *exported*. The SDK
+//! reads it directly and this crate does not intercept it, so
+//! `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
+//! `OTEL_TRACES_SAMPLER_ARG=0.1` keeps a tenth of traces whole — head sampling,
+//! so a sampled trace is complete rather than a tenth of every trace's spans.
+//! Default is `parentbased_always_on`, which is right for an example and wrong
+//! for anything with traffic.
+//!
+//! Neither knob is a retention policy. Whatever reaches your backend is kept for
+//! as long as that backend is configured to keep it, and spans are the highest-
+//! volume signal kafkaman produces.
+//!
+//! Going the other way, `RUST_LOG=info,kafkaman::internal=debug` adds a span per
+//! kafkaman function beneath the phase spans. It has its own target so reaching
+//! it does not also enable `sqlx` and `rdkafka` debug logging. Those span names
+//! are function names and are not a stability surface.
 //!
 //! # Two contracts
 //!
@@ -122,6 +156,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer as _;
 
 const OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTLP_METRICS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
@@ -174,23 +209,30 @@ pub enum Error {
 /// Install the providers and a default subscriber.
 ///
 /// The one-call path. Equivalent to [`builder`] followed by
-/// [`Builder::build`], plus a `tracing_subscriber` registry carrying an
-/// `EnvFilter` (from `RUST_LOG`, defaulting to `info`), a formatter, and
-/// whichever OpenTelemetry layers were enabled.
+/// [`Builder::build`], plus a `tracing_subscriber` registry carrying a
+/// formatter and whichever OpenTelemetry layers were enabled. Each layer gets
+/// its own `EnvFilter` (from `RUST_LOG`, defaulting to `info`), so the same
+/// filter bounds stdout, traces, and OTel logs — and a host composing its own
+/// registry can give the telemetry layers a different one. See the crate docs on
+/// bounding what leaves the process.
 ///
 /// Call before constructing any kafkaman runtime loop; see the crate docs.
 pub fn init(service_name: impl Into<Cow<'static, str>>) -> Result<Telemetry, Error> {
     let telemetry = builder(service_name).build()?;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
     if let Err(err) = tracing::subscriber::set_global_default(
         tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(telemetry.trace_layer())
-            .with(telemetry.log_layer()),
+            .with(tracing_subscriber::fmt::layer().with_filter(env_filter()))
+            .with(
+                telemetry
+                    .trace_layer()
+                    .map(|layer| layer.with_filter(env_filter())),
+            )
+            .with(
+                telemetry
+                    .log_layer()
+                    .map(|layer| layer.with_filter(env_filter())),
+            ),
     ) {
         // `build` has already installed the providers and started their exporter
         // threads. Returning here without flushing would strand them for the life
@@ -540,6 +582,11 @@ fn env_is_nonempty(name: &str) -> bool {
     std::env::var(name)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
 /// Keep the first shutdown error, log any that follow.

@@ -228,6 +228,7 @@ async fn handler_enqueues_outbox_atomically_with_receive_transaction() -> TestRe
         8,
         90,
         Some(b"order-consume-produce-ok-duplicate"),
+        None,
     )
     .await?;
     duplicate_tx.commit().await?;

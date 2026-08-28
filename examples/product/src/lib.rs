@@ -26,6 +26,7 @@ use kafkaman::sqlx::{
 use kafkaman::{Envelope, HandlerCtx, IdempotencyIdentity};
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool, Row};
+use tracing::Instrument;
 use uuid::Uuid;
 
 pub use boot::{start, start_with, BootMode, BoxError, RunningService, ServiceOptions};
@@ -161,6 +162,11 @@ pub(crate) async fn recompute_availability(
         .bind(order.product_id.to_string())
         .bind(ORDER_STATUS_FULFILLED_WIRE)
         .fetch_one(&mut *conn)
+        .instrument(kafkaman::db_span!(
+            "SELECT",
+            order_cache,
+            "sum fulfilled orders from cache",
+        ))
         .await?;
 
     let sql = format!(
@@ -173,6 +179,11 @@ pub(crate) async fn recompute_availability(
         .bind(fulfilled)
         .bind(order.product_id)
         .fetch_optional(&mut *conn)
+        .instrument(kafkaman::db_span!(
+            "UPDATE",
+            "products",
+            "recompute product availability",
+        ))
         .await?
     else {
         // An order for a product this service has never heard of. Not an error

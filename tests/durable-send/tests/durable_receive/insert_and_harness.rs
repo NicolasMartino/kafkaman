@@ -74,9 +74,16 @@ async fn receive_insert_reports_message_id_conflict_separately_from_redelivery()
     })
     .with_idempotency_key("idem-conflict-first");
     let mut tx = harness.pool().begin().await?;
-    let outcome =
-        insert_received_with_outcome(&mut tx, &cfg, &first, 0, 20, Some(b"order-conflict-first"))
-            .await?;
+    let outcome = insert_received_with_outcome(
+        &mut tx,
+        &cfg,
+        &first,
+        0,
+        20,
+        Some(b"order-conflict-first"),
+        None,
+    )
+    .await?;
     tx.commit().await?;
     assert_eq!(outcome, ReceivedInsertOutcome::Inserted);
 
@@ -92,6 +99,7 @@ async fn receive_insert_reports_message_id_conflict_separately_from_redelivery()
         0,
         21,
         Some(b"order-conflict-redelivery"),
+        None,
     )
     .await?;
     tx.commit().await?;
@@ -110,6 +118,7 @@ async fn receive_insert_reports_message_id_conflict_separately_from_redelivery()
         0,
         22,
         Some(b"order-conflict-second"),
+        None,
     )
     .await?;
     tx.commit().await?;

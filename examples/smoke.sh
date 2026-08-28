@@ -13,6 +13,10 @@
 # Override the endpoints when running against something other than the compose
 # defaults:
 #     ORDER_URL=http://127.0.0.1:3001 PRODUCT_URL=http://127.0.0.1:3002
+#
+# Drive extra traffic after the assertions, so the latency histograms and
+# queue-depth gauges have a distribution rather than a single observation:
+#     VOLUME_PRODUCTS=12
 
 set -euo pipefail
 
@@ -31,8 +35,14 @@ POLL_SECONDS=0.1
 # through an intermediate republish, so reading once after a write can catch a
 # stale-but-plausible value and "pass" for the wrong reason.
 SETTLE_POLLS=8
+# How many extra products the unasserted volume phase drives through the same
+# path after the assertions pass. Zero skips it entirely, which is the default
+# so `just examples demo` stays quick; `just examples all` sets it, because a
+# telemetry backend is what the phase exists to give something to show.
+VOLUME_PRODUCTS="${VOLUME_PRODUCTS:-0}"
 
 readonly ORDER_URL PRODUCT_URL DEADLINE_SECONDS POLL_SECONDS SETTLE_POLLS
+readonly VOLUME_PRODUCTS
 
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
@@ -109,6 +119,23 @@ await_settled() {
      last observed: ${candidate:-<nothing applied>}"
 }
 
+# Block until order's cache holds *any* view of the product.
+#
+# Weaker than `await_settled` on purpose, and only for the volume phase below:
+# that phase asserts nothing about the value, so waiting for stability would buy
+# nothing and cost SETTLE_POLLS of latency per product. Presence is all that is
+# needed before an order can be placed against it.
+await_present() {
+    local product_id="$1"
+    local deadline=$((SECONDS + DEADLINE_SECONDS))
+
+    while (( SECONDS < deadline )); do
+        [[ -n "$(read_cached "$product_id")" ]] && return 0
+        sleep "$POLL_SECONDS"
+    done
+    return 1
+}
+
 expect_available() {
     local view="$1" want="$2" got
     got=$(jq -r '.available' <<<"$view")
@@ -174,3 +201,58 @@ http POST "$ORDER_URL/orders" \
 pass "rejected on status, not on stock"
 
 printf '\n\033[32mAll steps passed.\033[0m\n'
+
+# --- Volume ------------------------------------------------------------------
+#
+# Everything above proves the two-service contract with one product, which is
+# the right shape for an assertion script and the wrong shape for a dashboard.
+# One entity puts a single observation in `kafkaman.dispatch.duration`,
+# `kafkaman.relay.publish.duration` and `kafkaman.outbox.time_to_publish`, and
+# moves the queue-depth gauges once. Opening Kibana on that shows a histogram
+# with one populated bucket, which looks broken and is not.
+#
+# So this phase drives traffic and asserts nothing beyond the writes being
+# accepted. Convergence is already proven above; re-proving it per product would
+# only make the script slower and give it more ways to fail for reasons that are
+# not the system's fault.
+if (( VOLUME_PRODUCTS > 0 )); then
+    step "volume: ${VOLUME_PRODUCTS} more products through the same path"
+
+    ids=()
+    for i in $(seq 1 "$VOLUME_PRODUCTS"); do
+        http POST "$PRODUCT_URL/products" \
+             "{\"name\":\"widget-$i\",\"price_cents\":$(( 500 + i * 25 )),\"on_hand\":$(( 20 + i ))}"
+        [[ "$HTTP_STATUS" == 2* ]] \
+            || fail "volume: creating product $i returned $HTTP_STATUS: $HTTP_BODY"
+        ids+=("$(jq -r '.product_id' <<<"$HTTP_BODY")")
+    done
+    pass "created ${#ids[@]} products"
+
+    # Placed and fulfilled separately from creation: `order` refuses an order for
+    # a product it has not cached yet, so each one has to arrive before it can be
+    # ordered against. That is the same rule step 3 relies on, just applied in
+    # bulk.
+    placed=0
+    for id in "${ids[@]}"; do
+        await_present "$id" || continue
+        http POST "$ORDER_URL/orders" "{\"product_id\":\"$id\",\"quantity\":2}"
+        [[ "$HTTP_STATUS" == 2* ]] || continue
+        http POST "$ORDER_URL/orders/$(jq -r '.order_id' <<<"$HTTP_BODY")/fulfil"
+        [[ "$HTTP_STATUS" == 2* ]] && placed=$((placed + 1))
+    done
+    pass "placed and fulfilled $placed orders"
+
+    # One settle at the end so the phase does not return before the telemetry it
+    # generated exists. Without it the stack can be inspected — or torn down —
+    # while the last fulfilments are still propagating.
+    # In a command substitution on purpose: `await_settled` reports a timeout
+    # through `fail`, which exits. Contained in a subshell that becomes a false
+    # condition here, so a slow last propagation ends the phase quietly instead
+    # of failing a run whose assertions all passed. Index written the long way
+    # because `${ids[-1]}` needs bash 4.3 and macOS ships 3.2.
+    if settled=$(await_settled "${ids[$(( ${#ids[@]} - 1 ))]}" -1 2>/dev/null); then
+        pass "the last product settled at offset $(jq -r '.applied_offset' <<<"$settled")"
+    else
+        printf '  the last product had not settled yet; telemetry is still arriving\n'
+    fi
+fi

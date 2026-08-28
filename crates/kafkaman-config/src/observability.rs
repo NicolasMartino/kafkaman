@@ -19,10 +19,14 @@ pub struct ObservabilityConfig {
 impl ObservabilityConfig {
     /// The effective policy for one message type: its override merged over the
     /// defaults, or the defaults when it has none.
+    ///
+    /// Called per record on the ingest path, which is why both policy types are
+    /// `Copy`: resolving one is a map lookup and a memcpy, with nothing to
+    /// allocate and nothing to drop.
     pub fn policy_for(&self, message_type: &str) -> ObservabilityPolicy {
         match self.overrides.get(message_type) {
-            Some(override_policy) => override_policy.clone().apply_to(self.defaults.clone()),
-            None => self.defaults.clone(),
+            Some(override_policy) => override_policy.apply_to(self.defaults),
+            None => self.defaults,
         }
     }
 }
@@ -33,6 +37,8 @@ impl ObservabilityConfig {
 ///
 /// - `lifecycle` and `sample_success` drive per-message success events in the
 ///   relay and dispatcher loops, via [`ObservabilityPolicy::lifecycle_emission`].
+/// - `kafka_trace_handoff` controls whether consumer ingest spans link to the
+///   propagated producer context or continue it as their parent.
 /// - `stuck_after` is the overdue threshold used by the stuck-row queries.
 /// - `max_queue_age` sets the `over_max_queue_age` flag on depth summaries.
 ///
@@ -41,7 +47,7 @@ impl ObservabilityConfig {
 /// are accepted now so that adding the redaction hook later is not a breaking
 /// config change. Each field documents this individually so it cannot be
 /// mistaken for a live knob at the use site.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ObservabilityPolicy {
     /// **Reserved.** Intended minimum level for kafkaman's own diagnostics.
     /// kafkaman emits through `tracing` and the host owns the subscriber, so
@@ -58,6 +64,12 @@ pub struct ObservabilityPolicy {
     /// **Reserved.** Intended user-header exposure policy. As with `payload`,
     /// no current code path emits arbitrary user headers.
     pub headers: HeaderLogging,
+    /// How a Kafka consumer span relates to the producer context propagated on
+    /// the record. `Linked` is the OpenTelemetry messaging default and remains
+    /// safest for batch-shaped consumers; `Parented` is an opt-in for
+    /// single-record processing when a backend should show one distributed
+    /// waterfall across the broker hop.
+    pub kafka_trace_handoff: KafkaTraceHandoff,
     /// Fraction of successes that get a lifecycle event, `0.0..=1.0`. Live when
     /// `lifecycle` is `per-message`.
     pub sample_success: f64,
@@ -91,6 +103,7 @@ impl Default for ObservabilityPolicy {
             lifecycle: LifecycleLogging::Summary,
             payload: PayloadLogging::Off,
             headers: HeaderLogging::KafkamanOnly,
+            kafka_trace_handoff: KafkaTraceHandoff::Linked,
             sample_success: 0.0,
             stuck_after: Duration::from_secs(60),
             max_queue_age: Duration::from_secs(300),
@@ -98,13 +111,14 @@ impl Default for ObservabilityPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityPolicyOverride {
     pub level: Option<ObservabilityLevel>,
     pub lifecycle: Option<LifecycleLogging>,
     pub payload: Option<PayloadLogging>,
     pub headers: Option<HeaderLogging>,
+    pub kafka_trace_handoff: Option<KafkaTraceHandoff>,
     pub sample_success: Option<f64>,
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub stuck_after: Option<Duration>,
@@ -125,6 +139,9 @@ impl ObservabilityPolicyOverride {
         }
         if let Some(value) = self.headers {
             base.headers = value;
+        }
+        if let Some(value) = self.kafka_trace_handoff {
+            base.kafka_trace_handoff = value;
         }
         if let Some(value) = self.sample_success {
             base.sample_success = value;
@@ -240,6 +257,25 @@ impl<'de> Deserialize<'de> for HeaderLogging {
                 _ => None,
             },
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaTraceHandoff {
+    Linked,
+    Parented,
+}
+
+impl<'de> Deserialize<'de> for KafkaTraceHandoff {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        string_enum(deserializer, "linked or parented", |value| match value {
+            "linked" => Some(Self::Linked),
+            "parented" => Some(Self::Parented),
+            _ => None,
+        })
     }
 }
 
