@@ -29,7 +29,8 @@ pub use observability::{
 pub use retry::{DlqMode, RetryConfig, RetryPolicy, RetryPolicyOverride};
 pub use schema::ConfigSchema;
 pub use sections::{
-    ObservabilitySection, RelaySection, RetentionSection, RetrySection, TopicsSection,
+    DispatcherSection, ObservabilitySection, RelaySection, RetentionSection, RetrySection,
+    TopicsSection,
 };
 
 #[cfg(test)]

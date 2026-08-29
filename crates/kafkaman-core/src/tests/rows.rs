@@ -11,7 +11,7 @@ use crate::{
 #[test]
 fn received_error_serializes_as_an_rfc9457_problem_detail() {
     let occurred_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-    let error = ReceivedError::new(ReceivedFailureKind::Handler, "boom", occurred_at);
+    let error = ReceivedError::new(ReceivedFailureKind::Handler, "boom", occurred_at, None);
     let json = serde_json::to_value(&error).unwrap();
 
     assert_eq!(json["type"], "urn:kafkaman:problem:handler");
@@ -211,4 +211,47 @@ fn received_row_fixture() -> ReceivedRow {
         created_at: OffsetDateTime::UNIX_EPOCH,
         processed_at: None,
     }
+}
+
+/// A stored problem detail carries its stage, and a row without one still reads.
+#[test]
+fn a_problem_detail_round_trips_with_and_without_a_stage() {
+    let occurred_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+    let staged = ReceivedError::new(
+        ReceivedFailureKind::Infrastructure,
+        "pool closed",
+        occurred_at,
+        Some(crate::FailureStage::Handler),
+    );
+    let json = serde_json::to_value(&staged).unwrap();
+    assert_eq!(json["stage"], "handler");
+    assert_eq!(
+        serde_json::from_value::<ReceivedError>(json).unwrap(),
+        staged,
+        "the blame axis must survive a round trip; it is what the class stopped \
+         carrying"
+    );
+
+    // Rows written before the field existed omit it, and a row written now with
+    // no stage omits it again — so the absence is not turned into a value that
+    // claims a frame nobody recorded.
+    let unstaged = ReceivedError::new(ReceivedFailureKind::Handler, "boom", occurred_at, None);
+    let json = serde_json::to_value(&unstaged).unwrap();
+    assert!(
+        json.get("stage").is_none(),
+        "an absent stage must not be serialized as null: {json}"
+    );
+
+    let legacy = serde_json::json!({
+        "type": "urn:kafkaman:problem:handler",
+        "title": "Handler returned an error",
+        "detail": "boom",
+        "occurred_at": "2023-11-14T22:13:20Z[UTC]",
+    });
+    let parsed: ReceivedError = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        parsed.stage, None,
+        "a row from before this reads as unstaged"
+    );
 }

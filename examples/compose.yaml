@@ -328,6 +328,12 @@ services:
     # `start()` is deliberately fail-fast: the process exits if any of its loops
     # dies. Bounded on purpose — an unbounded restart plus `up --wait` means a
     # genuinely broken service hangs the terminal instead of reporting.
+    #
+    # An *application handler* panicking is no longer one of the ways a loop can
+    # die: kafkaman catches that at the handler boundary and dead-letters the row
+    # instead. It used to be, and the bound here is what turned it into a
+    # permanently dead service — the row was still `Pending` after each restart,
+    # so it panicked again, three times, and then stayed down.
     restart: on-failure:3
     # The binaries install a SIGINT handler (tokio::signal::ctrl_c) and nothing
     # else. Docker sends SIGTERM, and Linux ignores default-disposition signals

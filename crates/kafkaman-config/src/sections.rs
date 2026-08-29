@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kafkaman_core::{LifecycleEmission, PurgeConfig, RelayConfig, TopicMode};
+use kafkaman_core::{DispatcherConfig, LifecycleEmission, PurgeConfig, RelayConfig, TopicMode};
 use serde::Deserialize;
 
-use crate::duration::deserialize_duration;
+use crate::duration::{deserialize_duration, deserialize_optional_duration};
 use crate::observability::{validate_observability_override, validate_observability_policy};
 use crate::retry::validate_policy;
 use crate::{
@@ -70,6 +70,52 @@ impl RetentionSection {
             batch_size: self.batch_size,
             poll_interval: self.poll_interval,
             include_failed: self.include_failed,
+        };
+        cfg.validate().map_err(|err| err.to_string())?;
+        Ok(cfg)
+    }
+}
+
+/// The `[dispatcher]` section of `kafkaman.toml`: how the receive dispatcher
+/// paces itself and when it gives up.
+///
+/// Optional, and every field within it optional too, because a service that
+/// never writes one gets exactly the behaviour it had before this section
+/// existed.
+///
+/// Separate from `[retry]` rather than folded into it, even though `[retry]` is
+/// otherwise the receive-dispatch section. `[retry]` is per message type, with
+/// `defaults` and per-type overrides; these are per *loop*, and there is no
+/// meaningful way for one message type to poll on a different interval than
+/// another when a dispatcher covers exactly one type each.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DispatcherSection {
+    /// Sleep between polls that found nothing due. Defaults to
+    /// `relay.poll_interval`, which is what the dispatcher read before this
+    /// section existed.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub poll_interval: Option<Duration>,
+    /// Distinct received rows that may panic consecutively before the dispatcher
+    /// stops. Defaults to ten.
+    #[serde(default)]
+    pub max_consecutive_panicking_rows: Option<usize>,
+}
+
+impl DispatcherSection {
+    /// Resolve against the relay's poll interval, which is the fallback.
+    pub fn into_dispatcher_config(
+        self,
+        lifecycle: LifecycleEmission,
+        relay_poll_interval: Duration,
+    ) -> std::result::Result<DispatcherConfig, String> {
+        let defaults = DispatcherConfig::default();
+        let cfg = DispatcherConfig {
+            poll_interval: self.poll_interval.unwrap_or(relay_poll_interval),
+            lifecycle,
+            max_consecutive_panicking_rows: self
+                .max_consecutive_panicking_rows
+                .unwrap_or(defaults.max_consecutive_panicking_rows),
         };
         cfg.validate().map_err(|err| err.to_string())?;
         Ok(cfg)

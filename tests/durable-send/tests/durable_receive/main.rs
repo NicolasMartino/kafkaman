@@ -2,7 +2,9 @@
 
 // Test cases, split by theme; the helpers they share follow.
 mod atomic_outbox;
+mod dispatch_failure_fallback;
 mod dispatch_handler_failure;
+mod dispatch_handler_panic;
 mod dispatch_retry_schedule;
 mod dispatch_success;
 mod dispatcher_loop;
@@ -19,7 +21,7 @@ use durable_send_tests::{
     TestResult,
 };
 use kafkaman_core::{
-    Envelope, KafkaMessage, LifecycleEmission, OutboxStatus, ReceiveStatus, ReceivedError,
+    DispatcherConfig, Envelope, KafkaMessage, OutboxStatus, ReceiveStatus, ReceivedError,
     ReceivedFailureKind, ReceivedMeta,
 };
 use kafkaman_sqlx::{
@@ -61,7 +63,7 @@ fn failure_errors_json_at(
     occurred_at: OffsetDateTime,
 ) -> serde_json::Value {
     let errors = (0..count)
-        .map(|idx| ReceivedError::new(kind, format!("boom-{idx}"), occurred_at))
+        .map(|idx| ReceivedError::new(kind, format!("boom-{idx}"), occurred_at, None))
         .collect::<Vec<_>>();
     serde_json::to_value(errors).expect("serialize received errors")
 }

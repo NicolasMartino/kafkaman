@@ -488,14 +488,54 @@ pub struct CapturedSpan {
 }
 
 impl CapturedSpan {
-    /// Whether this span descends directly from `parent`.
+    /// Whether this span's immediate parent is `parent`.
     ///
     /// Both halves matter. A matching `parent_span_id` in a *different* trace is
     /// what a broken handoff looks like — the id survives, the trace does not.
+    ///
+    /// Use this only where the *edge* is the subject. For "is this work part of
+    /// that request", use [`Captured::is_descendant_of`]: the depth between two
+    /// spans is a function of which functions happen to be instrumented, and
+    /// pinning it turns every added span into a test failure.
     #[must_use]
-    pub fn descends_from(&self, parent: &CapturedSpan) -> bool {
+    pub fn is_child_of(&self, parent: &CapturedSpan) -> bool {
         self.trace_id == parent.trace_id
             && self.parent_span_id.as_deref() == Some(parent.span_id.as_str())
+    }
+}
+
+impl Captured {
+    /// Whether `span` sits anywhere beneath `ancestor` in the same trace.
+    ///
+    /// Walks the recorded parent chain rather than comparing one edge. What a
+    /// waterfall assertion means is "this work happened as part of that
+    /// request", and that stays true when a span is added between the two —
+    /// which the `kafkaman::internal` tier does by design, since promoting a
+    /// function to the default filter inserts it into exactly these chains.
+    ///
+    /// Bounded by the number of recorded spans, so a malformed export that
+    /// reports a cycle terminates instead of hanging the suite.
+    #[must_use]
+    pub fn is_descendant_of(&self, span: &CapturedSpan, ancestor: &CapturedSpan) -> bool {
+        if span.trace_id != ancestor.trace_id || span.span_id == ancestor.span_id {
+            return false;
+        }
+        let mut current = span;
+        for _ in 0..self.span_records.len() {
+            let Some(parent_id) = current.parent_span_id.as_deref() else {
+                return false;
+            };
+            if parent_id == ancestor.span_id {
+                return true;
+            }
+            let Some(parent) = self.span_records.iter().find(|candidate| {
+                candidate.span_id == parent_id && candidate.trace_id == span.trace_id
+            }) else {
+                return false;
+            };
+            current = parent;
+        }
+        false
     }
 }
 

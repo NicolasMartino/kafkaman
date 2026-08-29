@@ -32,6 +32,12 @@ pub enum Error {
         reason: &'static str,
     },
 
+    #[error("invalid dispatcher config: {field} {reason}")]
+    InvalidDispatcherConfig {
+        field: &'static str,
+        reason: &'static str,
+    },
+
     #[error("invalid purge config: {field} {reason}")]
     InvalidPurgeConfig {
         field: &'static str,
@@ -63,4 +69,34 @@ pub enum Error {
          one, because changing it later means republishing every entity onto a new topic"
     )]
     TopicPartitionsUndeclared { topic: String },
+}
+
+impl crate::ProblemType for Error {
+    /// Every variant here is a validation failure, so none of them is
+    /// [`INFRASTRUCTURE`](crate::problem::INFRASTRUCTURE) — retrying any of
+    /// them recomputes the same answer. The split that matters is *whose*
+    /// input was wrong: a deployment's configuration, a stored value, a message
+    /// type's declaration, or a broker topic.
+    fn problem_type(&self) -> &'static str {
+        use crate::problem;
+        match self {
+            Self::InvalidIdentifier { .. }
+            | Self::InvalidRelayConfig { .. }
+            | Self::InvalidDispatcherConfig { .. }
+            | Self::InvalidPurgeConfig { .. }
+            | Self::InvalidTopicSpec { .. } => problem::CONFIGURATION,
+
+            Self::InvalidOutboxStatus(_) | Self::InvalidReceiveStatus(_) => problem::SCHEMA,
+
+            Self::InvalidMessageDescriptor(_) => problem::MESSAGE_ROUTING,
+
+            Self::InvalidIdempotencyNamespace { .. }
+            | Self::InvalidIdempotencyKey { .. }
+            | Self::InvalidIdempotencySource(_) => problem::IDEMPOTENCY,
+
+            Self::TopicPolicyMismatch { .. }
+            | Self::TopicMissing { .. }
+            | Self::TopicPartitionsUndeclared { .. } => problem::TOPIC,
+        }
+    }
 }

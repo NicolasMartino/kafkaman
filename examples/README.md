@@ -39,6 +39,29 @@ different things:
 The loop closes and terminates: an order snapshot makes `product` republish,
 `order`'s cache converges, and `order` publishes nothing further.
 
+## Where to go from here
+
+In a hurry: [Running them](#running-them) is the quickstart, and
+[When it goes wrong](#when-it-goes-wrong) is the failure walkthrough. The rest
+is reference.
+
+- [How a service is assembled](#how-a-service-is-assembled) — what boot actually
+  declares, and the escape hatch under it
+- [Running them](#running-them) — `just examples all`, and each narrower arm
+- [What builds what](#what-builds-what) — which container creates which table
+  and topic
+- [Looking at it](#looking-at-it) — the waterfall, and the two knobs that bound
+  its volume
+  - [Keeping the trace volume honest](#keeping-the-trace-volume-honest)
+  - [Going deeper than the waterfall](#going-deeper-than-the-waterfall)
+- [When it goes wrong](#when-it-goes-wrong) — the fault switch, the seven
+  scenarios, and what each one proves
+  - [The fault switch](#the-fault-switch)
+  - [What each scenario shows](#what-each-scenario-shows)
+  - [A panicking handler no longer takes the service with it](#a-panicking-handler-no-longer-takes-the-service-with-it)
+  - [Reading it in Kibana](#reading-it-in-kibana)
+- [Tests](#tests)
+
 ## How a service is assembled
 
 Boot is a role declaration. `order/src/service.rs` is 51 lines and
@@ -105,6 +128,17 @@ After the seven assertion steps it drives another twelve products through the
 same path without asserting anything, so the latency histograms and queue-depth
 gauges have a distribution rather than a single observation. One entity makes
 Kibana look broken. Set `VOLUME_PRODUCTS` to change the count.
+
+**Break it on purpose**, once something is up:
+
+```bash
+just examples faults
+```
+
+Six asserted failure scenarios — retries, the dead-letter queue, redrive, a
+panicking handler, a poison record, a broker outage. See
+[When it goes wrong](#when-it-goes-wrong). `just examples all` runs the first two
+of them, so the telemetry is not uniformly green.
 
 **Without the backend**, when you want propagation and not a gigabyte of heap:
 
@@ -398,11 +432,14 @@ kafkaman.relay.publish`, then open the consumer URL to inspect
 Spans scale with traffic, and a demo stack left running overnight is traffic.
 Three things bound it, cutting at three different points:
 
-**`RUST_LOG` bounds what is recorded.** Scheduler polling spans — `claim outbox
-batch`, `claim received row`, and the claim transactions around them — are
-`debug`, so at the default `info` they are never created and cost nothing. Raise
-it to `debug` only when you want to inspect empty polling cycles; otherwise start
-from a route transaction such as `POST /products` to debug one lifecycle.
+**`RUST_LOG` bounds what is recorded.** Everything that runs on a *timer* is
+`debug`, so at the default `info` it is never created and costs nothing: the
+polling spans `claim outbox batch` and `claim received row`, the claim
+transactions around them, the retention sweep, and the scheduler functions that
+open them. Raise it to `debug` only when you want to inspect empty polling
+cycles; otherwise start from a route transaction such as `POST /products` to
+debug one lifecycle. What runs *because there is a message* is `info` and is
+already in the trace — see "Going deeper" below for where the line falls.
 
 **`OTEL_TRACES_SAMPLER` bounds what is exported.** The OpenTelemetry SDK reads it
 directly, so it works on these examples without any kafkaman involvement:
@@ -433,8 +470,19 @@ examples down` is the retention policy.
 
 ### Going deeper than the waterfall
 
-The seventeen-span waterfall is kafkaman's *phases*. Underneath it, kafkaman's
-own functions are instrumented too, at `debug` and behind their own target:
+The `kafkaman.*` waterfall is kafkaman's *phases*. Underneath it, kafkaman's own
+functions are instrumented too, behind the target `kafkaman::internal` — and
+they are split across two levels, because the two halves cost wildly different
+amounts.
+
+**The message-path half is `info`, and you already have it.** A function that
+runs because there is a message to process — `dispatch_claimed_row`,
+`converge_and_dispatch`, `enqueue_inner`, `publish_row_traced`, and about sixty
+others — is in the default trace. That is what makes a dispatch waterfall
+gapless: the time between `kafkaman.dispatch` opening and the first `db.query`
+underneath it is attributed to a named frame rather than to nothing.
+
+**The polling half is `debug`, and you have to ask for it:**
 
 ```bash
 RUST_LOG=info,kafkaman::internal=debug just examples all
@@ -444,24 +492,41 @@ The target is the point. Plain `RUST_LOG=debug` would also switch on `sqlx`'s an
 `rdkafka`'s debug logging and bury what you came for; this reaches kafkaman's
 functions and nothing else.
 
-**Measure the cost before you leave it on.** A product-create request goes from
-17 spans to 25 — modest, because a request is short. The real cost is the
-schedulers, which poll every cycle whether or not there is work. With the tier on
-for one service and the stack otherwise idle:
+**Why the split is where it is.** Measured on this stack, not estimated. With
+the *whole* tier promoted for one service and the stack otherwise idle, that
+service produced **2322 spans in two minutes** against 5 from the service without
+it. A product-create request, meanwhile, went from 17 spans to 25.
 
-| | spans in two minutes |
+Those two numbers are unrelated. The 2322 is not request work — it is
+`claim_batch`, `claim_received_row`, `observe`, `refresh`, and the other loop
+functions running on their intervals forever and describing having found nothing.
+So the loop functions stay `debug` and the message-path ones do not.
+
+Re-measured after the split, against this stack at `RUST_LOG=info`:
+
+| | spans |
 | --- | --- |
-| `product`, tier on | 2322 |
-| `order`, tier off | 5 |
+| one product-create request, end to end | 38 |
+| ...of which promoted function spans | 16 (7 in `product`, 9 in `order`) |
+| ...of which `db.query` | 16 |
+| ...of which `kafkaman.*` phase | 5 |
+| idle stack, both services, two minutes | **0** |
 
-Nearly all of that is `claim_batch`, `claim_received_row`, `observe`, and the
-other loop functions, not request work. It is fine for a debugging session and
-wrong for anything left running, so pair it with `OTEL_TRACES_SAMPLER` above, or
-turn it on for one service at a time as that table did.
+Eight promoted spans per service per request, and nothing at all when nothing is
+happening. That is the whole affordability argument, and it is the same rule that
+already applied to the `db.query` spans — which is why `claim outbox batch` is
+invisible at `info` and `insert outbox row` is not.
+
+Two functions are `debug` for a different reason and are called out where they
+are defined: `health` and `ready`, which an orchestrator probes forever, and
+`enqueue`, which is excluded so `kafkaman.enqueue` stays a *trace root* in a
+service with no caller span rather than hanging under a function name.
 
 Those span names are function names. They are **not** a stability surface and
 will change whenever the functions do — build dashboards on the `kafkaman.*`
-phase spans and the `db.query` summaries, which are.
+phase spans and the `db.query` summaries, which are. That the *level* of a given
+function is not a stability surface either is the same statement: expect
+individual functions to move between the two halves as this is tuned.
 
 What this deliberately does not do is time every Rust method. Rust has no
 runtime agent that can instrument a whole binary the way a JVM agent rewrites
@@ -470,6 +535,214 @@ call frames in a release build. Spans answer "where did this request wait";
 "which code burned the CPU" is a profiler's question, and
 `wiki/plans/apm-waterfall-traces.plan.md` records what happened when we measured
 whether continuous profiling could answer it against this stack.
+
+## When it goes wrong
+
+Everything above is the happy path, and for a long time that was all this stack
+could show. Measured against it before any of the below existed: **227,394 spans
+indexed, none carrying a failure status, no log record above `INFO`, and every
+dead-letter queue empty.** The half of kafkaman that exists for when things go
+wrong — backoff, the attempt budget, the DLQ, redrive, ingest quarantine — was
+demonstrated by nothing and therefore proven by nothing.
+
+```bash
+just examples faults
+```
+
+Seven scenarios, each asserted, against a stack that is already up. `just
+examples all` runs the first two of them, so the telemetry has a failure side to
+look at without your asking.
+
+### The fault switch
+
+`product` carries a small control plane that makes its dispatch handler
+misbehave on demand. It is in the OpenAPI spec, so it is also in
+`http://127.0.0.1:3002/swagger-ui`:
+
+```bash
+curl -sX POST localhost:3002/faults -H 'content-type: application/json' \
+  -d '{"mode":"error","remaining":2}'   # fail twice, then succeed
+curl -sX POST localhost:3002/faults -H 'content-type: application/json' \
+  -d '{"mode":"error"}'                 # fail until disarmed
+curl -sX POST localhost:3002/faults -H 'content-type: application/json' \
+  -d '{"mode":"panic"}'                 # panic instead of returning
+curl -sX POST localhost:3002/faults -H 'content-type: application/json' \
+  -d '{"mode":"constraint"}'            # fail on a constraint the database held
+curl -sX POST localhost:3002/faults -H 'content-type: application/json' \
+  -d '{"mode":"contention"}'            # fail on a deadlock
+curl -sX POST localhost:3002/faults -H 'content-type: application/json' \
+  -d '{"mode":"statement"}'             # fail on a statement that cannot run
+curl -s  localhost:3002/faults          # mode, budget left, times fired
+curl -sX DELETE localhost:3002/faults   # disarm
+```
+
+The last three fail *in the database*, on the dispatch transaction's own
+connection, which is what makes them worth having as separate modes: each lands
+in a different branch of kafkaman's SQL classifier, and each answers a different
+operational question. A deadlock is nobody's bug and is worth retrying unchanged;
+a constraint violation will fail identically on all eight attempts; a malformed
+statement is a bug that shipped. They are produced with `RAISE … USING ERRCODE`
+rather than by genuinely breaking something, because sqlx classifies on the
+five-character SQLSTATE alone — a real check violation and this one are the same
+value by the time kafkaman reads them — and because a deadlock cannot be
+staged from one handler at all.
+
+`remaining` is the whole difference between the two stories kafkaman tells about
+failure. A bounded count is *transient*: the row retries on its backoff and
+converges anyway, with nobody involved. Omitting it is *permanent*: the row
+spends its budget, dead-letters, and waits for a human.
+
+Only `product` has one, because only `product` has an application handler —
+`order` declares `ProductSnapshot` with `cache::<T>()` and has no handler to
+fault. The switch is in-memory and per-process, deliberately, so it can be armed
+and disarmed without a restart; a restart is the very thing some of these
+scenarios are checking does *not* happen.
+
+### What each scenario shows
+
+| | Scenario | What to look for |
+| --- | --- | --- |
+| 1 | Two failures, then success | The cache converges anyway. Nothing dead-letters, no operator involved — this is the common case and it is meant to be boring. |
+| 2 | Failing forever | Eight attempts over ~19s, then `Failed`. The count is asserted against `kafkaman.toml`, not against the library default. |
+| 3 | Redrive | `POST /internal/kafkaman/dlq/order_snapshot/redrive` puts it back to `Pending`; it converges on the next pass. |
+| 4 | Three panics | The service **stays up** and keeps dispatching. See below. |
+| 5 | A poison record | Quarantined into `received_ingest_failures`, and the good record produced behind it still converges. One unreadable record must not stall a partition. |
+| 6 | The broker stops | Writes are still accepted, the outbox backs up, and the backlog drains when the broker returns. Nothing to replay by hand. |
+| 7 | Three database failures | The row stores `infrastructure` at `stage: handler`; APM groups each under `constraint`, `contention` or `statement`. Two vocabularies, each asserted where it lives. |
+
+Scenarios 5, 6 and 7 need Docker rather than HTTP alone — one produces a
+malformed record with `rpk`, one stops and starts the broker, one reads the
+service's own `received_order_snapshot` rows — and are skipped with a note when
+Docker is not available. Pick a subset with
+`FAULT_SCENARIOS="1 2" examples/faults.sh`.
+
+Scenario 7 is where both of kafkaman's failure vocabularies are visible at once,
+and where they deliberately disagree.
+
+The **row** stores `type: urn:kafkaman:problem:infrastructure` and `stage:
+handler`. That pair is the taxonomy and the blame axis: a database error returned
+by a handler is an infrastructure failure raised in the handler's frame, not a
+handler failure. Collapsing the two into one field is what made an operator
+filtering for infrastructure problems miss every one a handler had touched.
+
+The **span** stores `error.type: urn:kafkaman:problem:constraint`, and Elastic
+turns its exception event into an APM error group of the same name. `type` on the
+row has four permanent values because they are written into stored rows and
+cannot churn, so fourteen of the eighteen problem URIs collapse onto
+`infrastructure`; the fine class survives on the span, which is the only reason
+that coarsening is acceptable. The scenario asserts each half against the place
+that actually holds it — the row through `psql`, the error group through
+Elasticsearch — and skips the second half with a note when the observability
+profile is not up.
+
+### A panicking handler no longer takes the service with it
+
+It used to. A panic unwound out of the handler, out of the dispatcher's task, and
+out of the supervised runtime, so the whole process exited — HTTP server
+included. Compose restarted it, the claim transaction had rolled back so the row
+was still `Pending`, it was claimed again, and it panicked again. After three
+restarts compose gave up. **One bad message killed the service permanently.**
+
+The panic is now caught at the handler call boundary and turned into an ordinary
+handler error, so an isolated bad row retries on its normal budget and
+dead-letters like any other failure. A bad deploy that makes every claimed row
+panic is not treated as healthy background work: after ten consecutive *distinct
+rows* panic, the dispatcher returns an error so runtime supervision can surface
+it. Distinct rows and not panics, deliberately — one poison message spending its
+whole retry budget never trips it, because absorbing that is exactly what the
+budget and the DLQ are for. The limit is
+`[dispatcher].max_consecutive_panicking_rows`.
+Panics in kafkaman's *own* loops still fail fast: a bug in the library is not
+something to swallow, and a dispatcher that dies quietly while `/health` still
+answers 204 is worse than one that stops.
+
+This is containment, not permission. A handler should still return `Err` — that
+is the path with a failure class, a retry schedule, and a message an operator can
+read. What changed is the blast radius when one does not.
+
+Scenario 4 proves the containment without needing Docker, using the fault
+switch's own state: `fired` lives in the panicking process's memory, so reading
+`3` back after three panics is proof that the process never restarted. A restart
+would report `0` and a disarmed fault.
+
+### Reading it in Kibana
+
+The dashboard has a **kafkaman failed transactions** panel, querying:
+
+```
+data_stream.type: traces and attributes.processor.event: transaction and (status.code: Error or attributes.event.outcome: failure)
+```
+
+That is the APM-level split: a failed receive attempt is a failed
+`kafkaman.dispatch` transaction, so the APM service overview can separate
+successful and failed async consumer work. Use `attributes.transaction.type` to
+distinguish messaging transactions from HTTP requests, and
+`attributes.kafkaman.failure.stage` to group where the failure was recorded:
+`routing`, `handler`, or `bookkeeping`.
+
+The dashboard also has a **kafkaman failure details** panel, querying:
+
+```
+data_stream.type: traces and status.code: Error
+```
+
+`status.code` is where the OTel mapping puts a span's status, and it is present
+only on spans that reported one, so that query is an exhaustive list of what the
+system called a failure with no exclusions to maintain. The detail view includes
+both the failed `kafkaman.dispatch` transaction and the narrower span that
+failed inside it, such as `kafkaman.handler`. `status.message` carries the
+recorded error, `attributes.error.type` carries the stable problem URI, and
+`attributes.handler.outcome` is `panicked` on the spans where the handler
+panicked rather than returning. Metrics carry the same distinction as
+`kafkaman.scheduler.rows{scheduler="dispatcher",status="panicked"}`; panicked
+rows are also counted under `status="failed"`.
+
+In APM, look at the service whose consumer handled the message. A product-side
+handler failure caused by an order event belongs to
+`kafkaman-example-product`, with `transactionType=messaging`. The
+`POST /orders` request in `kafkaman-example-order` should stay successful: that
+service accepted and durably published the order, and the downstream product
+handler failed asynchronously after the HTTP request had already finished.
+Elastic's Errors UI is a separate grouping, over reported *exceptions* rather
+than over failed transactions, and this stack now populates it. Every failure on
+the durable path emits an OpenTelemetry `exception` span event carrying
+`exception.type` — the same permanent `urn:kafkaman:problem:*` URI the DLQ row
+stores — and `exception.message`, bounded to 256 bytes. So the APM service page
+groups failures by kind, counts occurrences per group, and lets you pivot from a
+failed transaction to the error and back.
+
+The grouping is finer than the DLQ's. `ReceivedFailureKind` has four permanent
+values because they are written into stored rows and cannot churn; the exception
+type is derived from the error's own Rust type and has eighteen, so a handler that
+*panicked* reports `urn:kafkaman:problem:handler-panicked` and groups separately
+from one that returned an error, while both still dead-letter as
+`urn:kafkaman:problem:handler`. Reconcile the two views on
+`attributes.error.type`, which both carry.
+
+One failure produces one error document, not one per span: the event is emitted
+on the innermost span that owns the failure — `kafkaman.handler` for a handler
+failure, `kafkaman.dispatch` for a routing or bookkeeping one — and the spans
+enclosing it carry the failure *status* without repeating the event.
+
+The operator routes are the other half of the picture, and they answer without
+any telemetry backend at all:
+
+```bash
+curl -s localhost:3002/internal/kafkaman/dlq      | jq   # depth, attempts, error history
+curl -s localhost:3002/internal/kafkaman/received | jq   # depth by status
+curl -s localhost:3002/internal/kafkaman/outbox   | jq   # the send side
+curl -s localhost:3002/internal/kafkaman/stuck    | jq   # overdue on either side
+```
+
+> **These routes have no authentication.** `/dlq` omits message bodies and
+> headers by construction, but it does return `entity_key` and each failure's
+> `detail` — a business key and free text your handler wrote. Panic details can
+> also carry assertion dumps or `Debug` output the handler never meant to expose.
+> That is acceptable *here* and nowhere else: a disposable local stack, on a
+> private compose network, with ports published to loopback. kafkaman ships reads
+> and the destructive redrive as two separate routers precisely so a real
+> deployment can put different policies on each — see `admin_router` and
+> `redrive_router`.
 
 Walk the lifecycle:
 

@@ -8,10 +8,10 @@
 //!
 //! # Security
 //!
-//! Nothing here is authenticated. [`admin_router`] reads queue contents,
-//! including stored payloads, and [`redrive_router`] re-enqueues dead-lettered
-//! messages. They are separate functions so that mounting the destructive one is
-//! a decision rather than a side effect — see their documentation.
+//! Nothing here is authenticated. [`admin_router`] reads queue metadata and
+//! failure details, and [`redrive_router`] re-enqueues dead-lettered messages.
+//! They are separate functions so that mounting the destructive one is a
+//! decision rather than a side effect — see their documentation.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,9 +29,10 @@ use axum::{Json, Router};
 use kafkaman_core::{MessageDescriptor, ReceivedError, ReceivedFailureKind};
 use kafkaman_sqlx::{
     outbox_status_summary, outbox_stuck_rows, received_failed_count, received_failed_rows,
-    received_status_summary, received_stuck_rows, redrive_received, OutboxStatusSummary,
-    OutboxStuckRow, OutboxTable, ReceivedFailureFilter, ReceivedStatusSummary, ReceivedStuckRow,
-    ReceivedTable, Replay, ResolvedConfig,
+    received_status_summary, received_stuck_rows, redrive_received, service_table_access,
+    service_tables, OutboxStatusSummary, OutboxStuckRow, OutboxTable, ReceivedFailureFilter,
+    ReceivedStatusSummary, ReceivedStuckRow, ReceivedTable, Replay, ResolvedConfig, ServiceTables,
+    TableAccess,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -217,9 +218,10 @@ impl AdminState {
 /// # Security
 ///
 /// **This router has no authentication or authorization.** Read-only is not the
-/// same as harmless: `/dlq` returns stored payloads and failure messages, which
-/// is exactly the data most likely to be sensitive. Mount it on an internal
-/// listener, or behind your own auth middleware — never on a public route table:
+/// same as harmless: `/dlq` returns business keys and failure messages, which
+/// can be as sensitive as the payloads deliberately omitted from the response.
+/// Mount it on an internal listener, or behind your own auth middleware — never
+/// on a public route table:
 ///
 /// ```ignore
 /// let admin = admin_router(state).layer(my_auth_layer());
@@ -273,6 +275,8 @@ pub fn redrive_router(state: AdminState) -> Router {
 
 /// Liveness: the process is up and serving. Touches no dependency on purpose,
 /// so a database blip cannot cause an orchestrator to kill a healthy process.
+// Stays in the debug tier: an orchestrator probes this forever and it touches nothing.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
@@ -282,6 +286,8 @@ async fn health() -> Json<serde_json::Value> {
 ///
 /// Deliberately narrower than "kafkaman is healthy" — it does not verify that
 /// tables exist, that migrations are current, or that workers are running.
+// Stays in the debug tier: an orchestrator probes this forever.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn ready(State(state): State<AdminState>) -> Response {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -310,11 +316,13 @@ async fn ready(State(state): State<AdminState>) -> Response {
 ///
 /// `now` is sampled once for the whole request so every table's age is measured
 /// against the same clock.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn outbox_summary(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<OutboxStatusSummary>>, AdminError> {
     let now = OffsetDateTime::now_utc();
+    let tables = service_tables(&state.pool, &state.cfg).await?;
+    ensure_service_tables(&state.cfg, &tables)?;
     let mut summaries = Vec::new();
     for descriptor in state.cfg.messages() {
         let policy = state
@@ -322,6 +330,14 @@ async fn outbox_summary(
             .observability
             .policy_for(descriptor.message_type.as_str());
         let table = OutboxTable::new(state.cfg.schema.clone(), descriptor.clone())?;
+        // A type this service only consumes has no outbox table, and querying
+        // one that was never created fails the whole request rather than
+        // omitting a row. See `ServiceTables`.
+        let qualified_name = table.qualified_name();
+        if !tables.contains(&qualified_name) {
+            log_skipped_table("outbox", descriptor, &qualified_name);
+            continue;
+        }
         summaries
             .extend(outbox_status_summary(&state.pool, &table, now, policy.max_queue_age).await?);
     }
@@ -330,11 +346,13 @@ async fn outbox_summary(
 
 /// Received-table depth per message type and status. Same cost and ordering
 /// rationale as [`outbox_summary`].
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn received_summary(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<ReceivedStatusSummary>>, AdminError> {
     let now = OffsetDateTime::now_utc();
+    let tables = service_tables(&state.pool, &state.cfg).await?;
+    ensure_service_tables(&state.cfg, &tables)?;
     let mut summaries = Vec::new();
     for descriptor in state.cfg.messages() {
         let policy = state
@@ -342,6 +360,13 @@ async fn received_summary(
             .observability
             .policy_for(descriptor.message_type.as_str());
         let table = ReceivedTable::for_descriptor(&state.cfg, descriptor.clone())?;
+        // Symmetrically: a type this service only publishes has no received
+        // table.
+        let qualified_name = table.qualified_name();
+        if !tables.contains(&qualified_name) {
+            log_skipped_table("received", descriptor, &qualified_name);
+            continue;
+        }
         summaries
             .extend(received_status_summary(&state.pool, &table, now, policy.max_queue_age).await?);
     }
@@ -363,11 +388,13 @@ pub struct StuckResponse {
 
 /// Expired outbox claims and overdue received rows, using each message type's
 /// configured `stuck_after` threshold.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn stuck_rows(State(state): State<AdminState>) -> Result<Json<StuckResponse>, AdminError> {
     const LIMIT_PER_TYPE: i64 = 100;
 
     let now = OffsetDateTime::now_utc();
+    let tables = service_tables(&state.pool, &state.cfg).await?;
+    ensure_service_tables(&state.cfg, &tables)?;
     let mut truncated = false;
     let mut outbox = Vec::new();
     let mut received = Vec::new();
@@ -377,28 +404,38 @@ async fn stuck_rows(State(state): State<AdminState>) -> Result<Json<StuckRespons
             .observability
             .policy_for(descriptor.message_type.as_str());
         let outbox_table = OutboxTable::new(state.cfg.schema.clone(), descriptor.clone())?;
-        let outbox_batch = outbox_stuck_rows(
-            &state.pool,
-            &outbox_table,
-            now,
-            policy.stuck_after,
-            LIMIT_PER_TYPE,
-        )
-        .await?;
-        truncated |= i64::try_from(outbox_batch.len()).unwrap_or(i64::MAX) >= LIMIT_PER_TYPE;
-        outbox.extend(outbox_batch);
+        let outbox_name = outbox_table.qualified_name();
+        if tables.contains(&outbox_name) {
+            let outbox_batch = outbox_stuck_rows(
+                &state.pool,
+                &outbox_table,
+                now,
+                policy.stuck_after,
+                LIMIT_PER_TYPE,
+            )
+            .await?;
+            truncated |= i64::try_from(outbox_batch.len()).unwrap_or(i64::MAX) >= LIMIT_PER_TYPE;
+            outbox.extend(outbox_batch);
+        } else {
+            log_skipped_table("outbox", descriptor, &outbox_name);
+        }
 
         let received_table = ReceivedTable::for_descriptor(&state.cfg, descriptor.clone())?;
-        let received_batch = received_stuck_rows(
-            &state.pool,
-            &received_table,
-            now,
-            policy.stuck_after,
-            LIMIT_PER_TYPE,
-        )
-        .await?;
-        truncated |= i64::try_from(received_batch.len()).unwrap_or(i64::MAX) >= LIMIT_PER_TYPE;
-        received.extend(received_batch);
+        let received_name = received_table.qualified_name();
+        if tables.contains(&received_name) {
+            let received_batch = received_stuck_rows(
+                &state.pool,
+                &received_table,
+                now,
+                policy.stuck_after,
+                LIMIT_PER_TYPE,
+            )
+            .await?;
+            truncated |= i64::try_from(received_batch.len()).unwrap_or(i64::MAX) >= LIMIT_PER_TYPE;
+            received.extend(received_batch);
+        } else {
+            log_skipped_table("received", descriptor, &received_name);
+        }
     }
     Ok(Json(StuckResponse {
         outbox,
@@ -432,8 +469,9 @@ pub struct DlqSummary {
 /// `entity_key` is a caller-chosen business key and `latest_error.detail` is a
 /// free-text string produced by your handler. Neither is payload, but both can
 /// carry whatever the application put in them, up to and including personal
-/// data. Treat this response as sensitive; it is sanitized of message bodies,
-/// not of everything.
+/// data. A panic detail is even less curated: it can include assertion dumps or
+/// `Debug` output the application never meant to expose. Treat this response as
+/// sensitive; it is sanitized of message bodies, not of everything.
 #[derive(Clone, Debug, Serialize)]
 pub struct DlqRowSummary {
     pub message_id: Uuid,
@@ -456,14 +494,22 @@ pub struct DlqRowSummary {
 ///
 /// Two queries per message type — an exact count plus a bounded page — because
 /// the count must stay honest when the listing is truncated.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn dlq_summary(State(state): State<AdminState>) -> Result<Json<Vec<DlqSummary>>, AdminError> {
     const ROW_LIMIT_PER_TYPE: i64 = 50;
 
     let filter = ReceivedFailureFilter::default();
+    let tables = service_tables(&state.pool, &state.cfg).await?;
+    ensure_service_tables(&state.cfg, &tables)?;
     let mut summaries = Vec::new();
     for descriptor in state.cfg.messages() {
         let table = ReceivedTable::for_descriptor(&state.cfg, descriptor.clone())?;
+        // Only what this service consumes has a dead-letter queue.
+        let qualified_name = table.qualified_name();
+        if !tables.contains(&qualified_name) {
+            log_skipped_table("received", descriptor, &qualified_name);
+            continue;
+        }
         let count = received_failed_count(&state.pool, &table, &filter).await?;
         let rows = received_failed_rows(&state.pool, &table, &filter, ROW_LIMIT_PER_TYPE).await?;
         summaries.push(DlqSummary {
@@ -570,7 +616,7 @@ pub struct RedriveResponse {
 /// Destructive and unauthenticated — see [`redrive_router`]. Bounded by
 /// [`MAX_REDRIVE_ROWS`]; targets terminal rows only; preserves failure history
 /// unless `clear_history` is set.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn redrive_dlq(
     State(state): State<AdminState>,
     Path(message_type): Path<String>,
@@ -583,6 +629,29 @@ async fn redrive_dlq(
     }
     let descriptor = descriptor_for_message_type(&state.cfg, &message_type)
         .ok_or_else(|| AdminError::UnknownMessageType(message_type.clone()))?;
+    // Registered is not the same as consumed. A type this service only publishes
+    // has no received table, so redriving it would fail against a relation that
+    // was never created — a 500 for what is really the caller pointing a real
+    // message type at the wrong service.
+    //
+    // `UPDATE` as well as `SELECT`, because redrive writes: `redrive_received`
+    // moves failed rows back to pending. A role holding only `SELECT` would pass
+    // a read-shaped probe and then fail against the statement the probe had just
+    // cleared, which is the 500 this check exists to replace.
+    let table = ReceivedTable::for_descriptor(&state.cfg, descriptor.clone())?;
+    let access = service_table_access(
+        &state.pool,
+        &table.schema,
+        &table.table,
+        &["SELECT", "UPDATE"],
+    )
+    .await?;
+    if !access.is_ready() {
+        return Err(AdminError::NotRedrivable {
+            message_type,
+            access,
+        });
+    }
     let mut replay =
         Replay::received_descriptor(Replay::RUNTIME_VERSION, descriptor).max_rows(request.max_rows);
     if let Some(kind) = request.failure_kind {
@@ -612,6 +681,54 @@ fn descriptor_for_message_type(
         .cloned()
 }
 
+/// Refuse to answer for a configuration whose schema cannot back it.
+///
+/// # The invariant, and why it is the right one
+///
+/// A message type is declared because this service does *something* with it, and
+/// the migrations create exactly one table per side. So every declared type must
+/// have at least one readable side here. A type with neither is not a service
+/// that publishes what it does not consume — it is a schema that was never
+/// migrated, or a database role that cannot read it.
+///
+/// Checking only "are there zero tables in total" caught the fully-unmigrated
+/// service and nothing else. A schema missing three of five types answered `200`
+/// with those three silently absent, which reads as *these queues are empty* —
+/// the most dangerous wrong answer an operator summary can give. Per type, the
+/// two cases separate cleanly: one side missing is the normal shape of a
+/// service, both sides missing is a broken deployment.
+fn ensure_service_tables(cfg: &ResolvedConfig, tables: &ServiceTables) -> Result<(), AdminError> {
+    let mut unusable = Vec::new();
+    for descriptor in cfg.messages() {
+        let outbox = OutboxTable::for_descriptor(cfg, descriptor.clone())?;
+        let received = ReceivedTable::for_descriptor(cfg, descriptor.clone())?;
+        if !tables.contains(&outbox.qualified_name())
+            && !tables.contains(&received.qualified_name())
+        {
+            unusable.push(descriptor.message_type.as_str().to_owned());
+        }
+    }
+    if unusable.is_empty() {
+        return Ok(());
+    }
+    Err(AdminError::UnusableServiceTables(unusable))
+}
+
+/// Note a message type this service has no table for on one side.
+///
+/// `debug!` rather than `info!`, and correctly so now that
+/// [`ensure_service_tables`] rejects the case worth shouting about. What reaches
+/// here is a type this service only publishes or only consumes, which is the
+/// normal shape of every real service and would be noise at every request.
+fn log_skipped_table(kind: &'static str, descriptor: &MessageDescriptor, qualified_name: &str) {
+    tracing::debug!(
+        message_type = descriptor.message_type.as_str(),
+        table = qualified_name,
+        kind,
+        "kafkaman admin route skipped the side of a message type this service does not have"
+    );
+}
+
 /// Failure of an admin request, mapped to a status code by its
 /// [`IntoResponse`] impl.
 ///
@@ -619,20 +736,64 @@ fn descriptor_for_message_type(
 /// A `Sqlx` failure logs in full and returns an opaque body, so schema names and
 /// SQL text never reach an unauthenticated client.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AdminError {
     BadRequest(String),
+    /// Message types this service declares but has no readable table for on
+    /// either side.
+    ///
+    /// Every declared type gets a table on the side this service is on, so
+    /// neither side present means the schema cannot back the configuration —
+    /// unmigrated, or unreadable by this role. Reported rather than skipped
+    /// because the alternative is answering `200` with those types silently
+    /// absent, which reads as "these queues are empty".
+    UnusableServiceTables(Vec<String>),
     Sqlx(kafkaman_sqlx::Error),
     UnknownMessageType(String),
+    /// Registered, but this route cannot redrive it here.
+    ///
+    /// Separate from [`Self::UnknownMessageType`] because the repair is
+    /// different: the caller named a real message type. The [`TableAccess`] says
+    /// which repair — a type this service only publishes, a schema that was
+    /// never migrated, or a role without the privileges redrive needs — and it
+    /// also decides the status, because only the first of those three is the
+    /// caller's to fix. See the [`IntoResponse`] impl.
+    NotRedrivable {
+        message_type: String,
+        access: TableAccess,
+    },
 }
 
 impl std::fmt::Display for AdminError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadRequest(message) => write!(f, "bad request: {message}"),
+            Self::UnusableServiceTables(message_types) => write!(
+                f,
+                "no readable kafkaman table for message type(s) {}",
+                message_types.join(", ")
+            ),
             Self::Sqlx(err) => write!(f, "storage error: {err}"),
             Self::UnknownMessageType(message_type) => {
                 write!(f, "message type `{message_type}` is not registered")
             }
+            Self::NotRedrivable {
+                message_type,
+                access,
+            } => write!(
+                f,
+                "message type `{message_type}` {}: {}",
+                // Agrees with the response body, because these two strings are
+                // read by the same person minutes apart — one in a log, one in a
+                // client. Saying the table is absent in a log while the response
+                // says it is unreadable makes them doubt both.
+                if access.is_ready() || *access == TableAccess::Missing {
+                    "has no dead-letter queue in this service"
+                } else {
+                    "has a dead-letter queue in this service, but it cannot be read"
+                },
+                access.repair()
+            ),
         }
     }
 }
@@ -670,6 +831,78 @@ impl IntoResponse for AdminError {
                 })),
             )
                 .into_response(),
+            // 503, not 500: the request is well-formed and the service is the
+            // right one to ask; its schema is not ready to answer. That is a
+            // retry-after-you-fix-the-deployment condition, and it is what a
+            // readiness probe would report if it checked tables.
+            Self::UnusableServiceTables(message_types) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "kafkaman has no readable table for some configured message types; \
+                              run this service's migrations, or grant its database role access",
+                    "message_types": message_types,
+                })),
+            )
+                .into_response(),
+            // The status separates the two things a refusal can mean, because
+            // they page different people.
+            //
+            // `Missing` is a 404 and belongs to the caller: every declared type
+            // gets a table on the side this service is on, so a *received* table
+            // that is absent means this type is published here and consumed
+            // somewhere else. There is no dead-letter queue at this address and
+            // there never will be.
+            //
+            // `NotATable` and `NoPrivilege` are 503, for the reason
+            // `UnusableServiceTables` above is: the request is well-formed and
+            // correctly addressed, and the schema behind it is not ready to
+            // answer. Reporting those as 404 tells an operator the queue does
+            // not exist when it does and is full — the same wrong answer, aimed
+            // at the same person, that `ensure_service_tables` exists to
+            // prevent. A retry after the deployment is fixed then succeeds,
+            // which is exactly what 503 promises and 404 denies.
+            //
+            // Not 403 for `NoPrivilege`. 403 says *this caller* may not do this,
+            // and no caller credential is involved: the role that lacks `UPDATE`
+            // is the service's own database role. Sending an operator to look at
+            // the requester's authorization would point them away from the
+            // grant that is actually missing.
+            Self::NotRedrivable {
+                message_type,
+                access,
+            } => {
+                let (status, error) = match access {
+                    // Unreachable: the route only builds this variant after
+                    // `is_ready()` returned false. Grouped with `Missing` so a
+                    // later edit that loosens the guard degrades to the
+                    // caller-facing answer rather than claiming an outage.
+                    TableAccess::Missing | TableAccess::Ready => (
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "message type `{message_type}` has no dead-letter queue in this \
+                             service"
+                        ),
+                    ),
+                    // The queue exists. Saying it does not would send an
+                    // operator looking for the wrong service while their rows
+                    // sit here.
+                    TableAccess::NotATable | TableAccess::NoPrivilege => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "message type `{message_type}` has a dead-letter queue in this \
+                             service, but it cannot be read"
+                        ),
+                    ),
+                };
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "error": error,
+                        "repair": access.repair(),
+                    })),
+                )
+                    .into_response()
+            }
             Self::Sqlx(err) => {
                 tracing::error!(error = %err, "kafkaman admin request failed");
                 (
@@ -748,7 +981,7 @@ impl RuntimeServer {
     /// runtime mid-cycle and cut in-flight publishes, which is exactly the
     /// failure an outbox exists to prevent. Use
     /// [`RuntimeServer::with_runtime_drain_timeout`] to change the bound.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     pub async fn with_runtime(
         self,
         tasks: Vec<RuntimeTask>,
@@ -1020,9 +1253,58 @@ mod tests {
         }
     }
 
+    /// Serializes every test that installs a subscriber.
+    ///
+    /// `tracing` keeps a **process-global** maximum level, recomputed as
+    /// subscribers come and go, and a span callsite consults it before it
+    /// consults any subscriber. So a test installing a filtered subscriber on
+    /// its own thread can silently disable another test's span on a different
+    /// one — which shows up as a span that simply never opened, with nothing
+    /// pointing at the cause. `set_default` being thread-local is not enough;
+    /// the level hint it adjusts is not.
+    ///
+    /// Poisoning is stepped over rather than propagated: one failing test
+    /// should not turn every other subscriber test into a second failure
+    /// reporting the first one's panic.
+    static SUBSCRIBER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_subscriber() -> std::sync::MutexGuard<'static, ()> {
+        ensure_permissive_global();
+        SUBSCRIBER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Install a permissive subscriber globally, once, before any test opens a
+    /// span.
+    ///
+    /// The mutex above is necessary and not sufficient, because the thing being
+    /// shared is not the dispatcher. `tracing` caches each *callsite's* interest
+    /// globally, and rebuilds that cache as thread-local defaults come and go —
+    /// computing it against the **global** dispatcher, which with none installed
+    /// is `NoSubscriber`, and which answers "never" for every callsite. That
+    /// answer is then cached, so a thread-local subscriber on another thread is
+    /// never consulted and its spans simply do not open.
+    ///
+    /// It shows up as a span that was never recorded, on a test that does not
+    /// install anything itself, only when the suite runs multi-threaded —
+    /// measured here at roughly one run in eight, and never under
+    /// `--test-threads=1`. Installing a permissive global once means every
+    /// rebuild computes a real answer instead of that one.
+    ///
+    /// The result is ignored: a second call is an error and is exactly what
+    /// `Once` is preventing.
+    fn ensure_permissive_global() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
     /// Drives one request through a real router with the layer applied, and
     /// returns the `(http.route, otel.name)` its span recorded.
     async fn recorded_route(uri: &str) -> (String, String) {
+        let _serialized = lock_subscriber();
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let recorded = RecordedRoutes::default();
@@ -1071,16 +1353,27 @@ mod tests {
         }
     }
 
-    /// The `kafkaman::internal` tier is off by default and on by its own target.
+    /// The `kafkaman::internal` tier is split by level, and its poll half is
+    /// reachable by its own target.
     ///
-    /// [`health`] stands in for all of it: it is the one annotated function in
-    /// this crate that touches nothing, and the attribute is identical on every
-    /// other one. What is being pinned is the directive `examples/README.md`
-    /// documents — including that reaching the tier does **not** require turning
-    /// on `debug` for everything, which would drown it in `sqlx` and `rdkafka`
-    /// output.
+    /// Three things are pinned, and they are three because the tier is no longer
+    /// one thing:
+    ///
+    /// 1. A function that runs on a timer ([`health`], which an orchestrator
+    ///    probes forever and which touches nothing) stays out of the default
+    ///    filter. This is the whole cost argument for the tier being visible at
+    ///    all — an idle service that exports its own scheduler exports nothing
+    ///    else worth reading.
+    /// 2. A function on the message path ([`RuntimeServer::with_runtime`],
+    ///    standing in for the sixty of them, since it is the one promoted
+    ///    function in this crate that needs no database) *is* in the default
+    ///    filter. Without this half the test passes just as well against a tier
+    ///    reverted to debug wholesale.
+    /// 3. The directive `examples/README.md` documents still reaches the poll
+    ///    half — and still does not require turning on `debug` globally, which
+    ///    would drown it in `sqlx` and `rdkafka` output.
     #[tokio::test]
-    async fn the_internal_span_tier_is_gated_by_its_own_target() {
+    async fn the_internal_span_tier_is_split_by_level_and_reachable_by_target() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
         // Per-layer filtering, because that is what `kafkaman_otel::init` does:
@@ -1090,6 +1383,15 @@ mod tests {
         async fn spans_opened_under(directive: &str) -> Vec<String> {
             use tracing_subscriber::Layer as _;
 
+            // Bound outside the guarded scope below. Binding inside it would put
+            // an `await` on the OS between installing a subscriber and removing
+            // it again, and that window is exactly what the lock exists to keep
+            // short.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("binding an ephemeral port");
+
+            let _serialized = lock_subscriber();
             let recorded = RecordedSpans::default();
             {
                 let _guard = tracing::subscriber::set_default(
@@ -1100,6 +1402,19 @@ mod tests {
                     ),
                 );
                 let _ = health().await;
+
+                // Returns immediately: the shutdown token is already cancelled,
+                // so the server stops before accepting anything and the drain
+                // has no tasks to wait for. The span is what is under test, not
+                // the serving.
+                let shutdown = CancellationToken::new();
+                shutdown.cancel();
+                let _ = RuntimeServer {
+                    listener,
+                    app: axum::Router::new(),
+                }
+                .with_runtime(Vec::new(), shutdown)
+                .await;
             }
             let names = recorded
                 .0
@@ -1109,17 +1424,24 @@ mod tests {
             names
         }
 
+        let default_filter = spans_opened_under("info").await;
         assert!(
-            !spans_opened_under("info")
-                .await
-                .contains(&"health".to_owned()),
-            "the default filter must not open internal-tier spans"
+            !default_filter.contains(&"health".to_owned()),
+            "a function an orchestrator polls forever must stay out of the default \
+             filter; opened: {default_filter:?}"
         );
+        assert!(
+            default_filter.contains(&"with_runtime".to_owned()),
+            "the message-path half of the tier is supposed to be visible by \
+             default — that is what makes the waterfall gapless; opened: \
+             {default_filter:?}"
+        );
+
         assert!(
             spans_opened_under("info,kafkaman::internal=debug")
                 .await
                 .contains(&"health".to_owned()),
-            "the documented directive must open them"
+            "the documented directive must reach the poll half too"
         );
     }
 
@@ -1265,6 +1587,7 @@ mod tests {
                 ReceivedFailureKind::Handler,
                 "boom",
                 now,
+                Some(kafkaman_core::FailureStage::Handler),
             )),
             error_count: 1,
         };
@@ -1399,6 +1722,7 @@ mod tests {
             ReceivedFailureKind::InvalidPayload,
             "boom",
             OffsetDateTime::UNIX_EPOCH,
+            Some(kafkaman_core::FailureStage::Handler),
         );
         let printed = serde_json::to_value(&printed).expect("a problem detail should serialize");
         let printed = printed["type"].as_str().expect("RFC 9457 names it `type`");
@@ -1448,11 +1772,81 @@ mod tests {
         let missing = AdminError::UnknownMessageType("nope".to_owned()).into_response();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
+        let schema =
+            AdminError::UnusableServiceTables(vec!["order_snapshot".to_owned()]).into_response();
+        assert_eq!(schema.status(), StatusCode::SERVICE_UNAVAILABLE);
+
         let internal = AdminError::Sqlx(kafkaman_sqlx::Error::Handler(
             "schema kafkaman_x".to_owned(),
         ))
         .into_response();
         assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn a_refused_redrive_separates_the_wrong_service_from_a_broken_one() {
+        let not_redrivable = |access| {
+            AdminError::NotRedrivable {
+                message_type: "order_snapshot".to_owned(),
+                access,
+            }
+            .into_response()
+            .status()
+        };
+
+        // No received table here at all: this service publishes the type and
+        // something else consumes it. The caller is at the wrong address, and
+        // no amount of waiting changes that.
+        assert_eq!(not_redrivable(TableAccess::Missing), StatusCode::NOT_FOUND);
+
+        // The table is there. A 404 would tell an operator the queue does not
+        // exist while it sits full behind a missing grant, and would send them
+        // to the caller's address instead of to the deployment.
+        assert_eq!(
+            not_redrivable(TableAccess::NoPrivilege),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a role without UPDATE is this deployment's fault, not the caller's"
+        );
+        assert_eq!(
+            not_redrivable(TableAccess::NotATable),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a relation kafkaman did not create is a broken schema, not a 404"
+        );
+
+        // The body has to agree with the status. A 503 that says the queue does
+        // not exist is worse than either half alone: it tells an operator to
+        // wait *and* that there is nothing to wait for.
+        let described = |access| {
+            AdminError::NotRedrivable {
+                message_type: "order_snapshot".to_owned(),
+                access,
+            }
+            .to_string()
+        };
+        assert!(
+            described(TableAccess::Missing).contains("has no dead-letter queue"),
+            "the 404 case must say the queue is absent: {}",
+            described(TableAccess::Missing)
+        );
+        assert!(
+            described(TableAccess::NoPrivilege).contains("cannot be read"),
+            "the 503 case must say the queue exists and is unreachable, not that \
+             it is absent: {}",
+            described(TableAccess::NoPrivilege)
+        );
+
+        // Whichever status, the body names the repair: the code alone cannot
+        // distinguish the three, and only one of them is the caller's to fix.
+        for access in [
+            TableAccess::Missing,
+            TableAccess::NoPrivilege,
+            TableAccess::NotATable,
+        ] {
+            assert!(
+                !access.repair().is_empty(),
+                "{access:?} must tell an operator what to do about it"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! Reclaiming disk from outbox rows nothing will ever act on again.
 
+use kafkaman_core::InstrumentDb;
 use kafkaman_core::{OutboxStatus, PurgeConfig, PurgeStats};
 use sqlx::PgPool;
 
@@ -25,6 +26,8 @@ use crate::{OutboxTable, Result};
 /// `FOR UPDATE SKIP LOCKED` keeps a sweep from blocking, or being blocked by, a
 /// relay working the same table: a row another transaction holds is left for the
 /// next batch rather than waited on.
+// Stays in the debug tier: a 60s sweep against a retention measured in days.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn purge_outbox_once(
     pool: &PgPool,
@@ -57,10 +60,21 @@ pub async fn purge_outbox_once(
         statuses = statuses.join(", "),
     );
 
+    // The one statement on the durable path that had no span at any tier, so a
+    // retention sweep was invisible however `RUST_LOG` was set. `db_poll_span!`
+    // rather than `db_span!` for the reason the seven scheduler statements use
+    // it: this runs on `poll_interval` (60s by default) against an `older_than`
+    // measured in days, so on nearly every run it deletes nothing and would be
+    // most of what an idle service exported.
     let result = sqlx::query(&sql)
         .bind(cfg.older_than.as_secs_f64())
         .bind(cfg.batch_size)
         .execute(pool)
+        .instrument_db(kafkaman_core::db_poll_span!(
+            "DELETE",
+            table.qualified_name(),
+            "purge outbox rows",
+        ))
         .await?;
 
     Ok(PurgeStats {

@@ -23,7 +23,7 @@ Related:
 When `dispatch_once` claims a row and no handler is registered for its
 `message_type`, it records a receive failure in the received table under the
 same claimed-row transaction and returns `DispatchStats { claimed: 1, processed:
-0, failed: 1 }` after that durable failure row update commits.
+0, failed: 1, panicked: 0 }` after that durable failure row update commits.
 
 The failure parks the row by setting it to `Retryable` with `next_attempt_at =
 NULL`, matching existing receive failure behavior. A missing-handler row must not

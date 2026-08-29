@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use kafkaman_core::{
-    Envelope, IdempotencyIdentity, IdempotencyKey, IdempotencySource, KafkaMessage,
+    panic_message, Envelope, IdempotencyIdentity, IdempotencyKey, IdempotencySource, KafkaMessage,
     ReceivedIngestFailureKind, TraceContext, RESERVED_HEADER_PREFIX,
 };
 use kafkaman_sqlx::ReceivedIngestFailure;
@@ -101,7 +102,8 @@ where
     }
 
     let payload = message.payload().ok_or(Error::MissingPayload)?;
-    let payload = serde_json::from_slice::<P>(payload)?;
+    let payload = catch_unwind(AssertUnwindSafe(|| serde_json::from_slice::<P>(payload)))
+        .map_err(|payload| Error::PayloadPanicked(panic_message(payload)))??;
     let key = message.key().map(Vec::from);
 
     let mut envelope = Envelope::new(payload);

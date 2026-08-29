@@ -21,10 +21,12 @@ attempted handler failures.
 
 Normal handler and missing-handler failure accounting holds the claimed row lock
 until the retryable failure row commits. A competing dispatcher therefore skips
-the locked row and reports `DispatchStats { claimed: 0, processed: 0, failed: 0
-}` while the first dispatcher is still recording the failure. The dispatcher
-that commits the failure reports `DispatchStats { claimed: 1, processed: 0,
-failed: 1 }`.
+the locked row and reports
+`DispatchStats { claimed: 0, processed: 0, failed: 0, panicked: 0 }` while the
+first dispatcher is still recording the failure. The dispatcher that commits the
+failure reports
+`DispatchStats { claimed: 1, processed: 0, failed: 1, panicked: 0 }`, or
+`panicked: 1` when the failure was a caught handler panic.
 
 ## Rationale
 

@@ -6,10 +6,10 @@
 //! version of this module was four functions that were two, differing only in
 //! the executor and drifting the moment one was fixed and the other was not.
 
+use kafkaman_core::InstrumentDb;
 use kafkaman_core::{MarkOutcome, ReceiveStatus, ReceivedError, ReceivedRow};
 use sqlx::PgConnection;
 use time::OffsetDateTime;
-use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::dispatch_failure::FailureDisposition;
@@ -21,6 +21,8 @@ use crate::{ReceivedTable, Result};
 ///
 /// `FOR UPDATE SKIP LOCKED` is what lets several dispatchers share one table:
 /// a row another worker holds is passed over rather than waited on.
+// Stays in the debug tier: runs on `poll_interval` and finds nothing on an idle service.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn claim_received_row(
     conn: &mut PgConnection,
@@ -46,7 +48,7 @@ pub(crate) async fn claim_received_row(
     let row = sqlx::query(&sql)
         .bind(due_at)
         .fetch_optional(conn)
-        .instrument(kafkaman_core::db_poll_span!(
+        .instrument_db(kafkaman_core::db_poll_span!(
             "SELECT",
             table.qualified_name(),
             "claim received row",
@@ -55,7 +57,7 @@ pub(crate) async fn claim_received_row(
     row.map(received_row_from_pg).transpose()
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn mark_received_processed(
     conn: &mut PgConnection,
     table: &ReceivedTable,
@@ -73,7 +75,7 @@ pub(crate) async fn mark_received_processed(
         .bind(message_id)
         .bind(processed_at)
         .execute(&mut *conn)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "UPDATE",
             table.qualified_name(),
             "mark received processed",
@@ -120,16 +122,21 @@ impl ReceivedFailureRecord {
 }
 
 /// Append a failure to a row's audit trail and schedule or exhaust its retry.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub(crate) async fn record_received_failure(
     conn: &mut PgConnection,
     table: &ReceivedTable,
     failure: ReceivedFailureRecord,
 ) -> Result<MarkOutcome> {
+    // Both axes are written: the class the failure belongs to, and the frame it
+    // came out of. The row could previously only hold the first, so a database
+    // error returned by a handler stored `handler` and an operator filtering for
+    // infrastructure failures could not find it.
     let error = serde_json::to_value(ReceivedError::new(
         failure.disposition.kind,
         failure.message,
         failure.occurred_at,
+        Some(failure.disposition.stage),
     ))?;
     let schedule = received_failure_schedule(
         table,
@@ -147,7 +154,7 @@ pub(crate) async fn record_received_failure(
         .bind(failure.occurred_at)
         .bind(failure.disposition.kind.discriminant())
         .execute(&mut *conn)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "UPDATE",
             table.qualified_name(),
             "record received failure",
@@ -166,7 +173,7 @@ pub(crate) async fn record_received_failure(
 /// The distinction matters to the caller. A stale claim means another worker
 /// owns the row and will finish it; a missing row means the work is not coming
 /// back and nothing else will report that.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn mark_miss_outcome(
     conn: &mut PgConnection,
     table: &ReceivedTable,
@@ -179,7 +186,7 @@ async fn mark_miss_outcome(
     let exists = sqlx::query(&sql)
         .bind(message_id)
         .fetch_optional(conn)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "SELECT",
             table.qualified_name(),
             "classify received mark miss",

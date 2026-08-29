@@ -36,6 +36,7 @@
 //! for you to compose:
 //!
 //! ```no_run
+//! use tracing_subscriber::filter::FilterExt as _;
 //! use tracing_subscriber::layer::SubscriberExt as _;
 //! use tracing_subscriber::Layer as _;
 //! use tracing_subscriber::util::SubscriberInitExt as _;
@@ -53,8 +54,15 @@
 //!     .with(telemetry.trace_layer().map(|layer| {
 //!         layer.with_filter(filter())
 //!     }))
+//!     // The log bridge gets one extra exclusion. kafkaman reports failures as
+//!     // message-less events on `EXCEPTION_TARGET`, because that is the only
+//!     // shape the span layer rewrites into an OpenTelemetry `exception` — so
+//!     // exporting them as logs as well produces a blank ERROR record for every
+//!     // error already reported as one. `init` does this for you.
 //!     .with(telemetry.log_layer().map(|layer| {
-//!         layer.with_filter(filter())
+//!         layer.with_filter(filter().and(tracing_subscriber::filter::filter_fn(
+//!             |metadata| metadata.target() != kafkaman_otel::EXCEPTION_TARGET,
+//!         )))
 //!     }))
 //!     .init();
 //! # Ok(())
@@ -154,6 +162,7 @@ use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
+use tracing_subscriber::filter::FilterExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer as _;
@@ -164,6 +173,22 @@ const OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 const OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
 /// Read by the SDK itself, not by this crate — see [`Builder::metric_interval`].
 const METRIC_EXPORT_INTERVAL: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+
+/// The `tracing` target kafkaman reports failures on, excluded from log export.
+///
+/// This is `kafkaman_core::TELEMETRY_TARGET`, spelled out rather than imported:
+/// this crate deliberately does not depend on kafkaman, which is what lets a
+/// host copy it and own it. `the_exception_target_matches_kafkaman_core` in
+/// `observability-tests` — which does depend on both — is what stops the two
+/// from drifting.
+///
+/// Events on this target carry no message, because that is the only shape
+/// `tracing-opentelemetry` rewrites into an OpenTelemetry `exception`. That
+/// makes them exactly right on the span layer and exactly wrong on the log
+/// bridge, which exports each one as a log record with an empty body — one blank
+/// ERROR line for every error already reported as an error. Measured on the
+/// example stack before this exclusion: 13 of 13 ERROR log records were these.
+pub const EXCEPTION_TARGET: &str = "kafkaman::telemetry";
 
 /// The metric collection interval used when neither the caller nor the
 /// environment picks one.
@@ -231,7 +256,7 @@ pub fn init(service_name: impl Into<Cow<'static, str>>) -> Result<Telemetry, Err
             .with(
                 telemetry
                     .log_layer()
-                    .map(|layer| layer.with_filter(env_filter())),
+                    .map(|layer| layer.with_filter(log_export_filter())),
             ),
     ) {
         // `build` has already installed the providers and started their exporter
@@ -587,6 +612,22 @@ fn env_is_nonempty(name: &str) -> bool {
 fn env_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// `RUST_LOG`, minus the events that are already leaving as exceptions.
+///
+/// The same filter every other layer gets, and then [`EXCEPTION_TARGET`] removed
+/// — see that constant for why. Dropping them here rather than at the callsite
+/// is what keeps the other two consumers whole: the span layer still gets the
+/// event it turns into an `exception`, and the stdout formatter still renders it
+/// for whoever is watching a terminal.
+///
+/// A host building its own registry through [`builder`] composes its own
+/// filters; the crate docs show this one.
+fn log_export_filter<S>() -> impl tracing_subscriber::layer::Filter<S> {
+    env_filter().and(tracing_subscriber::filter::filter_fn(|metadata| {
+        metadata.target() != EXCEPTION_TARGET
+    }))
 }
 
 /// Keep the first shutdown error, log any that follow.

@@ -26,6 +26,10 @@ impl OutboxTable {
         Self::new(cfg.schema.clone(), cfg.descriptor_for::<P>()?)
     }
 
+    pub fn for_descriptor(cfg: &ResolvedConfig, descriptor: MessageDescriptor) -> Result<Self> {
+        Self::new(cfg.schema.clone(), descriptor)
+    }
+
     pub fn qualified_name(&self) -> String {
         qualified_name(&self.schema, &self.table)
     }

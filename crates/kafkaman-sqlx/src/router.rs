@@ -6,6 +6,7 @@ use std::sync::Arc;
 use kafkaman_core::{KafkaMessage, ReceivedMeta};
 use serde::de::DeserializeOwned;
 use sqlx::PgConnection;
+use uuid::Uuid;
 
 use crate::Result;
 
@@ -235,9 +236,36 @@ impl MessageRouter {
 }
 
 /// What one dispatch cycle did.
+///
+/// `#[non_exhaustive]` because it has grown twice and will again: the three
+/// constructors are all inside this crate, where the attribute does not apply,
+/// so it costs nothing here and stops every future field from being a
+/// source-breaking change for adopters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct DispatchStats {
     pub claimed: usize,
     pub processed: usize,
     pub failed: usize,
+    /// Claimed rows whose failure was a caught handler panic.
+    ///
+    /// Also counted in [`Self::failed`], so summing the fields double-counts.
+    /// Kept separate so worker loops and metrics can distinguish "the handler
+    /// returned an error" from "the handler unwound" without inventing a second
+    /// durable failure kind.
+    pub panicked: usize,
+    /// The row that panicked, when one did.
+    ///
+    /// # Why the identity and not just the count
+    ///
+    /// The dispatcher's breaker has to tell "this deploy panics on everything"
+    /// from "this one message is poison". Those look identical through a
+    /// counter: `dispatch_once` claims one row per cycle, so a single row
+    /// retrying on its budget produces exactly as many panics as a bad deploy
+    /// does across distinct rows — and the retry budget is the thing that is
+    /// supposed to absorb the poison message, not trip a breaker over it.
+    ///
+    /// The identity separates them with no ambiguity, which is why it is carried
+    /// here rather than reconstructed from a heuristic in the loop.
+    pub panicked_message_id: Option<Uuid>,
 }

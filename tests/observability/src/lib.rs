@@ -35,7 +35,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 
-pub use durable_send_tests::{postgres_for_suite, ProductSnapshot, TestPostgres, TestResult};
+pub use durable_send_tests::{
+    postgres_for_suite, ProductSnapshot, RegionalProduct, TestPostgres, TestResult,
+};
 
 /// The suite label carried by this suite's containers.
 pub const SUITE: &str = "observability";
@@ -395,17 +397,51 @@ impl TracePipeline {
     /// moment it ends, and a batch processor would add a scheduling delay
     /// between the work finishing and the assertion being able to see it.
     pub fn install() -> Self {
-        let exporter = InMemorySpanExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        opentelemetry::global::set_tracer_provider(provider.clone());
+        let (provider, exporter) = Self::provider();
         tracing::subscriber::set_global_default(
             tracing_subscriber::registry()
                 .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("kafkaman"))),
         )
         .expect("no other subscriber should be installed in this binary");
         Self { provider, exporter }
+    }
+
+    /// The same pipeline, gated to the filter a default deployment runs.
+    ///
+    /// [`install`](Self::install) applies no filter at all, so it records the
+    /// `kafkaman::internal` tier alongside the phase spans. That is deliberate
+    /// for the trace-shape tests: the tier broke the durable trace context twice
+    /// and those tests are its regression proof.
+    ///
+    /// It is wrong for a test asserting that a phase span is a *root*. Under the
+    /// tier, `enqueue` carries a function span and calls `enqueue_on_connection`,
+    /// which opens `kafkaman.enqueue` — so the phase span has a parent, quite
+    /// correctly, and is the root only at the `info` a default deployment runs.
+    pub fn install_at_default_filter() -> Self {
+        use tracing_subscriber::Layer as _;
+
+        let (provider, exporter) = Self::provider();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("kafkaman"))
+                    // Per layer rather than registry-wide, matching how
+                    // `kafkaman_otel::init` composes its own.
+                    .with_filter(tracing_subscriber::EnvFilter::new("info")),
+            ),
+        )
+        .expect("no other subscriber should be installed in this binary");
+        Self { provider, exporter }
+    }
+
+    /// The provider and exporter both constructors share.
+    fn provider() -> (SdkTracerProvider, InMemorySpanExporter) {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_tracer_provider(provider.clone());
+        (provider, exporter)
     }
 
     /// Every span finished so far.
@@ -561,14 +597,21 @@ pub async fn drive_kafka_round_trip(
     .await?;
     assert_eq!(dispatch.processed, 1, "the handler ran");
 
-    // The `kafkaman::internal` debug tier must be live for this drive, because
-    // that is what makes the assertions downstream a regression test for it.
+    // The whole `kafkaman::internal` tier must be live for this drive — both its
+    // `info` half and its `debug` half — because that is what makes the
+    // assertions downstream a regression test for it.
     //
-    // It is live because `TracePipeline` installs no filter — and this fails
-    // loudly if that ever changes, rather than letting the coverage evaporate
-    // silently. Twice during its introduction the tier moved the stored trace
-    // context off the phase span and onto a private function, so what these
-    // tests prove *while it is on* is the whole point.
+    // It is live because `TracePipeline` installs no filter at all, which is a
+    // stronger condition than a service ever runs under: at `RUST_LOG=info` only
+    // the message-path half is on. Asserting against the wider setting is
+    // deliberate, since the hazard is a function span nesting between a capture
+    // and the phase span it means to capture, and a function that is `debug`
+    // today can be promoted tomorrow.
+    //
+    // This fails loudly if the tier ever stops being exercised, rather than
+    // letting the coverage evaporate silently. Twice during its introduction the
+    // tier moved the stored trace context off the phase span and onto a private
+    // function, so what these tests prove *while it is on* is the whole point.
     //
     // Detected structurally rather than by name: every deliberate span is
     // `kafkaman.*`, `db.query <summary>`, or `METHOD /route`, so a bare

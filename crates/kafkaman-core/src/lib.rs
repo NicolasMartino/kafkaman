@@ -12,6 +12,7 @@
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+mod dispatcher_config;
 /// Declares enums together with the `ALL` arrays derived from them. Used through
 /// `sql_enum!` and `discriminant_enum!` rather than called directly, which is why
 /// it is private.
@@ -28,6 +29,7 @@ mod relay_config;
 mod rows;
 mod span;
 mod status;
+mod text;
 mod topics;
 mod trace;
 
@@ -36,11 +38,13 @@ mod trace;
 /// directly, which is why it is private.
 mod problem_type;
 
+pub mod problem;
 pub mod rfc9557;
 
+pub use dispatcher_config::DispatcherConfig;
 pub use envelope::Envelope;
 pub use error::Error;
-pub use failure_kind::{ReceivedFailureKind, ReceivedIngestFailureKind};
+pub use failure_kind::{FailureStage, ReceivedFailureKind, ReceivedIngestFailureKind};
 pub use idempotency::{
     IdempotencyIdentity, IdempotencyKey, IdempotencySource, IntoIdempotencyIdentity,
     LEGACY_STRING_IDEMPOTENCY_NAMESPACE,
@@ -48,14 +52,18 @@ pub use idempotency::{
 pub use identifier::SqlIdentifier;
 pub use lifecycle::{LifecycleEmission, LifecycleSampler};
 pub use message::{reserved_header, KafkaMessage, MessageDescriptor, RESERVED_HEADER_PREFIX};
+pub use problem::ProblemType;
 pub use purge_config::{PurgeConfig, PurgeStats};
 pub use relay_config::{RelayConfig, RelayStats};
 pub use rows::{
     ClaimedOutboxRow, MarkOutcome, OutboxRow, PublishAck, PublishedRecord, ReceivedError,
     ReceivedMeta, ReceivedRow,
 };
-pub use span::record_error;
+pub use span::{
+    record_error, record_exception, record_exception_as, InstrumentDb, TELEMETRY_TARGET,
+};
 pub use status::{OutboxStatus, ReceiveStatus};
+pub use text::panic_message;
 pub use topics::{
     reconcile, CleanupPolicy, ObservedTopic, PartitionDrift, TopicAction, TopicMode, TopicOutcome,
     TopicSpec,

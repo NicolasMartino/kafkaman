@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kafkaman_config::KafkaTraceHandoff;
-use kafkaman_core::{Envelope, KafkaMessage, ReceivedIngestFailureKind};
+use kafkaman_core::{Envelope, InstrumentDb, KafkaMessage, ProblemType, ReceivedIngestFailureKind};
 use kafkaman_sqlx::{
     insert_received_ingest_failure, insert_received_with_outcome, ReceivedInsertOutcome,
-    ResolvedConfig,
+    ReceivedTable, ResolvedConfig,
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
@@ -42,6 +42,67 @@ impl RecordLocation {
             partition: message.partition(),
             offset: message.offset(),
         }
+    }
+}
+
+/// What became of one record, and the refusal to report if it was refused.
+///
+/// A quarantined record is a *handled* failure: the diagnosis is written, the
+/// offset advances, the loop continues, and `ingest_once` returns `Ok`. All of
+/// that is right, and it used to be the whole story — so `kafkaman.ingest`
+/// reported success for a record the ingester had rejected. A poison message
+/// produced no exception, no failed transaction, and no entry in any error list;
+/// the only trace of it was a row in a table nobody queries. Handled is not the
+/// same as fine.
+///
+/// The refusal travels out to `ingest_once` rather than being reported where it
+/// is decided, because `kafkaman.ingest` is that function's span. Recorded from
+/// inside `store` or `quarantine` it would land on those functions' own spans,
+/// which are a different span from the one an operator opens and whose names are
+/// deliberately not a compatibility surface.
+struct IngestOutcome {
+    stats: IngestStats,
+    refusal: Option<Refusal>,
+}
+
+impl IngestOutcome {
+    /// A record that became a row.
+    const fn stored(stats: IngestStats) -> Self {
+        Self {
+            stats,
+            refusal: None,
+        }
+    }
+
+    /// A record the ingester would not store.
+    fn refused(stats: IngestStats, kind: ReceivedIngestFailureKind, detail: String) -> Self {
+        Self {
+            stats,
+            refusal: Some(Refusal { kind, detail }),
+        }
+    }
+}
+
+/// Why a record was refused, in the shape [`kafkaman_core::record_exception`] wants.
+///
+/// A value implementing `ProblemType` and `Display` rather than a URI and a
+/// string passed side by side, so the ingest span is classified from the failure
+/// itself — the same rule the dispatch and publish paths follow, and the reason a
+/// call site cannot label a refusal as something it is not.
+struct Refusal {
+    kind: ReceivedIngestFailureKind,
+    detail: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl ProblemType for Refusal {
+    fn problem_type(&self) -> &'static str {
+        self.kind.problem_type()
     }
 }
 
@@ -147,10 +208,30 @@ impl RdkafkaConsumer {
             .ingest_decoded::<P>(pool, cfg, &message, at, &headers, trace)
             .instrument(span.clone())
             .await;
-        if let Err(err) = &result {
-            kafkaman_core::record_error(&span, err);
+        match &result {
+            // Both arms are failures worth reporting, and only one of them is an
+            // `Err`. A refusal is absorbed by design — that is what keeps the
+            // partition moving — but the operator reading the error list is the
+            // same one who has to go and look at the quarantine row.
+            Ok(outcome) => {
+                if let Some(refusal) = &outcome.refusal {
+                    kafkaman_core::record_exception(&span, refusal);
+                }
+            }
+            Err(err) => kafkaman_core::record_exception(&span, err),
         }
-        result
+        result.map(|outcome| outcome.stats)
+    }
+
+    /// Acknowledge the record to the broker, synchronously.
+    ///
+    /// A blocking network round trip on the durable path, and until it had a
+    /// span of its own it was unattributed time inside `kafkaman.ingest` — the
+    /// most likely thing to be slow there, and the least visible.
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+    fn commit_record(&self, message: &BorrowedMessage<'_>) -> Result<()> {
+        self.consumer.commit_message(message, CommitMode::Sync)?;
+        Ok(())
     }
 
     /// Decode one record and route it to storage or quarantine.
@@ -158,7 +239,7 @@ impl RdkafkaConsumer {
     /// Split from [`Self::ingest_once`] only so the whole of it — decode
     /// included — runs inside one `.instrument`, rather than each arm opening a
     /// span of its own after the decision has already been made.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     async fn ingest_decoded<P>(
         &self,
         pool: &PgPool,
@@ -167,7 +248,7 @@ impl RdkafkaConsumer {
         at: RecordLocation,
         headers: &RecordHeaders,
         trace: Option<kafkaman_core::TraceContext>,
-    ) -> Result<IngestStats>
+    ) -> Result<IngestOutcome>
     where
         P: KafkaMessage + DeserializeOwned + Serialize,
     {
@@ -190,7 +271,7 @@ impl RdkafkaConsumer {
     }
 
     /// Write the receive row, then acknowledge the record.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     // One more than clippy's threshold, and the same trade `dispatch_claimed_row`
     // makes: the alternative is a struct that exists only to carry them.
     #[allow(clippy::too_many_arguments)]
@@ -203,12 +284,24 @@ impl RdkafkaConsumer {
         envelope: &Envelope<P>,
         key: Option<Vec<u8>>,
         trace: Option<kafkaman_core::TraceContext>,
-    ) -> Result<IngestStats>
+    ) -> Result<IngestOutcome>
     where
         P: KafkaMessage + Serialize,
     {
-        let mut tx = pool.begin().await?;
-        let outcome = insert_received_with_outcome(
+        // Resolved here as well as inside the insert, so the transaction spans can
+        // name the relation they act on. Construction is a string format and a
+        // validation, and a config that cannot name the table fails the insert
+        // either way.
+        let table = ReceivedTable::for_message::<P>(cfg)?;
+        let mut tx = pool
+            .begin()
+            .instrument_db(kafkaman_core::db_span!(
+                "BEGIN",
+                table.qualified_name(),
+                "open ingest transaction",
+            ))
+            .await?;
+        let outcome = match insert_received_with_outcome(
             &mut tx,
             cfg,
             envelope,
@@ -217,24 +310,61 @@ impl RdkafkaConsumer {
             key.as_deref(),
             trace,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err @ kafkaman_sqlx::Error::ApplicationPanicked { .. }) => {
+                let _ = tx
+                    .rollback()
+                    .instrument_db(kafkaman_core::db_span!(
+                        "ROLLBACK",
+                        table.qualified_name(),
+                        "abandon ingest transaction",
+                    ))
+                    .await;
+                return self
+                    .quarantine::<P>(
+                        pool,
+                        cfg,
+                        message,
+                        at,
+                        ReceivedIngestFailureKind::InvalidPayload,
+                        err.to_string(),
+                    )
+                    .await;
+            }
+            Err(err) => return Err(err.into()),
+        };
 
-        let conflicted = outcome == ReceivedInsertOutcome::MessageIdConflict;
-        if conflicted {
+        // Rendered once rather than at each of the two places that need it: the
+        // quarantine row's diagnosis and the ingest span's exception message are
+        // the same sentence, and two `format!` calls are two sentences waiting to
+        // disagree.
+        let conflict = (outcome == ReceivedInsertOutcome::MessageIdConflict).then(|| {
+            format!(
+                "message_id {} conflicts with an existing receive row for another idempotency key",
+                envelope.message_id
+            )
+        });
+        let conflicted = conflict.is_some();
+        if let Some(detail) = conflict.clone() {
             // The same `message_id` already identifies a different logical
             // message. Record it in the same transaction as the (rejected)
             // insert, so the audit row exists exactly when the rejection does.
             let failure = ingest_failure_record::<P, _>(
                 message,
                 ReceivedIngestFailureKind::MessageIdConflict,
-                format!(
-                    "message_id {} conflicts with an existing receive row for another idempotency key",
-                    envelope.message_id
-                ),
+                detail,
             );
             insert_received_ingest_failure(&mut tx, cfg, &failure).await?;
         }
-        tx.commit().await?;
+        tx.commit()
+            .instrument_db(kafkaman_core::db_span!(
+                "COMMIT",
+                table.qualified_name(),
+                "commit ingest transaction",
+            ))
+            .await?;
 
         // A conflict is a skip, and counts against the same breaker as an
         // unparseable record: a producer emitting colliding ids is as stuck as
@@ -252,7 +382,7 @@ impl RdkafkaConsumer {
             outcome,
         })?;
 
-        self.consumer.commit_message(message, CommitMode::Sync)?;
+        self.commit_record(message)?;
 
         let stats = IngestStats {
             consumed: 1,
@@ -264,7 +394,12 @@ impl RdkafkaConsumer {
             offset: at.offset,
         };
         report_ingest_result(&stats);
-        Ok(stats)
+        Ok(match conflict {
+            Some(detail) => {
+                IngestOutcome::refused(stats, ReceivedIngestFailureKind::MessageIdConflict, detail)
+            }
+            None => IngestOutcome::stored(stats),
+        })
     }
 
     /// Store an unreadable record for triage, then acknowledge it.
@@ -273,7 +408,7 @@ impl RdkafkaConsumer {
     /// on the following line cannot roll it back — the record's diagnosis
     /// survives even when the loop stops. Redelivery after a trip re-runs this,
     /// which the `(topic, partition, offset)` primary key absorbs.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     async fn quarantine<P>(
         &self,
         pool: &PgPool,
@@ -282,19 +417,33 @@ impl RdkafkaConsumer {
         at: RecordLocation,
         kind: ReceivedIngestFailureKind,
         error: String,
-    ) -> Result<IngestStats>
+    ) -> Result<IngestOutcome>
     where
         P: KafkaMessage,
     {
-        let failure = ingest_failure_record::<P, _>(message, kind, error);
-        let mut tx = pool.begin().await?;
+        let failure = ingest_failure_record::<P, _>(message, kind, error.clone());
+        let table = ReceivedTable::for_message::<P>(cfg)?;
+        let mut tx = pool
+            .begin()
+            .instrument_db(kafkaman_core::db_span!(
+                "BEGIN",
+                table.qualified_name(),
+                "open ingest quarantine transaction",
+            ))
+            .await?;
         insert_received_ingest_failure(&mut tx, cfg, &failure).await?;
-        tx.commit().await?;
+        tx.commit()
+            .instrument_db(kafkaman_core::db_span!(
+                "COMMIT",
+                table.qualified_name(),
+                "commit ingest quarantine transaction",
+            ))
+            .await?;
 
         // Before the commit: a tripped breaker must leave the offset
         // uncommitted, so the operator's fix is not raced by the loop moving on.
         self.count_skip(at)?;
-        self.consumer.commit_message(message, CommitMode::Sync)?;
+        self.commit_record(message)?;
 
         let stats = IngestStats {
             consumed: 1,
@@ -306,7 +455,7 @@ impl RdkafkaConsumer {
             offset: at.offset,
         };
         report_ingest_result(&stats);
-        Ok(stats)
+        Ok(IngestOutcome::refused(stats, kind, error))
     }
 
     /// Count one skip against the poison breaker, failing when it trips.
@@ -416,6 +565,7 @@ fn ingest_span<P: KafkaMessage>(
         "otel.kind" = "consumer",
         "otel.status_code" = tracing::field::Empty,
         "otel.status_description" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
         message_type = P::MESSAGE_TYPE,
         messaging.system = "kafka",
         messaging.destination.name = P::TOPIC,

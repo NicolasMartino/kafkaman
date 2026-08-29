@@ -11,10 +11,12 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod boot;
+pub mod faults;
 pub mod http;
 pub mod service;
 pub mod service_manual;
 
+use kafkaman::InstrumentDb;
 use std::sync::Arc;
 
 use example_contracts::{
@@ -26,7 +28,6 @@ use kafkaman::sqlx::{
 use kafkaman::{Envelope, HandlerCtx, IdempotencyIdentity};
 use serde::Serialize;
 use sqlx::{PgConnection, PgPool, Row};
-use tracing::Instrument;
 use uuid::Uuid;
 
 pub use boot::{start, start_with, BootMode, BoxError, RunningService, ServiceOptions};
@@ -162,7 +163,7 @@ pub(crate) async fn recompute_availability(
         .bind(order.product_id.to_string())
         .bind(ORDER_STATUS_FULFILLED_WIRE)
         .fetch_one(&mut *conn)
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "SELECT",
             order_cache,
             "sum fulfilled orders from cache",
@@ -179,7 +180,7 @@ pub(crate) async fn recompute_availability(
         .bind(fulfilled)
         .bind(order.product_id)
         .fetch_optional(&mut *conn)
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "UPDATE",
             "products",
             "recompute product availability",
@@ -219,6 +220,10 @@ pub async fn derive_availability(
     order: &OrderSnapshot,
     cx: &mut HandlerCtx<'_>,
 ) -> Result<(), KafkamanError> {
+    // First, before anything is read or written, so an injected fault is a clean
+    // failure rather than a half-applied one. Off unless a request armed it; see
+    // `crate::faults`.
+    faults::check(cx.conn()).await?;
     let order_cache = cx.cache_table::<OrderSnapshot>()?.qualified_name();
     let Some(product) = recompute_availability(cx.conn(), &order_cache, order).await? else {
         return Ok(());
@@ -238,6 +243,9 @@ async fn apply_order_snapshot(
     order_cache: &str,
     order: &OrderSnapshot,
 ) -> Result<(), KafkamanError> {
+    // The manual boot path reaches the same fault switch, so `just examples
+    // faults` behaves identically whichever way the service was started.
+    faults::check(conn).await?;
     let Some(product) = recompute_availability(conn, order_cache, order).await? else {
         return Ok(());
     };

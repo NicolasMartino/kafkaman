@@ -1635,6 +1635,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1922,6 +1923,7 @@ dependencies = [
  "durable-send-tests",
  "kafkaman-axum",
  "kafkaman-core",
+ "kafkaman-otel",
  "kafkaman-rdkafka",
  "kafkaman-sqlx",
  "kafkaman-test",

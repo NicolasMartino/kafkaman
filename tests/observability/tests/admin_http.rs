@@ -20,8 +20,11 @@ use std::sync::Arc;
 use kafkaman_axum::{
     admin_router, redrive_router, AdminState, CorrelationLayer, CORRELATION_ID_HEADER,
 };
+use kafkaman_sqlx::{OutboxTable, ReceivedTable};
 use kafkaman_test::Harness;
-use observability_tests::{postgres_for_suite, ProductSnapshot, TestResult, SUITE};
+use observability_tests::{
+    postgres_for_suite, ProductSnapshot, RegionalProduct, TestResult, SUITE,
+};
 
 #[tokio::test]
 async fn every_admin_route_answers_over_http() -> TestResult {
@@ -318,4 +321,197 @@ async fn serve(harness: &Harness, mounted: Mounted) -> TestResult<AdminServer> {
         base: format!("http://{addr}"),
         task,
     })
+}
+
+/// A service that publishes one type and consumes a *different* one still gets
+/// every summary.
+///
+/// This is the realistic shape and it was broken in every one of these routes.
+/// A configuration records the descriptors a service exchanges but not which
+/// side of each it is on — roles are declared above `kafkaman-sqlx`, and a
+/// hand-wired service has no registry at all — so each handler built both an
+/// outbox *and* a received table for every message type and queried whichever
+/// the migrations had never created. Every summary answered 500.
+///
+/// It survived because the tests above register both tables for the same type,
+/// which no real service does: `product` publishes `product_snapshot` and
+/// consumes `order_snapshot`, and `order` does the mirror image. So the fixture
+/// here is the fix's whole point — two types, one role each.
+#[tokio::test]
+async fn the_summaries_cover_only_the_tables_this_service_has() -> TestResult {
+    let postgres = postgres_for_suite(SUITE).await?;
+    let harness = Harness::connect(postgres.url()).await?;
+    let _outbox = harness.outbox_table::<ProductSnapshot>().await?;
+    let _received = harness.received_table::<RegionalProduct>().await?;
+
+    // The harness creates both sides for *every* registered type, which is a
+    // convenience for the tests above and is exactly why this bug hid here: no
+    // fixture had ever produced a schema with a one-sided message type. Drop the
+    // two tables a service that only publishes `product_snapshot` and only
+    // consumes `regional_product` would never have had migrated, so the schema
+    // is the one a real deployment runs.
+    for table in [
+        ReceivedTable::for_message::<ProductSnapshot>(&harness.config())?.qualified_name(),
+        OutboxTable::for_message::<RegionalProduct>(&harness.config())?.qualified_name(),
+    ] {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(harness.pool())
+            .await?;
+    }
+
+    let envelope = ProductSnapshot::envelope("one-sided", "a product")
+        .try_with_idempotency_key("one-sided")?;
+    harness.enqueue(&envelope).await?;
+
+    let server = serve(&harness, Mounted::Everything).await?;
+    let base = &server.base;
+    let client = reqwest::Client::new();
+
+    for route in ["outbox", "received", "stuck", "dlq"] {
+        let response = client.get(format!("{base}/{route}")).send().await?;
+        assert_eq!(
+            response.status(),
+            200,
+            "GET /{route} must not fail because some other message type has no \
+             table on this side; that is the normal shape of a service"
+        );
+    }
+
+    // Not merely 200: the right rows. The published type is on the send side and
+    // the consumed one is not, and a summary that listed both would mean the
+    // filter had been widened into a no-op.
+    let outbox: serde_json::Value = client
+        .get(format!("{base}/outbox"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let outbox_types: Vec<&str> = outbox
+        .as_array()
+        .expect("the outbox summary is a list")
+        .iter()
+        .filter_map(|bucket| bucket["message_type"].as_str())
+        .collect();
+    assert!(
+        outbox_types.contains(&"product_snapshot"),
+        "the published type has an outbox table and a pending row: {outbox_types:?}"
+    );
+    assert!(
+        !outbox_types.contains(&"regional_product"),
+        "a type this service only consumes has no outbox table to report on: \
+         {outbox_types:?}"
+    );
+
+    let dlq: serde_json::Value = client
+        .get(format!("{base}/dlq"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let dlq_types: Vec<&str> = dlq
+        .as_array()
+        .expect("the DLQ summary is a list")
+        .iter()
+        .filter_map(|summary| summary["message_type"].as_str())
+        .collect();
+    assert_eq!(
+        dlq_types,
+        vec!["regional_product"],
+        "a dead-letter queue belongs to the receive side alone"
+    );
+
+    // And the destructive route agrees with the summary. Redriving a type this
+    // service only publishes is the caller pointing a real message type at the
+    // wrong service — a 404 naming the reason, not a 500 from a missing table.
+    let refused = client
+        .post(format!("{base}/dlq/product_snapshot/redrive"))
+        .json(&serde_json::json!({ "max_rows": 10 }))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), 404);
+    let refused: serde_json::Value = refused.json().await?;
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has no dead-letter queue in this service"),
+        "the error should say the type has no usable received table here rather \
+         than that it does not exist, because it does: {refused}"
+    );
+    // The reason, not just the refusal. 404 is reserved for the case this is —
+    // a received table that does not exist here, because this service publishes
+    // the type rather than consuming it. A table that exists but is unreadable
+    // answers 503 instead, so the status alone already separates "wrong address"
+    // from "broken deployment"; the body then names the repair within that.
+    assert!(
+        refused["repair"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("migrations"),
+        "the body should name the repair, since 404 alone cannot distinguish an \
+         unmigrated schema from the wrong service: {refused}"
+    );
+
+    // The consumed one still redrives, so this is a distinction rather than a
+    // broken route.
+    let allowed = client
+        .post(format!("{base}/dlq/regional_product/redrive"))
+        .json(&serde_json::json!({ "max_rows": 10 }))
+        .send()
+        .await?;
+    assert_eq!(allowed.status(), 200);
+
+    Ok(())
+}
+
+/// A schema missing *both* sides of a declared type is a broken deployment, and
+/// every summary route says so instead of answering with the type quietly
+/// absent.
+///
+/// This is the middle of the spectrum the earlier check missed. Zero readable
+/// tables was already an error and one-sided types are the normal shape of a
+/// service; a partially migrated schema sat between them and answered `200` with
+/// rows silently missing — which an operator reads as "these queues are empty",
+/// the most dangerous wrong answer a queue-depth route can give.
+#[tokio::test]
+async fn a_message_type_with_no_table_on_either_side_fails_the_summaries() -> TestResult {
+    let postgres = postgres_for_suite(SUITE).await?;
+    let harness = Harness::connect(postgres.url()).await?;
+    let _outbox = harness.outbox_table::<ProductSnapshot>().await?;
+    let _received = harness.received_table::<RegionalProduct>().await?;
+
+    // Every table for `regional_product`, so the type is declared and the schema
+    // can back none of it — an unmigrated deployment, or a role that cannot read
+    // what was migrated.
+    for table in [
+        ReceivedTable::for_message::<RegionalProduct>(&harness.config())?.qualified_name(),
+        OutboxTable::for_message::<RegionalProduct>(&harness.config())?.qualified_name(),
+    ] {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(harness.pool())
+            .await?;
+    }
+
+    let server = serve(&harness, Mounted::Everything).await?;
+    let base = &server.base;
+    let client = reqwest::Client::new();
+
+    for route in ["outbox", "received", "stuck", "dlq"] {
+        let response = client.get(format!("{base}/{route}")).send().await?;
+        assert_eq!(
+            response.status(),
+            503,
+            "GET /{route} must refuse rather than answer with a configured \
+             message type silently missing"
+        );
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(
+            body["message_types"],
+            serde_json::json!(["regional_product"]),
+            "and name which type it cannot back, or the operator has to diff the \
+             response against their own config to find out: {body}"
+        );
+    }
+
+    Ok(())
 }

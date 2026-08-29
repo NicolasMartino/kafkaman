@@ -21,6 +21,27 @@ impl KafkaMessage for ProductSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct PanickingPayload;
+
+impl<'de> Deserialize<'de> for PanickingPayload {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        panic!("deserialize exploded");
+    }
+}
+
+impl KafkaMessage for PanickingPayload {
+    const MESSAGE_TYPE: &'static str = "panicking_payload";
+    const TOPIC: &'static str = "products";
+
+    fn entity_key(&self) -> String {
+        "panic".to_owned()
+    }
+}
+
 /// A 64-hex digest, the only shape `kafkaman-idempotency-key` accepts.
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -129,6 +150,25 @@ fn a_malformed_occurred_at_is_rejected_rather_than_degraded() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_payload_deserializer_panic_is_quarantinable() {
+    let message = record(header("kafkaman-idempotency-key", DIGEST));
+    let scanned = RecordHeaders::of(&message);
+    let Err(err) = record_envelope::<PanickingPayload, _>(&message, &scanned) else {
+        panic!("a panicking deserializer must not unwind out of ingest");
+    };
+
+    assert!(matches!(err, Error::PayloadPanicked(_)));
+    assert_eq!(
+        err.ingest_failure_kind(),
+        Some(kafkaman_core::ReceivedIngestFailureKind::InvalidPayload)
+    );
+    assert!(
+        err.to_string().contains("deserialize exploded"),
+        "the quarantine error should retain the panic message: {err}"
+    );
 }
 
 #[test]
@@ -367,4 +407,72 @@ fn a_tracestate_alone_is_not_a_context() {
         !decoded.envelope.headers.contains_key("tracestate"),
         "it is still protocol context rather than application data"
     );
+}
+
+/// That this crate's failures reach APM under a declared name.
+///
+/// Compiler exhaustiveness already refuses a variant nobody classified. What it
+/// cannot see is a classification written as a bare string rather than a
+/// `problem::*` constant — `"urn:kafkaman:problem:infrastrcture"` compiles and
+/// then appears in Kibana as an error group of one that nothing joins.
+mod problem_types {
+    use kafkaman_core::problem::ALL_PROBLEM_TYPES;
+    use kafkaman_core::ProblemType as _;
+
+    #[test]
+    fn no_classification_in_this_crate_invents_a_uri() {
+        assert!(
+            !include_str!("error.rs").contains("\"urn:kafkaman:problem:"),
+            "error.rs contains a literal problem URI; classifications must go \
+             through a `kafkaman_core::problem::*` constant"
+        );
+    }
+
+    #[test]
+    fn every_uri_this_crate_returns_is_declared() {
+        // `ALL_PROBLEM_TYPES` is hand-listed, so a constant can exist without
+        // being in it. These are the ones this crate can produce.
+        let samples: Vec<crate::Error> = vec![
+            crate::Error::MissingPayload,
+            crate::Error::MissingIdempotencyKey,
+            crate::Error::PayloadPanicked("unwound".to_owned()),
+            crate::Error::UnexpectedTopic {
+                expected: "orders",
+                actual: "products".to_owned(),
+            },
+            crate::Error::InvalidHeader {
+                name: "kafkaman-message-id",
+                message: "not a uuid".to_owned(),
+            },
+            crate::Error::TopicAdmin {
+                topic: "orders".to_owned(),
+                message: "no such topic".to_owned(),
+            },
+            crate::Error::ConsecutiveSkipLimitExceeded {
+                limit: 3,
+                partition: 0,
+                offset: 42,
+            },
+            // The delegating arms. A transparently wrapped error keeps its own
+            // classification rather than being relabelled at the boundary.
+            crate::Error::Core(kafkaman_core::Error::InvalidOutboxStatus("nope".to_owned())),
+            crate::Error::Sqlx(kafkaman_sqlx::Error::Handler("boom".to_owned())),
+        ];
+
+        for error in &samples {
+            let uri = error.problem_type();
+            assert!(
+                ALL_PROBLEM_TYPES.contains(&uri),
+                "{error} classified as {uri}, which is not in ALL_PROBLEM_TYPES"
+            );
+        }
+
+        assert_eq!(
+            crate::Error::Sqlx(kafkaman_sqlx::Error::Handler("boom".to_owned())).problem_type(),
+            kafkaman_core::problem::HANDLER,
+            "a wrapped handler failure must still group as a handler failure; \
+             relabelling it at the transport boundary would hide the one class \
+             an application owner can act on"
+        );
+    }
 }

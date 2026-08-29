@@ -27,19 +27,27 @@
 //! behind the applied offset, get `Ignored`, and skip the handler — permanently.
 //! Covering the upsert makes the retry see the same state the first attempt did.
 
-use kafkaman_core::{LifecycleSampler, MarkOutcome, ReceivedMeta, ReceivedRow};
+use kafkaman_core::InstrumentDb;
+use std::future::Future;
+use std::pin::Pin;
+
+use kafkaman_core::{
+    FailureStage, LifecycleSampler, MarkOutcome, ReceivedFailureKind, ReceivedMeta, ReceivedRow,
+};
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tracing::Instrument;
 
+use crate::catch_panic::{catch_handler_panic, HandlerAbort};
 use crate::dispatch_cache::{upsert_cache_from_received, CacheApplyOutcome};
 use crate::dispatch_failure::{
-    create_dispatch_handler_savepoint, dispatch_failure_stats, handler_failure_disposition,
-    received_failure_disposition, rollback_handler_and_record_received_failure, FailureDisposition,
+    create_dispatch_handler_savepoint, dispatch_failure_stats, failure_disposition,
+    rollback_handler_and_record_received_failure, FailureDisposition, FailureRecordPath,
 };
 use crate::received_rows::{
     claim_received_row, mark_received_processed, record_received_failure, ReceivedFailureRecord,
 };
+use crate::retry_backoff::received_retry_outcome;
 use crate::router::HandlerFlow;
 use crate::{DispatchStats, Error, MessageRouter, ReceivedTable, Result};
 
@@ -68,6 +76,8 @@ const NO_HOOKS: Hooks<'static> = std::marker::PhantomData;
 ///
 /// One row per call, not a batch: the caller loops, and a per-row transaction
 /// keeps a single bad handler from rolling back everything else in flight.
+// Stays in the debug tier: one dispatch poll, work or no work.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn dispatch_once(
     pool: &PgPool,
@@ -93,6 +103,8 @@ pub async fn dispatch_once(
 /// The sampler is borrowed mutably because its count carries across cycles:
 /// sampling one in ten successes has to mean one in ten over the stream, not one
 /// per call that happens to succeed.
+// Stays in the debug tier: one dispatch poll, work or no work.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn dispatch_once_sampled(
     pool: &PgPool,
@@ -106,6 +118,8 @@ pub async fn dispatch_once_sampled(
 
 #[cfg(feature = "internal-hooks")]
 #[doc(hidden)]
+// Stays in the debug tier: one dispatch poll, work or no work.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn dispatch_once_with_observer(
     pool: &PgPool,
@@ -130,7 +144,7 @@ async fn dispatch_once_inner(
     // default filter it would be most of what an idle service exports.
     let mut tx = pool
         .begin()
-        .instrument(kafkaman_core::db_poll_span!(
+        .instrument_db(kafkaman_core::db_poll_span!(
             "BEGIN",
             table.qualified_name(),
             "open received claim transaction"
@@ -138,7 +152,7 @@ async fn dispatch_once_inner(
         .await?;
     let Some(row) = claim_received_row(&mut tx, table, due_at).await? else {
         tx.commit()
-            .instrument(kafkaman_core::db_poll_span!(
+            .instrument_db(kafkaman_core::db_poll_span!(
                 "COMMIT",
                 table.qualified_name(),
                 "commit empty received claim transaction"
@@ -157,6 +171,13 @@ async fn dispatch_once_inner(
         "otel.kind" = "consumer",
         "otel.status_code" = tracing::field::Empty,
         "otel.status_description" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
+        "kafkaman.failure.kind" = tracing::field::Empty,
+        "kafkaman.failure.type" = tracing::field::Empty,
+        "kafkaman.failure.stage" = tracing::field::Empty,
+        "kafkaman.failure.recorded_via" = tracing::field::Empty,
+        "kafkaman.retry.attempt" = tracing::field::Empty,
+        "kafkaman.retry.exhausted" = tracing::field::Empty,
         message_type = row.message_type.as_str(),
         messaging.system = "kafka",
         messaging.destination.name = row.source_topic.as_str(),
@@ -177,16 +198,18 @@ async fn dispatch_once_inner(
     // the trace. A handler that fails does its failure accounting — savepoint
     // rollback, failure record, retry scheduling — after the handler returns,
     // which is exactly the part worth timing when a dispatcher is slow.
-    let result = dispatch_claimed_row(pool, table, router, due_at, hooks, lifecycle, tx, row)
-        .instrument(span.clone())
-        .await;
-    // Only a dispatch that could not complete at all marks the span failed. A
-    // handler that returns an error and gets a retry scheduled is a *successful*
-    // dispatch cycle by this function's contract — the failure is recorded on the
-    // row and counted in `DispatchStats`, and marking the span ERROR too would
-    // make an APM error rate count work the system is handling as designed.
+    let result = dispatch_claimed_row(
+        pool, table, router, due_at, hooks, lifecycle, &span, tx, row,
+    )
+    .instrument(span.clone())
+    .await;
+    // A hard dispatcher error means the cycle did not even finish recording the
+    // row-level failure. Row-level receive failures are marked inside
+    // `dispatch_claimed_row`, after the failure record has landed, so APM can
+    // separate successful and failed consumer transactions without counting
+    // abandoned bookkeeping attempts as handled message failures.
     if let Err(err) = &result {
-        kafkaman_core::record_error(&span, err);
+        kafkaman_core::record_exception(&span, err);
     }
     result
 }
@@ -196,7 +219,7 @@ async fn dispatch_once_inner(
 /// Split out so [`dispatch_once_inner`] has one `.instrument` call covering all
 /// of it, rather than a span that each branch has to remember to enter.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn dispatch_claimed_row(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -204,6 +227,7 @@ async fn dispatch_claimed_row(
     due_at: OffsetDateTime,
     hooks: Hooks<'_>,
     lifecycle: Option<&mut LifecycleSampler>,
+    dispatch_span: &tracing::Span,
     mut tx: Transaction<'_, Postgres>,
     row: ReceivedRow,
 ) -> Result<DispatchStats> {
@@ -213,26 +237,43 @@ async fn dispatch_claimed_row(
     // row is parked, not dropped, so convergence is deferred rather than broken
     // — and the deferral is the point.
     if !router.routes(&row.message_type) {
-        return record_failure_in_claim_tx(
+        // Kept as the error rather than rendered to a `String` on the way past:
+        // the span needs to ask it what class of problem it is, and a `String`
+        // cannot answer that. It is also what the disposition is derived from,
+        // so the class cannot be stated here and contradicted there.
+        let error = Error::MissingHandler(row.message_type.clone());
+        let disposition = failure_disposition(&error, FailureStage::Routing);
+        let (stats, recorded_via) = record_failure_in_claim_tx(
             tx,
             table,
             &row,
-            ReceivedFailureRecord::of(
-                &row,
-                FailureDisposition::retryable(kafkaman_core::ReceivedFailureKind::MissingHandler),
-                Error::MissingHandler(row.message_type.clone()).to_string(),
-                due_at,
-            ),
+            ReceivedFailureRecord::of(&row, disposition, error.to_string(), due_at),
             hooks,
         )
-        .await;
+        .await?;
+        record_retry_outcome(dispatch_span, table, &row, disposition);
+        record_recorded_dispatch_failure(
+            dispatch_span,
+            stats.failed,
+            disposition.kind,
+            FailureStage::Routing,
+            recorded_via,
+            &error,
+        );
+        return Ok(stats);
     }
 
-    create_dispatch_handler_savepoint(&mut tx).await?;
+    create_dispatch_handler_savepoint(&mut tx, table).await?;
 
     match converge_and_dispatch(&mut tx, table, &row, router, due_at).await {
         Ok(outcome) => {
-            tx.commit().await?;
+            tx.commit()
+                .instrument_db(kafkaman_core::db_span!(
+                    "COMMIT",
+                    table.qualified_name(),
+                    "commit dispatch transaction",
+                ))
+                .await?;
             // A stale or missing mark means another worker owns the row now; the
             // work is not lost, but this cycle did not do it.
             let processed = usize::from(outcome == MarkOutcome::Updated);
@@ -243,11 +284,14 @@ async fn dispatch_claimed_row(
                 claimed: 1,
                 processed,
                 failed: 0,
+                panicked: 0,
+                panicked_message_id: None,
             })
         }
         Err(failure) => {
             let disposition = failure.disposition();
-            unwind_and_record(
+            let panicked = usize::from(failure.is_handler_panic());
+            let (mut stats, recorded_via) = unwind_and_record(
                 pool,
                 tx,
                 table,
@@ -255,7 +299,22 @@ async fn dispatch_claimed_row(
                 ReceivedFailureRecord::of(&row, disposition, failure.to_string(), due_at),
                 hooks,
             )
-            .await
+            .await?;
+            record_retry_outcome(dispatch_span, table, &row, disposition);
+            record_recorded_dispatch_failure(
+                dispatch_span,
+                stats.failed,
+                disposition.kind,
+                disposition.stage,
+                recorded_via,
+                &failure,
+            );
+            stats.panicked = panicked;
+            // Named here rather than deeper, so `dispatch_failure_stats` stays
+            // panic-agnostic and the identity is set on the one path that knows
+            // a panic happened.
+            stats.panicked_message_id = (panicked > 0).then_some(row.message_id);
+            Ok(stats)
         }
     }
 }
@@ -274,19 +333,125 @@ async fn dispatch_claimed_row(
 /// handler. Two values, so it stays a bounded grouping key — and the distinction
 /// matters, because only the pre-upsert position can skip the one after it.
 ///
-/// Errors are recorded here rather than on `kafkaman.dispatch`. A handler that
-/// fails and gets a retry scheduled is a *successful* dispatch cycle by
-/// `dispatch_once`'s contract, so the dispatch span stays unmarked; this is the
-/// span that says the handler itself failed.
+/// Errors are recorded here and on `kafkaman.dispatch`, deliberately. This span
+/// says the handler itself failed and carries handler-specific fields; the
+/// enclosing dispatch transaction carries the receive attempt outcome so APM can
+/// split messaging transactions by success and failure.
+///
+/// `handler.outcome` is recorded only when the handler *panicked*, which is what
+/// makes it useful: `handler.outcome: panicked` selects exactly the panics, and
+/// nothing else has to be excluded. A returned error is already visible as
+/// `otel.status_code`, and the two are stored under one
+/// `ReceivedFailureKind::Handler` on purpose — see `handler_failure_disposition`.
 fn handler_span(row: &ReceivedRow, position: &'static str) -> tracing::Span {
     tracing::info_span!(
         "kafkaman.handler",
         "otel.kind" = "internal",
         "otel.status_code" = tracing::field::Empty,
         "otel.status_description" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
+        "kafkaman.failure.kind" = tracing::field::Empty,
+        "kafkaman.failure.type" = tracing::field::Empty,
+        "kafkaman.failure.stage" = tracing::field::Empty,
         message_type = row.message_type.as_str(),
         "handler.position" = position,
+        "handler.outcome" = tracing::field::Empty,
     )
+}
+
+/// Report which attempt a failure is, and whether it was the last one.
+///
+/// Without these two a trace can say a message failed but not whether *this* is
+/// the attempt that dead-lettered it — which is the difference between a retry
+/// an operator can ignore and a message that has stopped moving.
+fn record_retry_outcome(
+    span: &tracing::Span,
+    table: &ReceivedTable,
+    row: &ReceivedRow,
+    disposition: FailureDisposition,
+) {
+    let (attempt, exhausted) = received_retry_outcome(table, row.attempts, disposition);
+    span.record("kafkaman.retry.attempt", u64::from(attempt));
+    span.record("kafkaman.retry.exhausted", exhausted);
+}
+
+/// The failure taxonomy as the *row* records it.
+///
+/// These three mirror what the DLQ row and the admin API say, so they stay on
+/// [`ReceivedFailureKind`]'s four persisted values. `error.type` deliberately
+/// does not: it is what an APM backend groups by, and there the distinction
+/// between a handler that returned an error and one that unwound is worth
+/// having. See [`kafkaman_core::problem`].
+fn record_failure_attrs(span: &tracing::Span, kind: ReceivedFailureKind, stage: FailureStage) {
+    span.record("kafkaman.failure.kind", kind.discriminant());
+    span.record("kafkaman.failure.type", kind.problem_type());
+    span.record("kafkaman.failure.stage", stage.as_str());
+}
+
+/// Mark `span` failed and classify it, without reporting an error.
+///
+/// For the span *enclosing* one that has already reported the same failure. A
+/// backend derives one error per exception event, so a handler failure reported
+/// on both `kafkaman.handler` and `kafkaman.dispatch` would arrive as two
+/// errors that no operator can tell apart from two failures.
+fn record_failure_status<E>(
+    span: &tracing::Span,
+    kind: ReceivedFailureKind,
+    stage: FailureStage,
+    error: &E,
+) where
+    E: kafkaman_core::ProblemType + std::fmt::Display + ?Sized,
+{
+    record_failure_attrs(span, kind, stage);
+    span.record("error.type", error.problem_type());
+    kafkaman_core::record_error(span, &error);
+}
+
+/// Mark `span` failed, classify it, and report the failure as an error.
+///
+/// For the innermost span that owns the failure: `kafkaman.handler` when a
+/// handler failed, `kafkaman.dispatch` when the failure was in routing or in
+/// kafkaman's own bookkeeping and no narrower span saw it.
+fn record_failure_exception<E>(
+    span: &tracing::Span,
+    kind: ReceivedFailureKind,
+    stage: FailureStage,
+    error: &E,
+) where
+    E: kafkaman_core::ProblemType + std::fmt::Display + ?Sized,
+{
+    record_failure_attrs(span, kind, stage);
+    kafkaman_core::record_exception(span, error);
+}
+
+/// Record a durably-parked failure on the enclosing `kafkaman.dispatch` span.
+///
+/// `failed == 0` means the row was not actually parked — a stale claim, or a row
+/// another worker owns now — and there is no handled failure to report.
+fn record_recorded_dispatch_failure<E>(
+    span: &tracing::Span,
+    failed: usize,
+    kind: ReceivedFailureKind,
+    stage: FailureStage,
+    recorded_via: FailureRecordPath,
+    error: &E,
+) where
+    E: kafkaman_core::ProblemType + std::fmt::Display + ?Sized,
+{
+    if failed == 0 {
+        return;
+    }
+    // Which transaction the record landed in, and so whether the row's attempt
+    // count is still atomic with the claim that produced it.
+    span.record("kafkaman.failure.recorded_via", recorded_via.as_str());
+    match stage {
+        // `run_handler` already reported this one on `kafkaman.handler`, which is
+        // the narrower and more useful place for it.
+        FailureStage::Handler => record_failure_status(span, kind, stage, error),
+        FailureStage::Routing | FailureStage::Bookkeeping => {
+            record_failure_exception(span, kind, stage, error);
+        }
+    }
 }
 
 /// Where in the cycle a dispatch failed.
@@ -305,11 +470,20 @@ enum DispatchFailure {
 }
 
 impl DispatchFailure {
+    /// One classifier for both variants, differing only in the stage they pass.
+    ///
+    /// It used to be two, and which one ran decided the stored class: an error
+    /// out of the handler frame became `Handler` whatever it was. The frame is
+    /// now recorded as the stage instead, so the class is the error's alone.
     fn disposition(&self) -> FailureDisposition {
         match self {
-            Self::Handler(error) => handler_failure_disposition(error),
-            Self::Bookkeeping(error) => received_failure_disposition(error),
+            Self::Handler(error) => failure_disposition(error, FailureStage::Handler),
+            Self::Bookkeeping(error) => failure_disposition(error, FailureStage::Bookkeeping),
         }
+    }
+
+    fn is_handler_panic(&self) -> bool {
+        matches!(self, Self::Handler(Error::HandlerPanicked(_)))
     }
 }
 
@@ -321,9 +495,21 @@ impl std::fmt::Display for DispatchFailure {
     }
 }
 
+impl kafkaman_core::ProblemType for DispatchFailure {
+    /// The wrapped error's own classification. Which of the two stages a failure
+    /// came from is already carried by `kafkaman.failure.stage`; repeating it
+    /// here would make `handler` and `bookkeeping` grow parallel copies of every
+    /// URI for no gain.
+    fn problem_type(&self) -> &'static str {
+        match self {
+            Self::Handler(error) | Self::Bookkeeping(error) => error.problem_type(),
+        }
+    }
+}
+
 /// Everything inside the savepoint: both handler positions, the cache upsert
 /// between them, and the processed mark.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn converge_and_dispatch(
     tx: &mut Transaction<'_, Postgres>,
     table: &ReceivedTable,
@@ -336,14 +522,10 @@ async fn converge_and_dispatch(
     let flow = match router.before_handler_for(&row.message_type) {
         Some(before) => {
             let span = handler_span(row, "before");
-            let result = before
-                .handle(&mut *tx, meta.clone(), row.payload.clone())
-                .instrument(span.clone())
-                .await;
-            if let Err(error) = &result {
-                kafkaman_core::record_error(&span, error);
-            }
-            result.map_err(DispatchFailure::Handler)?
+            let call = before.handle(&mut *tx, meta.clone(), row.payload.clone());
+            run_handler(&span, call)
+                .await
+                .map_err(DispatchFailure::Handler)?
         }
         None => HandlerFlow::Continue,
     };
@@ -362,20 +544,49 @@ async fn converge_and_dispatch(
     if flow == HandlerFlow::Continue && !ignored {
         if let Some(handler) = router.handler_for(&row.message_type) {
             let span = handler_span(row, "after");
-            let result = handler
-                .handle(&mut *tx, meta, row.payload.clone())
-                .instrument(span.clone())
-                .await;
-            if let Err(error) = &result {
-                kafkaman_core::record_error(&span, error);
-            }
-            result.map_err(DispatchFailure::Handler)?;
+            let call = handler.handle(&mut *tx, meta, row.payload.clone());
+            run_handler(&span, call)
+                .await
+                .map_err(DispatchFailure::Handler)?;
         }
     }
 
     mark_received_processed(tx, table, row.message_id, processed_at)
         .await
         .map_err(DispatchFailure::Bookkeeping)
+}
+
+/// Run one handler call inside its span, with the panic boundary applied.
+///
+/// Both positions go through here rather than repeating four lines twice, so the
+/// boundary cannot be put on one and forgotten on the other — which is the whole
+/// failure mode it exists to prevent.
+///
+/// Not annotated for the internal span tier: it applies a phase span, and a
+/// second span around it would nest a duplicate above every `kafkaman.handler`.
+async fn run_handler<T>(
+    span: &tracing::Span,
+    call: Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>,
+) -> Result<T> {
+    let result = match catch_handler_panic(call).instrument(span.clone()).await {
+        Ok(result) => result,
+        Err(HandlerAbort::Panicked(message)) => {
+            span.record("handler.outcome", "panicked");
+            Err(Error::HandlerPanicked(message))
+        }
+        // Deliberately not `HandlerPanicked`. This is a kafkaman bug, not the
+        // application's, and recording it as a panic would put it in the row's
+        // failure history under the application's name and count it against the
+        // dispatcher's panic breaker.
+        Err(HandlerAbort::PolledAfterCompletion) => Err(Error::Handler(
+            "kafkaman polled the handler boundary after it completed".to_owned(),
+        )),
+    };
+    if let Err(error) = &result {
+        let disposition = failure_disposition(error, FailureStage::Handler);
+        record_failure_exception(span, disposition.kind, disposition.stage, error);
+    }
+    result
 }
 
 /// Emit one sampled per-message success event, inside `kafkaman.dispatch`.
@@ -412,14 +623,14 @@ fn emit_success_event(
 /// Record a failure in the transaction that claimed the row.
 ///
 /// Used where nothing has run yet, so there is nothing to unwind.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn record_failure_in_claim_tx(
     mut tx: Transaction<'_, Postgres>,
     table: &ReceivedTable,
     row: &ReceivedRow,
     failure: ReceivedFailureRecord,
     hooks: Hooks<'_>,
-) -> Result<DispatchStats> {
+) -> Result<(DispatchStats, FailureRecordPath)> {
     #[cfg(feature = "internal-hooks")]
     run_dispatch_hook(
         hooks,
@@ -433,15 +644,24 @@ async fn record_failure_in_claim_tx(
     let _ = (hooks, row);
 
     let outcome = record_received_failure(&mut tx, table, failure).await?;
-    tx.commit().await?;
-    Ok(dispatch_failure_stats(outcome))
+    tx.commit()
+        .instrument_db(kafkaman_core::db_span!(
+            "COMMIT",
+            table.qualified_name(),
+            "commit received failure transaction",
+        ))
+        .await?;
+    Ok((
+        dispatch_failure_stats(outcome),
+        FailureRecordPath::ClaimTransaction,
+    ))
 }
 
 /// Roll the handler's writes back to the savepoint, then record the failure.
 ///
 /// Both failing paths — the handler's own error and a failure applying its
 /// result — need exactly this, and they used to spell it out twice.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn unwind_and_record(
     pool: &PgPool,
     tx: Transaction<'_, Postgres>,
@@ -449,7 +669,7 @@ async fn unwind_and_record(
     row: &ReceivedRow,
     failure: ReceivedFailureRecord,
     hooks: Hooks<'_>,
-) -> Result<DispatchStats> {
+) -> Result<(DispatchStats, FailureRecordPath)> {
     #[cfg(feature = "internal-hooks")]
     for slot in [
         DispatchHookSlot::BeforeFailureRollback,
@@ -467,8 +687,9 @@ async fn unwind_and_record(
     #[cfg(not(feature = "internal-hooks"))]
     let _ = (hooks, row);
 
-    let outcome = rollback_handler_and_record_received_failure(tx, pool, table, failure).await?;
-    Ok(dispatch_failure_stats(outcome))
+    let (outcome, recorded_via) =
+        rollback_handler_and_record_received_failure(tx, pool, table, failure).await?;
+    Ok((dispatch_failure_stats(outcome), recorded_via))
 }
 
 /// What the cache apply did, for an operator reading logs.

@@ -29,7 +29,11 @@ use opentelemetry::trace::SpanId;
 async fn an_enqueue_with_no_caller_span_still_anchors_the_trace() -> TestResult {
     let postgres = postgres_for_suite(SUITE).await?;
     let harness = Harness::connect(postgres.url()).await?;
-    let pipeline = TracePipeline::install();
+    // At the default filter, deliberately. The `kafkaman::internal` tier puts a
+    // function span on `enqueue`, which calls the function that opens
+    // `kafkaman.enqueue` — so with the tier on the phase span has a parent, and
+    // the root-ness this test is about is a property of the default filter.
+    let pipeline = TracePipeline::install_at_default_filter();
 
     // No span is opened here: this is the background-job case.
     relay_until_published(&harness, "root-enqueue").await?;

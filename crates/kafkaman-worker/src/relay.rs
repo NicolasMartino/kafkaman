@@ -1,3 +1,4 @@
+use kafkaman_core::InstrumentDb;
 use std::time::Instant;
 
 use kafkaman_core::{LifecycleSampler, MarkOutcome, RelayConfig, RelayStats};
@@ -16,6 +17,8 @@ use crate::{Publisher, Result};
 /// hold a transaction open across network calls. Publishing is sequential
 /// because claim order is publish order, and per-entity ordering is what the
 /// convergence guard downstream depends on.
+// Stays in the debug tier: one relay poll, work or no work.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn relay_once<P: Publisher>(
     pool: &PgPool,
@@ -53,7 +56,7 @@ async fn relay_once_inner<P: Publisher>(
     // default filter it would be most of what an idle service exports.
     let mut tx = pool
         .begin()
-        .instrument(kafkaman_core::db_poll_span!(
+        .instrument_db(kafkaman_core::db_poll_span!(
             "BEGIN",
             table.qualified_name(),
             "open outbox claim transaction"
@@ -69,7 +72,7 @@ async fn relay_once_inner<P: Publisher>(
     )
     .await?;
     tx.commit()
-        .instrument(kafkaman_core::db_poll_span!(
+        .instrument_db(kafkaman_core::db_poll_span!(
             "COMMIT",
             table.qualified_name(),
             "commit outbox claim transaction"
@@ -93,6 +96,7 @@ async fn relay_once_inner<P: Publisher>(
             "otel.kind" = "producer",
             "otel.status_code" = tracing::field::Empty,
             "otel.status_description" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
             message_type = table.descriptor.message_type.as_str(),
             messaging.system = "kafka",
             messaging.destination.name = row.row.topic.as_str(),
@@ -128,7 +132,7 @@ async fn relay_once_inner<P: Publisher>(
                     .instrument(span.clone())
                     .await;
                 if let Err(err) = &marked {
-                    kafkaman_core::record_error(&span, err);
+                    kafkaman_core::record_exception(&span, err);
                 }
                 let outcome = marked?;
                 if outcome == MarkOutcome::Updated {
@@ -140,7 +144,16 @@ async fn relay_once_inner<P: Publisher>(
                 // Rendered once: it is both the span's status description and
                 // the `last_error` column the retry writes.
                 let description = err.to_string();
-                kafkaman_core::record_error(&span, &description);
+                // The one place a problem type is passed rather than asked for.
+                // `Publisher::publish` returns a boxed `std::error::Error` so a
+                // transport crate can report failures without this crate
+                // depending on it; requiring `ProblemType` there would break
+                // every implementor, for a value this call site already knows.
+                kafkaman_core::record_exception_as(
+                    &span,
+                    kafkaman_core::problem::PUBLISH,
+                    &description,
+                );
                 let marked = mark_publish_failed(
                     pool,
                     table,
@@ -152,7 +165,7 @@ async fn relay_once_inner<P: Publisher>(
                 .instrument(span.clone())
                 .await;
                 if let Err(err) = &marked {
-                    kafkaman_core::record_error(&span, err);
+                    kafkaman_core::record_exception(&span, err);
                 }
                 let outcome = marked?;
                 if outcome == MarkOutcome::Updated {

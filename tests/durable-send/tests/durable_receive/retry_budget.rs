@@ -211,20 +211,41 @@ async fn crash_during_dispatch_rolls_back_and_can_be_redriven() -> TestResult {
             .await?
     );
 
-    let crash_router = MessageRouter::new().handler::<OrderCreated>(|conn, _meta, msg| {
+    // The crash is an aborted task, not a panicking handler.
+    //
+    // It used to be a panic, which was the shorter way to interrupt a dispatch
+    // and is no longer an interruption at all: a handler panic is caught at the
+    // call boundary and recorded as an ordinary handler failure, so it would
+    // leave `attempts = 1` and a `Retryable` row rather than the untouched one
+    // this test is about. `dispatch_handler_panic.rs` covers that contract.
+    //
+    // What is under test here is the other thing entirely — the transaction
+    // guarantee when a dispatch simply stops mid-flight, which is what a killed
+    // process looks like to Postgres. Aborting the task drops the future and its
+    // open transaction with no failure accounting whatsoever, which is exactly
+    // that, and is a truer simulation than the panic ever was.
+    let handler_started = Arc::new(Notify::new());
+    let never_finish = Arc::new(Notify::new());
+    let handler_started_for_handler = Arc::clone(&handler_started);
+    let never_finish_for_handler = Arc::clone(&never_finish);
+    let crash_router = MessageRouter::new().handler::<OrderCreated>(move |conn, _meta, msg| {
+        let handler_started = Arc::clone(&handler_started_for_handler);
+        let never_finish = Arc::clone(&never_finish_for_handler);
         Box::pin(async move {
             sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
                 .bind(msg.order_id)
                 .execute(conn)
                 .await?;
-            panic!("simulated crash during dispatch");
-            #[allow(unreachable_code)]
+            // Park with the write done and the transaction still open, so the
+            // abort below lands in the window this test exists to cover.
+            handler_started.notify_one();
+            never_finish.notified().await;
             Ok(())
         })
     });
     let crash_pool = harness.pool().clone();
     let crash_table = table.clone();
-    let crash_result = tokio::spawn(async move {
+    let crashing = tokio::spawn(async move {
         dispatch_once(
             &crash_pool,
             &crash_table,
@@ -232,11 +253,13 @@ async fn crash_during_dispatch_rolls_back_and_can_be_redriven() -> TestResult {
             OffsetDateTime::now_utc(),
         )
         .await
-    })
-    .await;
-    assert!(crash_result
-        .expect_err("crash dispatch task should panic")
-        .is_panic());
+    });
+    tokio::time::timeout(Duration::from_secs(5), handler_started.notified()).await?;
+    crashing.abort();
+    assert!(crashing
+        .await
+        .expect_err("the aborted dispatch task should not report a result")
+        .is_cancelled());
 
     let row = harness
         .received_row_by_idempotency_key::<OrderCreated>("idem-crash-redrive")

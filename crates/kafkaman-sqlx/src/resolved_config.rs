@@ -3,7 +3,9 @@ use std::time::Duration;
 use kafkaman_config::{
     Config, ConfigErrors, ConfigIssue, ConfigSchema, ObservabilityConfig, RetryConfig,
 };
-use kafkaman_core::{KafkaMessage, MessageDescriptor, RelayConfig, SqlIdentifier, TopicMode};
+use kafkaman_core::{
+    DispatcherConfig, KafkaMessage, MessageDescriptor, RelayConfig, SqlIdentifier, TopicMode,
+};
 
 use crate::{Error, Result};
 
@@ -17,6 +19,11 @@ use crate::{Error, Result};
 pub struct ResolvedConfig {
     pub schema: SqlIdentifier,
     pub relay: RelayConfig,
+    /// How the receive dispatcher paces itself and when its panic breaker trips.
+    ///
+    /// `poll_interval` falls back to the relay's when `[dispatcher]` does not
+    /// set one, which is what the dispatcher read before the section existed.
+    pub dispatcher: DispatcherConfig,
     pub retry: RetryConfig,
     pub observability: ObservabilityConfig,
     /// What boot may do about the topics the registered types declare.
@@ -36,6 +43,7 @@ impl ResolvedConfig {
         Self {
             schema,
             relay: RelayConfig::default(),
+            dispatcher: DispatcherConfig::default(),
             retry: RetryConfig::default(),
             observability: ObservabilityConfig::default(),
             topics: TopicMode::default(),
@@ -114,6 +122,32 @@ impl ResolvedConfig {
             Some(RetryConfig::default())
         };
 
+        // No `contains` guard: the section is optional and every field within it
+        // is too, so `dispatcher()` defaults an absent one to exactly the
+        // behaviour that predates it.
+        //
+        // Resolved after `relay` because the fallback for an unset
+        // `poll_interval` is the relay's, which is where the dispatcher read it
+        // from before this section existed.
+        let dispatcher = match (cfg.dispatcher(), relay.as_ref()) {
+            (Ok(section), Some(relay)) => {
+                match section.into_dispatcher_config(relay.lifecycle, relay.poll_interval) {
+                    Ok(dispatcher) => Some(dispatcher),
+                    Err(reason) => {
+                        issues.push(ConfigIssue::new("dispatcher", reason));
+                        None
+                    }
+                }
+            }
+            (Err(err), _) => {
+                issues.push(err.into());
+                None
+            }
+            // `[relay]` already failed and reported its own issue; there is no
+            // fallback to resolve against and no second complaint worth making.
+            (Ok(_), None) => None,
+        };
+
         // Absent is not the same as off: `topics()` supplies `verify` for a
         // missing section, and only an unparseable one lands here as an issue.
         let topics = match cfg.topics() {
@@ -157,6 +191,7 @@ impl ResolvedConfig {
         let schema = SqlIdentifier::new(schema.ok_or_else(|| missing("database.schema"))?)?;
         let mut resolved = Self::new(schema)
             .with_relay(relay.ok_or_else(|| missing("relay"))?)
+            .with_dispatcher(dispatcher.ok_or_else(|| missing("dispatcher"))?)
             .with_retry(retry.ok_or_else(|| missing("retry"))?)
             .with_observability(observability.ok_or_else(|| missing("observability"))?)
             .with_topics(topics.ok_or_else(|| missing("topics"))?);
@@ -218,6 +253,11 @@ impl ResolvedConfig {
 
     pub fn with_relay(mut self, relay: RelayConfig) -> Self {
         self.relay = relay;
+        self
+    }
+
+    pub fn with_dispatcher(mut self, dispatcher: DispatcherConfig) -> Self {
+        self.dispatcher = dispatcher;
         self
     }
 

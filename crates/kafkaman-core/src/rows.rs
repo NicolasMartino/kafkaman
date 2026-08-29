@@ -19,7 +19,7 @@ use crate::{IdempotencyKey, OutboxStatus, ReceiveStatus, ReceivedFailureKind};
 /// RFC 9457's `status` member is omitted: it is defined as an HTTP status code
 /// and has no meaning for a Kafka dispatch failure. `occurred_at` is an
 /// extension member, which RFC 9457 permits.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReceivedError {
     /// RFC 9457 `type`. Reads also accept the pre-problem-detail `kind` field.
     #[serde(rename = "type", alias = "kind", with = "crate::problem_type", default)]
@@ -33,20 +33,38 @@ pub struct ReceivedError {
     /// RFC 9457 extension member carrying an RFC 9557 timestamp.
     #[serde(with = "crate::rfc9557")]
     pub occurred_at: OffsetDateTime,
+    /// Which part of the dispatch raised this — the *blame* axis, where
+    /// [`kind`](Self::kind) is the taxonomy axis.
+    ///
+    /// `None` means the row was written before stages were recorded, not that
+    /// the frame is unknown. An `Option` rather than a defaulted variant so
+    /// those two cannot be confused: a reader can tell "this version did not
+    /// know" from "this version knew and said routing".
+    ///
+    /// Omitted from the JSON when absent, so a row written before this exists
+    /// round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<crate::FailureStage>,
 }
 
 impl ReceivedError {
     /// Build a problem detail for `kind`, filling `title` from the failure class.
+    ///
+    /// `stage` is taken rather than defaulted because every caller inside
+    /// kafkaman knows it; `None` is reserved for values read back off rows that
+    /// predate the field.
     pub fn new(
         kind: ReceivedFailureKind,
         detail: impl Into<String>,
         occurred_at: OffsetDateTime,
+        stage: Option<crate::FailureStage>,
     ) -> Self {
         Self {
             kind,
             title: kind.title().to_owned(),
             detail: detail.into(),
             occurred_at,
+            stage,
         }
     }
 }

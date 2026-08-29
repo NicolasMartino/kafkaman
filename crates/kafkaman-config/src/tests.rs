@@ -1,6 +1,7 @@
 //! Unit tests, split to mirror the module they cover.
 
 mod config_file;
+mod dispatcher;
 mod duration;
 mod observability;
 mod retention;

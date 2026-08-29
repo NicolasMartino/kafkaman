@@ -21,6 +21,7 @@ pub mod boot;
 pub mod http;
 pub mod service;
 
+use kafkaman::InstrumentDb;
 use std::sync::Arc;
 
 use example_contracts::{OrderSnapshot, OrderStatus, ProductSnapshot, ProductStatus};
@@ -28,7 +29,6 @@ use kafkaman::sqlx::{CacheTable, Error as KafkamanError, ResolvedConfig};
 use kafkaman::{Envelope, IdempotencyIdentity};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
-use tracing::Instrument;
 use uuid::Uuid;
 
 pub use boot::{BoxError, RunningService, ServiceOptions};
@@ -182,7 +182,7 @@ where
     let Some(row) = sqlx::query(&sql)
         .bind(product_id.to_string())
         .fetch_optional(executor)
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "SELECT",
             cache_table,
             "read cached product"

@@ -1,5 +1,19 @@
 use super::*;
 
+#[derive(Clone, Debug, Serialize)]
+struct EntityKeyPanics {
+    order_id: String,
+}
+
+impl KafkaMessage for EntityKeyPanics {
+    const MESSAGE_TYPE: &'static str = "entity_key_panics";
+    const TOPIC: &'static str = "orders";
+
+    fn entity_key(&self) -> String {
+        panic!("entity key exploded");
+    }
+}
+
 #[tokio::test]
 async fn receive_insert_deduplicates_by_idempotency_key() -> TestResult {
     let _test_guard = receive_test_lock().lock().await;
@@ -58,6 +72,76 @@ async fn receive_insert_deduplicates_by_idempotency_key() -> TestResult {
         .await
         .expect_err("conflicting message id should not insert a new receive row");
     assert!(err.to_string().contains("idem-conflicting-message-id"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn receive_insert_turns_entity_key_panics_into_errors() -> TestResult {
+    let _test_guard = receive_test_lock().lock().await;
+    let (_postgres, harness) = start_harness().await?;
+    let _table = harness.received_table::<EntityKeyPanics>().await?;
+
+    let envelope = Envelope::new(EntityKeyPanics {
+        order_id: "order-panicking-entity-key".to_owned(),
+    })
+    .with_idempotency_key("idem-panicking-entity-key");
+    let err = harness
+        .insert_received(&envelope, 0, 13, Some(b"order-panicking-entity-key"))
+        .await
+        .expect_err("a panicking entity_key implementation must not unwind");
+
+    assert!(
+        matches!(
+            err,
+            kafkaman_test::Error::Sqlx(kafkaman_sqlx::Error::ApplicationPanicked { .. })
+        ),
+        "expected the panic to be reported as an application panic, got {err}"
+    );
+    assert!(
+        err.to_string().contains("entity key exploded"),
+        "the error should retain the panic message: {err}"
+    );
+
+    Ok(())
+}
+
+/// The same containment on the send side.
+///
+/// `enqueue` calls the same trait the receive side does, and a panic there would
+/// unwind into whatever called `enqueue` — usually an HTTP handler, whose task
+/// dies with nothing written down about why. Symmetry matters here beyond
+/// tidiness: an application implementing `KafkaMessage` should not have to know
+/// which direction its method is being called from to predict what a bug in it
+/// does.
+#[tokio::test]
+async fn enqueue_turns_entity_key_panics_into_errors() -> TestResult {
+    let _test_guard = receive_test_lock().lock().await;
+    let (_postgres, harness) = start_harness().await?;
+    let _table = harness.outbox_table::<EntityKeyPanics>().await?;
+
+    let envelope = Envelope::new(EntityKeyPanics {
+        order_id: "order-panicking-entity-key-enqueue".to_owned(),
+    })
+    .with_idempotency_key("idem-panicking-entity-key-enqueue");
+
+    let mut conn = harness.pool().acquire().await?;
+    let err = enqueue_on_connection(&mut conn, &harness.config(), &envelope)
+        .await
+        .expect_err("a panicking entity_key implementation must not unwind");
+
+    assert!(
+        matches!(err, kafkaman_sqlx::Error::ApplicationPanicked { .. }),
+        "expected the panic to be reported as an application panic, got {err}"
+    );
+    assert!(
+        err.to_string().contains("entity key exploded"),
+        "the error should retain the panic message: {err}"
+    );
+    assert!(
+        err.to_string().contains("resolve entity key"),
+        "and name which call panicked, since three of them are wrapped: {err}"
+    );
 
     Ok(())
 }

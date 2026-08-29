@@ -63,7 +63,7 @@ impl RdkafkaPublisher {
     /// Naming the context rather than reading the ambient one is what keeps the
     /// `traceparent` other services parse pointing at `kafkaman.relay.publish`,
     /// whatever gets opened between that span and this call.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     pub async fn publish_row_traced(
         &self,
         row: &ClaimedOutboxRow,

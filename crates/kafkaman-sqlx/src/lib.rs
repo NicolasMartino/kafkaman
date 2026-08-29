@@ -15,6 +15,7 @@ pub use kafkaman_core;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+mod catch_panic;
 mod changelog;
 mod changeset;
 mod changesets;
@@ -64,7 +65,8 @@ pub use ingest_failure::{ReceivedIngestFailure, ReceivedIngestFailureRow, Receiv
 pub use migration_runner::{migrate, migrate_dry_run};
 pub use operability::{
     outbox_status_summary, outbox_stuck_rows, received_status_summary, received_stuck_rows,
-    OutboxStatusSummary, OutboxStuckRow, ReceivedStatusSummary, ReceivedStuckRow,
+    service_table_access, service_tables, OutboxStatusSummary, OutboxStuckRow,
+    ReceivedStatusSummary, ReceivedStuckRow, ServiceTables, TableAccess,
 };
 pub use outbox_claim::claim_batch;
 pub use outbox_enqueue::{enqueue, enqueue_on_connection};

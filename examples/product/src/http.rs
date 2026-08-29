@@ -5,20 +5,24 @@
 //! write to an owned entity enqueues its snapshot in the *same* transaction, so
 //! a committed product and its announcement cannot come apart.
 
+use kafkaman::InstrumentDb;
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use example_contracts::ProductStatus;
+use kafkaman::axum::{admin_router, redrive_router, AdminState};
 use kafkaman::sqlx::enqueue;
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 use uuid::Uuid;
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::faults::{self, ArmRequest, FaultMode, FaultStatus};
 use crate::{
     product_from_row, product_snapshot_envelope, AppState, ProductRecord, PRODUCT_COLUMNS,
 };
@@ -37,21 +41,72 @@ use crate::{
         description = "Owns products. Publishes ProductSnapshot, and derives \
                        availability from its own cache of orders.",
     ),
-    paths(health, list_products, create_product, read_product, discontinue),
-    components(schemas(CreateProductRequest, ProductRecord, ErrorBody)),
-    tags((name = "products", description = "Entities this service owns.")),
+    paths(
+        health,
+        list_products,
+        create_product,
+        read_product,
+        discontinue,
+        read_fault,
+        arm_fault,
+        disarm_fault,
+    ),
+    components(schemas(
+        CreateProductRequest,
+        ProductRecord,
+        ErrorBody,
+        ArmRequest,
+        FaultMode,
+        FaultStatus,
+    )),
+    tags(
+        (name = "products", description = "Entities this service owns."),
+        (
+            name = "faults",
+            description = "Make the dispatch handler fail on purpose, so the \
+                           retry, dead-letter and redrive paths can be watched \
+                           end to end. Demo only.",
+        ),
+    ),
 )]
 struct ApiDoc;
 
 pub fn build_router(state: AppState) -> Router {
+    let operator = operator_routes(&state);
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
         .route("/products", get(list_products).post(create_product))
         .route("/products/{product_id}", get(read_product))
         .route("/products/{product_id}/discontinue", post(discontinue))
+        .route(
+            "/faults",
+            get(read_fault).post(arm_fault).delete(disarm_fault),
+        )
         .with_state(state)
+        // After `with_state`, so the already-stated operator router nests
+        // without the two state types having to unify.
+        .nest("/internal/kafkaman", operator)
         .layer(kafkaman::axum::CorrelationLayer::new())
+}
+
+/// The operator routes kafkaman ships, mounted where an operator can reach them.
+///
+/// `admin_router` is read-only — queue depth by status, rows stuck past their
+/// threshold, and the dead-letter queue. `redrive_router` is the one destructive
+/// route, and kafkaman keeps it in a separate router precisely so that mounting
+/// it is a decision rather than a side effect of wanting dashboards.
+///
+/// # No authentication
+///
+/// Neither router has any, which is acceptable *here* and nowhere else: a
+/// disposable local stack on a private compose network, with ports published to
+/// loopback. See [`admin_router`]'s `# Security` section for what the responses
+/// expose — including panic details, which are the least curated strings in the
+/// system — and for how a real deployment should mount them.
+fn operator_routes(state: &AppState) -> Router {
+    let admin = AdminState::new(state.pool.clone(), Arc::clone(&state.cfg));
+    admin_router(admin.clone()).merge(redrive_router(admin))
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -135,7 +190,16 @@ async fn health() -> StatusCode {
     request_body = CreateProductRequest,
     responses(
         (status = 201, description = "Created, and its snapshot enqueued.", body = ProductRecord),
-        (status = 400, description = "Empty name, or a negative price or stock.", body = ErrorBody),
+        (status = 400, description = "Empty name, a negative price or stock, or a \
+                                      body that was not valid JSON.", body = ErrorBody),
+        // Axum's `Json` extractor answers before any handler code runs, and
+        // with three statuses this route would otherwise not admit to. A client
+        // generated from this spec has to handle them: they are what it gets for
+        // a field it spelled wrong.
+        (status = 415, description = "Content-Type was not application/json.", body = ErrorBody),
+        (status = 422, description = "Well-formed JSON that does not match the \
+                                      request schema — an unknown, missing, or \
+                                      wrongly typed field.", body = ErrorBody),
         (status = 409, description = "This product_id already exists.", body = ErrorBody),
     ),
 )]
@@ -169,7 +233,7 @@ async fn create_product(
     let mut tx = state
         .pool
         .begin()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "BEGIN",
             "products",
             "open product write transaction",
@@ -188,7 +252,7 @@ async fn create_product(
     .bind(product.available)
     .bind(product.version)
     .execute(&mut *tx)
-    .instrument(kafkaman::db_span!("INSERT", "products", "insert product"))
+    .instrument_db(kafkaman::db_span!("INSERT", "products", "insert product"))
     .await
     .map_err(|err| {
         if is_unique_violation(&err) {
@@ -205,7 +269,7 @@ async fn create_product(
         .map_err(|err| ProductError::Internal(format!("enqueue snapshot: {err}")))?;
 
     tx.commit()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "COMMIT",
             "products",
             "commit product write transaction",
@@ -227,7 +291,7 @@ async fn list_products(
         "SELECT {PRODUCT_COLUMNS} FROM products ORDER BY created_at, product_id"
     ))
     .fetch_all(&state.pool)
-    .instrument(kafkaman::db_span!("SELECT", "products", "list products"))
+    .instrument_db(kafkaman::db_span!("SELECT", "products", "list products"))
     .await
     .map_err(internal("list products"))?;
 
@@ -257,7 +321,7 @@ async fn read_product(
     ))
     .bind(product_id)
     .fetch_optional(&state.pool)
-    .instrument(kafkaman::db_span!("SELECT", "products", "read product"))
+    .instrument_db(kafkaman::db_span!("SELECT", "products", "read product"))
     .await
     .map_err(internal("read product"))?
     .ok_or(ProductError::NotFound)?;
@@ -286,7 +350,7 @@ async fn discontinue(
     let mut tx = state
         .pool
         .begin()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "BEGIN",
             "products",
             "open product write transaction",
@@ -299,7 +363,7 @@ async fn discontinue(
     ))
     .bind(product_id)
     .fetch_optional(&mut *tx)
-    .instrument(kafkaman::db_span!("SELECT", "products", "lock product"))
+    .instrument_db(kafkaman::db_span!("SELECT", "products", "lock product"))
     .await
     .map_err(internal("read product"))?
     .ok_or(ProductError::NotFound)?;
@@ -309,7 +373,7 @@ async fn discontinue(
     // second snapshot of state nothing changed.
     if current.status == ProductStatus::Discontinued {
         tx.commit()
-            .instrument(kafkaman::db_span!(
+            .instrument_db(kafkaman::db_span!(
                 "COMMIT",
                 "products",
                 "commit product no-op transaction",
@@ -328,7 +392,7 @@ async fn discontinue(
     .bind(String::from(ProductStatus::Discontinued))
     .bind(product_id)
     .fetch_one(&mut *tx)
-    .instrument(kafkaman::db_span!(
+    .instrument_db(kafkaman::db_span!(
         "UPDATE",
         "products",
         "discontinue product"
@@ -344,7 +408,7 @@ async fn discontinue(
         .map_err(|err| ProductError::Internal(format!("enqueue snapshot: {err}")))?;
 
     tx.commit()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "COMMIT",
             "products",
             "commit product write transaction",
@@ -352,4 +416,63 @@ async fn discontinue(
         .await
         .map_err(internal("commit"))?;
     Ok(Json(updated))
+}
+
+/// Read what the dispatch handler is currently rigged to do.
+#[utoipa::path(
+    get, path = "/faults", tag = "faults",
+    responses((status = 200, description = "The armed fault, if any", body = FaultStatus)),
+)]
+async fn read_fault() -> Json<FaultStatus> {
+    Json(faults::status())
+}
+
+/// Make the dispatch handler fail.
+///
+/// `remaining` is the whole difference between the two failure stories kafkaman
+/// tells. A bounded count is a transient failure: the row retries on its backoff
+/// and converges anyway, with no operator involved. Omitting it is a permanent
+/// failure: the row spends its attempt budget and dead-letters, and a human has
+/// to redrive it.
+///
+/// `mode: "panic"` is the third story. A panicking handler used to take the
+/// whole process down — HTTP server included — for one bad message. It is now
+/// caught at the handler boundary and treated as an error, so this arms a fault
+/// that dead-letters a row while the service keeps serving.
+#[utoipa::path(
+    post, path = "/faults", tag = "faults",
+    request_body = ArmRequest,
+    responses(
+        (status = 200, description = "The fault as armed", body = FaultStatus),
+        (status = 400, description = "Invalid fault request, or a body that was \
+                                      not valid JSON.", body = ErrorBody),
+        // Axum's `Json` extractor answers before any handler code runs, and
+        // with three statuses this route would otherwise not admit to. A client
+        // generated from this spec has to handle them: they are what it gets for
+        // a field it spelled wrong.
+        (status = 415, description = "Content-Type was not application/json.", body = ErrorBody),
+        (status = 422, description = "Well-formed JSON that does not match the \
+                                      request schema — an unknown, missing, or \
+                                      wrongly typed field.", body = ErrorBody),
+    ),
+)]
+async fn arm_fault(Json(request): Json<ArmRequest>) -> Result<Json<FaultStatus>, ProductError> {
+    let status = faults::arm(request).map_err(ProductError::InvalidRequest)?;
+    tracing::warn!(
+        mode = ?status.mode,
+        remaining = ?status.remaining,
+        "product dispatch fault armed"
+    );
+    Ok(Json(status))
+}
+
+/// Stop failing. The fired count stays readable.
+#[utoipa::path(
+    delete, path = "/faults", tag = "faults",
+    responses((status = 200, description = "The fault after disarming", body = FaultStatus)),
+)]
+async fn disarm_fault() -> Json<FaultStatus> {
+    let status = faults::disarm();
+    tracing::info!(fired = status.fired, "product dispatch fault disarmed");
+    Json(status)
 }

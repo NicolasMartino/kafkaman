@@ -6,7 +6,7 @@ use rand::SeedableRng;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::dispatch_failure::{received_failure_disposition, FailureDisposition};
+use crate::dispatch_failure::{failure_disposition, FailureDisposition};
 use crate::retry_backoff::{jittered, received_failure_schedule, retry_backoff};
 use crate::tests::received_table;
 use crate::Error;
@@ -14,6 +14,7 @@ use crate::Error;
 /// The disposition most tests want: an ordinary retryable failure.
 const RETRYABLE: FailureDisposition = FailureDisposition {
     kind: ReceivedFailureKind::Handler,
+    stage: kafkaman_core::FailureStage::Handler,
     terminal: false,
 };
 
@@ -80,29 +81,50 @@ fn failure_schedule_exhausts_exactly_at_max_attempts() {
 }
 
 #[test]
-fn deterministic_cache_errors_are_terminal_on_the_first_attempt() {
+fn deterministic_cache_errors_are_terminal_whichever_frame_raised_them() {
+    use kafkaman_core::FailureStage;
+
     // Retrying either of these re-reads the same row and fails identically,
     // so spending the attempt budget buys nothing and delays the only signal
     // an operator gets by exactly that budget.
-    let mismatch = received_failure_disposition(&Error::CacheOriginMismatch {
+    //
+    // Asserted across every stage, because that is the change: terminality used
+    // to live only in the classifier kafkaman used for its *own* failures, so
+    // the identical error returned by a handler quietly kept its retries. It is
+    // a property of the error — the guard's predicate cannot become true again
+    // no matter who noticed it could not.
+    let mismatch = Error::CacheOriginMismatch {
         entity_key: "p-1".to_owned(),
         applied_topic: "products".to_owned(),
         applied_partition: 0,
         incoming_topic: "products".to_owned(),
         incoming_partition: 1,
-    });
-    assert!(mismatch.terminal);
-
-    let missing = received_failure_disposition(&Error::MissingEntityKey {
+    };
+    let missing = Error::MissingEntityKey {
         message_id: Uuid::nil(),
         message_type: "product_snapshot".to_owned(),
-    });
-    assert!(missing.terminal);
+    };
+
+    for stage in FailureStage::ALL {
+        assert!(
+            failure_disposition(&mismatch, stage).terminal,
+            "a cache origin mismatch is terminal from {stage:?}"
+        );
+        assert!(
+            failure_disposition(&missing, stage).terminal,
+            "a missing entity key is terminal from {stage:?}"
+        );
+        assert!(
+            !failure_disposition(&Error::MissingHandler("x".to_owned()), stage).terminal,
+            "an unregistered type is retryable from {stage:?} — a replica that \
+             has not deployed yet will register it"
+        );
+    }
 
     // A transient database error shares the `Infrastructure` class with them,
     // which is exactly why terminality cannot be read off the class.
-    assert_eq!(mismatch.kind, ReceivedFailureKind::Infrastructure);
-    assert!(!received_failure_disposition(&Error::MissingHandler("x".to_owned())).terminal);
+    let disposition = failure_disposition(&mismatch, FailureStage::Bookkeeping);
+    assert_eq!(disposition.kind, ReceivedFailureKind::Infrastructure);
 
     // And terminality really does short-circuit the schedule, on attempt zero
     // of a policy with attempts to spare.
@@ -111,7 +133,7 @@ fn deterministic_cache_errors_are_terminal_on_the_first_attempt() {
         table.retry.max_attempts > 1,
         "fixture must have retries left"
     );
-    let schedule = received_failure_schedule(&table, 0, OffsetDateTime::UNIX_EPOCH, mismatch);
+    let schedule = received_failure_schedule(&table, 0, OffsetDateTime::UNIX_EPOCH, disposition);
     assert!(schedule.exhausted);
     assert!(
         schedule.next_attempt_at.is_none(),

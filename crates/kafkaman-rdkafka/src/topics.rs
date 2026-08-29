@@ -58,6 +58,8 @@ impl TopicAdmin {
     }
 
     /// What the broker reports for `topic`, or `None` if it does not exist.
+    // Stays in the debug tier: a topic poll, convergence or no convergence.
+    // See the span-depth decision for the rule.
     #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
     pub async fn observe(&self, topic: &str) -> Result<Option<ObservedTopic>> {
         let Some(partitions) = self.partition_count(topic)? else {
@@ -98,7 +100,7 @@ impl TopicAdmin {
             .map(|candidate| candidate.partitions().len() as i32))
     }
 
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     async fn cleanup_policy(&self, topic: &str) -> Result<CleanupPolicy> {
         let resources = self
             .client
@@ -129,7 +131,7 @@ impl TopicAdmin {
 
     /// Create `topic`. An existing topic is not an error: two services booting
     /// against the same cluster race here by construction.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     pub async fn create(
         &self,
         topic: &str,
@@ -192,7 +194,7 @@ impl TopicAdmin {
 ///
 /// Returns the partition drifts worth warning about; a policy mismatch is an
 /// error rather than a return value.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn converge_topics(
     admin: &TopicAdmin,
     mode: TopicMode,

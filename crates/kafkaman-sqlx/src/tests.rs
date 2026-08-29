@@ -12,11 +12,13 @@ use uuid::Uuid;
 
 use crate::ReceivedTable;
 
+mod catch_panic;
 mod changelog;
 mod dispatch_cache;
 mod generated_changelog;
 mod lock_keys;
 mod migration_runner;
+mod problem;
 mod replay;
 mod resolved_config;
 mod retry_backoff;

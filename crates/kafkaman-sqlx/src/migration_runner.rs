@@ -38,7 +38,7 @@ struct SchemaLock {
 
 impl SchemaLock {
     /// Wait for the lock, however long another replica holds it.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     async fn acquire(pool: &PgPool, cfg: &ResolvedConfig) -> Result<Self> {
         let mut transaction = pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -51,7 +51,7 @@ impl SchemaLock {
     /// Release the lock, reporting `result`'s error in preference to a release
     /// failure: the caller cares far more about why the migration failed than
     /// about the rollback that followed.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     async fn release<T>(self, result: Result<T>) -> Result<T> {
         // Rollback, not commit: this transaction exists only to scope the lock
         // and has written nothing.
@@ -64,7 +64,7 @@ impl SchemaLock {
 }
 
 /// Apply every changeset the context allows that has not already been applied.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn migrate(
     pool: &PgPool,
     cfg: &ResolvedConfig,
@@ -91,7 +91,7 @@ pub async fn migrate(
 }
 
 /// Report what [`migrate`] would do, without doing any of it.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn migrate_dry_run(
     pool: &PgPool,
     cfg: &ResolvedConfig,
@@ -126,7 +126,7 @@ pub async fn migrate_dry_run(
     }
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn dry_run_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     cfg: &ResolvedConfig,
@@ -176,7 +176,7 @@ async fn dry_run_in_tx(
     Ok(report)
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn run_migrations(
     conn: &mut PgConnection,
     cfg: &ResolvedConfig,
@@ -249,7 +249,7 @@ async fn run_migrations(
 ///
 /// Idempotent and unversioned by necessity: these must exist before any
 /// changeset can be version-checked, so they cannot themselves be changesets.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn bootstrap_history(conn: &mut PgConnection, cfg: &ResolvedConfig) -> Result<()> {
     let schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", cfg.schema.quoted());
     sqlx::query(&schema_sql).execute(&mut *conn).await?;
@@ -285,7 +285,7 @@ struct HistoryRow {
     checksum: Option<String>,
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn history_row(
     cfg: &ResolvedConfig,
     tx: &mut Transaction<'_, Postgres>,
@@ -309,7 +309,7 @@ async fn history_row(
     }
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn insert_history(
     cfg: &ResolvedConfig,
     tx: &mut Transaction<'_, Postgres>,

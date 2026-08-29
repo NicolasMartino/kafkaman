@@ -6,8 +6,9 @@ use serde::de::DeserializeOwned;
 
 use crate::duration::parse_duration;
 use crate::{
-    ConfigError, ConfigErrors, ConfigSchema, ObservabilityConfig, ObservabilitySection,
-    RelaySection, Result, RetentionSection, RetryConfig, RetrySection, TopicsSection,
+    ConfigError, ConfigErrors, ConfigSchema, DispatcherSection, ObservabilityConfig,
+    ObservabilitySection, RelaySection, Result, RetentionSection, RetryConfig, RetrySection,
+    TopicsSection,
 };
 
 /// A parsed `kafkaman.toml`.
@@ -88,6 +89,15 @@ impl Config {
     /// it required would turn an upgrade into a silent deletion.
     pub fn retention(&self) -> Result<Option<RetentionSection>> {
         self.section("retention")
+    }
+
+    /// The `[dispatcher]` section, if present.
+    ///
+    /// Optional like `[retention]`: every field in it has a default, so an
+    /// absent section is a complete policy. The absent-section defaults are
+    /// exactly the behaviour that predates the section.
+    pub fn dispatcher(&self) -> Result<DispatcherSection> {
+        Ok(self.section("dispatcher")?.unwrap_or_default())
     }
 
     /// The `[retry]` section.

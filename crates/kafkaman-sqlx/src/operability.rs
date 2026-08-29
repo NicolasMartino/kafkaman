@@ -21,16 +21,227 @@
 //!
 //! Nothing here mutates. The one operational write that belongs with these — a
 //! runtime DLQ redrive — lives in `replay.rs` beside the statement it reuses.
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use kafkaman_core::{OutboxStatus, ReceiveStatus};
+use kafkaman_core::{OutboxStatus, ReceiveStatus, SqlIdentifier};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::resolved_config::ResolvedConfig;
 use crate::retry_backoff::duration_to_time;
 use crate::{Error, OutboxTable, ReceivedTable, Result};
+
+/// Which of the durable tables a configuration *could* name this service
+/// actually has.
+///
+/// # Why this is needed at all
+///
+/// A service declares every message type it exchanges, and `ResolvedConfig`
+/// records the descriptors — but not which side of each one this service is on.
+/// Roles are declared above this crate, and a hand-wired service has no role
+/// registry at all, so the configuration genuinely cannot answer "do I publish
+/// this, or consume it".
+///
+/// The schema can. An outbox table exists exactly when this service publishes
+/// the type, and a received table exactly when it consumes it, because that is
+/// what the migrations create. So anything summarizing "every message type"
+/// must ask the schema first, or it queries a table that was never meant to
+/// exist and fails the whole request.
+///
+/// That is not hypothetical: every operator summary route raised
+/// `relation ... does not exist` for any service that both publishes and
+/// consumes, which is every realistic service. It survived because nothing
+/// mounted those routes.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceTables {
+    present: BTreeSet<String>,
+}
+
+impl ServiceTables {
+    /// Whether the schema holds this table, by the qualified name
+    /// [`OutboxTable::qualified_name`] and friends produce.
+    #[must_use]
+    pub fn contains(&self, qualified_name: &str) -> bool {
+        self.present.contains(qualified_name)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.present.is_empty()
+    }
+}
+
+/// Ask the schema which outbox and received tables this service has.
+///
+/// One round trip for the whole set rather than one per candidate: the routes
+/// that need this already run an unbounded aggregate per message type, and
+/// doubling that with an existence probe each would be the more expensive half.
+///
+/// This asks the catalog rather than trying a `SELECT`: a missing table should
+/// filter out one side of a service, not fail the whole request. The probe is
+/// still stricter than `to_regclass`; a view, index, sequence, or table the
+/// current role cannot read is not usable by the admin routes.
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+pub async fn service_tables(pool: &PgPool, cfg: &ResolvedConfig) -> Result<ServiceTables> {
+    let mut qualified_names = Vec::with_capacity(cfg.messages().len() * 2);
+    let mut schema_names = Vec::with_capacity(cfg.messages().len() * 2);
+    let mut table_names = Vec::with_capacity(cfg.messages().len() * 2);
+    for descriptor in cfg.messages() {
+        let outbox = OutboxTable::new(cfg.schema.clone(), descriptor.clone())?;
+        push_table_candidate(
+            &mut qualified_names,
+            &mut schema_names,
+            &mut table_names,
+            &outbox.schema,
+            &outbox.table,
+        );
+
+        let received = ReceivedTable::for_descriptor(cfg, descriptor.clone())?;
+        push_table_candidate(
+            &mut qualified_names,
+            &mut schema_names,
+            &mut table_names,
+            &received.schema,
+            &received.table,
+        );
+    }
+
+    let present: Vec<String> = sqlx::query_scalar(
+        "SELECT candidate.qualified_name
+         FROM unnest($1::text[], $2::text[], $3::text[])
+              AS candidate(qualified_name, schema_name, table_name)
+         JOIN pg_namespace namespace
+           ON namespace.nspname = candidate.schema_name
+         JOIN pg_class class
+           ON class.relnamespace = namespace.oid
+          AND class.relname = candidate.table_name
+         WHERE class.relkind IN ('r', 'p')
+           AND has_table_privilege(class.oid, 'SELECT')",
+    )
+    .bind(&qualified_names)
+    .bind(&schema_names)
+    .bind(&table_names)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ServiceTables {
+        present: present.into_iter().collect(),
+    })
+}
+
+/// Why a generated service table cannot be used, when it cannot.
+///
+/// A `bool` collapsed three genuinely different repairs into one answer, and the
+/// route that consumed it had to guess between them in prose: run your
+/// migrations, point the request at the service that consumes this type, or
+/// grant your database role the privilege. Naming which one it is turns a
+/// message an operator has to work through into one they can act on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableAccess {
+    /// Present, a real table, and usable for the privileges asked about.
+    Ready,
+    /// No relation of that name in that schema. Either the migrations have not
+    /// run, or this service was never meant to have this side of the type.
+    Missing,
+    /// A relation of that name exists but is not an ordinary or partitioned
+    /// table — a view or a sequence left over from a hand-rolled schema.
+    NotATable,
+    /// The table is there and the current database role cannot use it as asked.
+    NoPrivilege,
+}
+
+impl TableAccess {
+    #[must_use]
+    pub fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+
+    /// What an operator should do about it, for an error body.
+    #[must_use]
+    pub fn repair(self) -> &'static str {
+        match self {
+            Self::Ready => "nothing; the table is usable",
+            Self::Missing => {
+                "run this service's migrations, or address the request to the service that has \
+                 this side of the message type"
+            }
+            Self::NotATable => {
+                "a relation of that name exists but is not a table; kafkaman's migrations create \
+                 one, so something else owns this name"
+            }
+            Self::NoPrivilege => {
+                "grant this service's database role the privileges the route needs on the table"
+            }
+        }
+    }
+}
+
+/// Whether one generated service table is present and usable for `privileges`.
+///
+/// `privileges` is checked with `has_table_privilege`'s **AND** semantics, one
+/// call per name — its own comma-separated form means "any of these", which is
+/// not what a caller listing what it is about to do wants. A route that reads
+/// passes `["SELECT"]`; one that writes has to say so, because a role with
+/// `SELECT` and no `UPDATE` would otherwise pass a read-shaped probe and then
+/// fail against the statement it was cleared for.
+///
+/// The predicates are selected as columns rather than filtered on, so an
+/// unusable table can say *why* instead of being indistinguishable from an
+/// absent one.
+///
+/// An empty `privileges` is a pure existence probe, and answers `Ready` for a
+/// table that exists: "the role holds all of no privileges" is vacuously true.
+/// The `LEFT JOIN` is what buys that. A `CROSS JOIN` over an empty array
+/// produces no rows at all, so the aggregate never runs, `fetch_optional`
+/// returns `None`, and a present, fully-readable table is reported `Missing` —
+/// the one answer that is both wrong and actionable, since it sends an operator
+/// to re-run migrations that already ran.
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+pub async fn service_table_access(
+    pool: &PgPool,
+    schema: &SqlIdentifier,
+    table: &SqlIdentifier,
+    privileges: &[&str],
+) -> Result<TableAccess> {
+    let found: Option<(bool, bool)> = sqlx::query_as(
+        "SELECT class.relkind IN ('r', 'p'),
+                coalesce(bool_and(has_table_privilege(class.oid, privilege)), true)
+         FROM pg_namespace namespace
+         JOIN pg_class class
+           ON class.relnamespace = namespace.oid
+          AND class.relname = $2
+         LEFT JOIN unnest($3::text[]) AS privilege ON true
+         WHERE namespace.nspname = $1
+         GROUP BY class.relkind",
+    )
+    .bind(schema.as_str())
+    .bind(table.as_str())
+    .bind(privileges)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(match found {
+        None => TableAccess::Missing,
+        Some((false, _)) => TableAccess::NotATable,
+        Some((true, false)) => TableAccess::NoPrivilege,
+        Some((true, true)) => TableAccess::Ready,
+    })
+}
+
+fn push_table_candidate(
+    qualified_names: &mut Vec<String>,
+    schema_names: &mut Vec<String>,
+    table_names: &mut Vec<String>,
+    schema: &SqlIdentifier,
+    table: &SqlIdentifier,
+) {
+    qualified_names.push(crate::tables::qualified_name(schema, table));
+    schema_names.push(schema.as_str().to_owned());
+    table_names.push(table.as_str().to_owned());
+}
 
 /// One `(message type, status)` bucket of an outbox table, with the age of its
 /// oldest row.
@@ -125,6 +336,8 @@ pub struct ReceivedStuckRow {
 ///
 /// `max_queue_age` only decides the `over_max_queue_age` flag; it never filters
 /// rows, so the counts stay complete regardless of the threshold.
+// Stays in the debug tier: the queue-metrics sampler calls this on `refresh_interval`.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn outbox_status_summary(
     pool: &PgPool,
@@ -164,6 +377,8 @@ pub async fn outbox_status_summary(
 
 /// Per-status row counts and oldest-row age for one received table. Carries the
 /// same cost caveat as [`outbox_status_summary`].
+// Stays in the debug tier: the queue-metrics sampler calls this on `refresh_interval`.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn received_status_summary(
     pool: &PgPool,
@@ -206,7 +421,7 @@ pub async fn received_status_summary(
 /// An expired claim is not itself a fault — the relay reclaims them on the next
 /// cycle. Staying expired past the threshold is the fault, so the cutoff is
 /// applied to `claim_expires_at` rather than to `created_at`.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn outbox_stuck_rows(
     pool: &PgPool,
     table: &OutboxTable,
@@ -271,7 +486,7 @@ pub async fn outbox_stuck_rows(
 /// the overdue set itself, not the table.
 ///
 /// [`create_outbox_retention_index_sql`]: crate::create_outbox_retention_index_sql
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn received_stuck_rows(
     pool: &PgPool,
     table: &ReceivedTable,

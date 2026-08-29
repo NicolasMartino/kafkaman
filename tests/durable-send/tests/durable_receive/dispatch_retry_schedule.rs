@@ -1,8 +1,10 @@
 //! Failures that are retried rather than parked, and when they come back.
+use kafkaman_core::ProblemType as _;
+
 use super::*;
 
 #[tokio::test]
-async fn handler_sql_constraint_error_is_recorded_as_handler_failure() -> TestResult {
+async fn handler_sql_constraint_error_records_its_class_and_its_frame() -> TestResult {
     let _test_guard = receive_test_lock().lock().await;
     let (_postgres, harness) = start_harness().await?;
     let table = harness.received_table::<OrderCreated>().await?;
@@ -48,7 +50,41 @@ async fn handler_sql_constraint_error_is_recorded_as_handler_failure() -> TestRe
         .await?;
     assert_eq!(row.status, ReceiveStatus::Retryable);
     assert_eq!(row.errors.len(), 1);
-    assert_eq!(row.errors[0].kind, ReceivedFailureKind::Handler);
+
+    // Two fields, and they have to be read together. This row used to record
+    // `Handler` alone, which said "something inside the handler" and nothing
+    // about what; it now records the class of the failure and the frame it came
+    // out of separately, which is strictly more than the single value carried.
+    //
+    // `Infrastructure` for a constraint violation is coarse, and deliberately
+    // so for now: kafkaman cannot tell a unique violation from a pool exhaustion
+    // without inspecting SQLSTATE, and both arrive as `Error::Sqlx`. The
+    // coarseness was always there — it was previously masked by the catch-all
+    // that relabelled everything a handler returned. Refining it is named in the
+    // taxonomy/blame decision's "Revisit If"; it would add a telemetry URI, not
+    // a stored class, since none of the four fits a constraint violation better.
+    assert_eq!(row.errors[0].kind, ReceivedFailureKind::Infrastructure);
+    assert_eq!(
+        row.errors[0].stage,
+        Some(kafkaman_core::FailureStage::Handler),
+        "the frame is what says this was the handler's own statement rather \
+         than kafkaman's bookkeeping"
+    );
+
+    // The telemetry class, against a real `PgDatabaseError` rather than a stub.
+    // This is the path the unit tests cannot reach: a genuine unique violation
+    // answers `kind()` directly, so the SQLSTATE table is never consulted.
+    let refused = sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
+        .bind("order-business-constraint")
+        .execute(harness.pool())
+        .await
+        .expect_err("the row is already there");
+    assert_eq!(
+        kafkaman_sqlx::Error::Sqlx(refused).problem_type(),
+        "urn:kafkaman:problem:constraint",
+        "a refused write groups apart from a broken environment in APM, even \
+         though both still store as Infrastructure"
+    );
 
     Ok(())
 }

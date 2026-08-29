@@ -1,5 +1,6 @@
 //! Recording what happened to a claimed outbox row, and reading one back.
 
+use kafkaman_core::InstrumentDb;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{Error, OutboxTable, Result};
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn mark_published(
     pool: &PgPool,
     table: &OutboxTable,
@@ -43,7 +44,7 @@ pub async fn mark_published(
     .await
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn mark_publish_failed(
     pool: &PgPool,
     table: &OutboxTable,
@@ -73,7 +74,7 @@ pub async fn mark_publish_failed(
         .bind(error)
         .bind(retry_after.as_secs_f64())
         .execute(pool)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "UPDATE",
             table.qualified_name(),
             "mark outbox publish failed",
@@ -87,7 +88,7 @@ pub async fn mark_publish_failed(
     }
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn mark_with_sql(
     pool: &PgPool,
     table: &OutboxTable,
@@ -110,7 +111,7 @@ async fn mark_with_sql(
     }
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn mark_miss_outcome(
     pool: &PgPool,
     table: &OutboxTable,
@@ -123,7 +124,7 @@ async fn mark_miss_outcome(
     let exists = sqlx::query(&sql)
         .bind(message_id)
         .fetch_optional(pool)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "SELECT",
             table.qualified_name(),
             "classify outbox mark miss",
@@ -137,7 +138,7 @@ async fn mark_miss_outcome(
     })
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn outbox_row(
     pool: &PgPool,
     table: &OutboxTable,
@@ -150,7 +151,7 @@ pub async fn outbox_row(
     let row = sqlx::query(&sql)
         .bind(message_id)
         .fetch_optional(pool)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "SELECT",
             table.qualified_name(),
             "read outbox row",

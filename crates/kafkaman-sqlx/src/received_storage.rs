@@ -1,10 +1,11 @@
+use kafkaman_core::InstrumentDb;
 use kafkaman_core::{Envelope, KafkaMessage, ReceiveStatus, ReceivedIngestFailureKind};
 use serde::Serialize;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use tracing::Instrument;
 use uuid::Uuid;
 
+use crate::catch_panic::catch_application_panic;
 use crate::schema_sql::received_ingest_failures_table_name;
 use crate::{
     Error, ReceivedIngestFailure, ReceivedIngestFailureRow, ReceivedInsertOutcome, ReceivedTable,
@@ -39,7 +40,7 @@ where
     ))
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn insert_received_with_outcome<P>(
     tx: &mut Transaction<'_, Postgres>,
     cfg: &ResolvedConfig,
@@ -66,13 +67,21 @@ where
         .as_ref()
         .map(|source| source.value().clone());
     let headers = serde_json::to_value(&evt.headers)?;
-    let payload = serde_json::to_value(&evt.payload)?;
+    let payload = catch_application_panic(
+        table.descriptor.message_type.as_str(),
+        "serialize payload",
+        || serde_json::to_value(&evt.payload),
+    )??;
     // Resolve the convergence identity here, where the payload is still typed,
     // and persist it as a column. Recovering it later from a `kafkaman-` header
     // would be fragile: ingest deliberately strips that namespace from user
     // headers, so a header-sourced entity key does not survive a broker round
     // trip.
-    let entity_key = evt.payload.entity_key();
+    let entity_key = catch_application_panic(
+        table.descriptor.message_type.as_str(),
+        "resolve entity key",
+        || evt.payload.entity_key(),
+    )?;
 
     let sql = format!(
         "INSERT INTO {name} (
@@ -113,7 +122,7 @@ where
         )
         .bind(evt.occurred_at)
         .execute(&mut **tx)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "INSERT",
             table.qualified_name(),
             "insert received row",
@@ -127,7 +136,7 @@ where
     received_insert_conflict_outcome(tx, &table, evt.message_id, &idempotency_key_hex).await
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn received_insert_conflict_outcome(
     tx: &mut Transaction<'_, Postgres>,
     table: &ReceivedTable,
@@ -144,7 +153,7 @@ async fn received_insert_conflict_outcome(
         .bind(message_id)
         .bind(idempotency_key)
         .fetch_all(&mut **tx)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "SELECT",
             table.qualified_name(),
             "classify received insert conflict",
@@ -168,7 +177,7 @@ async fn received_insert_conflict_outcome(
     }
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn insert_received_ingest_failure(
     tx: &mut Transaction<'_, Postgres>,
     cfg: &ResolvedConfig,
@@ -194,7 +203,7 @@ pub async fn insert_received_ingest_failure(
         .bind(failure.kind.discriminant())
         .bind(failure.error.as_str())
         .execute(&mut **tx)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "INSERT",
             table.as_str(),
             "insert received ingest failure",
@@ -204,7 +213,7 @@ pub async fn insert_received_ingest_failure(
     Ok(result.rows_affected() == 1)
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn received_ingest_failure_by_source(
     pool: &PgPool,
     cfg: &ResolvedConfig,
@@ -225,7 +234,7 @@ pub async fn received_ingest_failure_by_source(
         .bind(source_partition)
         .bind(source_offset)
         .fetch_optional(pool)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "SELECT",
             table.as_str(),
             "read received ingest failure",

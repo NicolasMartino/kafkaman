@@ -24,7 +24,9 @@
   - examples/order/kafkaman.toml
   - examples/product/kafkaman.toml
   - tests/observability/tests/trace_parented_handoff.rs
+  - tests/observability/tests/dispatch_failure_status.rs
   - tests/example-telemetry/tests/binary_telemetry.rs
+  - examples/kibana-dashboard.sh
   - tests/durable-send/src/containers.rs
 - Related:
   - wiki/compatibility/m4-retry-backoff-runtime-api.compat.md
@@ -89,14 +91,21 @@ and exists only so the two macros expand in a crate that does not depend on
 
 - `ResolvedConfig.observability`
 - `ResolvedConfig::with_observability`
+- `OutboxTable::for_descriptor`
 - `ReceivedTable::for_descriptor`
 - `Replay::received_descriptor`
 - `Replay::RUNTIME_VERSION`
+- `kafkaman_core::DispatcherConfig`
+- `kafkaman_config::DispatcherSection`, `Config::dispatcher`
+- `ResolvedConfig.dispatcher`, `ResolvedConfig::with_dispatcher`
+- `kafkaman_core::panic_message`
 - `outbox_status_summary`
 - `received_status_summary`
 - `outbox_stuck_rows`
 - `received_stuck_rows`
+- `service_table_access`, `TableAccess`
 - `redrive_received`
+- `DispatchStats.panicked`, `DispatchStats.panicked_message_id`
 - summary/stuck row structs for outbox and received inspection.
 
 `kafkaman-axum` is a new crate. The facade crate re-exports it behind the new
@@ -117,9 +126,11 @@ These are additive-looking but source-breaking for existing callers:
 - `outbox_status_summary` and `received_status_summary` take a `max_queue_age:
   Duration` argument, which decides the new `over_max_queue_age` flag. It never
   filters rows, so counts are unaffected.
-- `run_dispatcher` takes a `lifecycle: LifecycleEmission` argument before
-  `shutdown`. `LifecycleEmission::default()` preserves the previous behavior
-  (summary only, no per-message events).
+- `run_dispatcher` takes one `cfg: DispatcherConfig` in place of its separate
+  `poll_interval` and `lifecycle` arguments, matching `run_purger` and
+  `relay::run`, which have always taken a config struct each.
+  `DispatcherConfig { poll_interval, ..Default::default() }` preserves the
+  previous behaviour.
 - `RelayConfig` gained a `lifecycle` field. `RelayConfig::default()` and the
   config-resolution path both fill it; struct-literal construction must add it.
 - `ObservabilityPolicy` gained `kafka_trace_handoff`, and
@@ -134,6 +145,12 @@ These are additive-looking but source-breaking for existing callers:
 - `Replay::message_type` was removed before any release used it. It had no
   callers.
 - `ReceivedStatusSummary`/`OutboxStatusSummary` gained `over_max_queue_age`.
+- `DispatchStats` gained `panicked` and `panicked_message_id`, and is now
+  `#[non_exhaustive]`, so it will not be source-breaking again. `panicked` is
+  also counted in `failed`; summing the fields double-counts.
+- `kafkaman_sqlx::Error`, `kafkaman_axum::AdminError`,
+  `kafkaman_rdkafka::Error`, and `kafkaman_worker::Error` are now
+  `#[non_exhaustive]`. Exhaustive matches must add a wildcard arm.
 
 The timestamp fields on every M6 inspection struct now serialize as RFC 9557
 strings rather than `time`'s derived nine-integer array. Any consumer written
@@ -330,6 +347,17 @@ kept their names and gained only units and the `messaging.*` attributes — but 
 added attribute is an added dimension, so the three `ingest.*` counters split
 into per-topic series. See *Ingest counters gained `messaging.destination.name`*
 below for what that costs a dashboard already querying them.
+
+The dispatcher records caught handler panics as
+`kafkaman.scheduler.rows{status="panicked"}` as well as `status="failed"`, and
+`kafkaman.dispatch.duration{outcome="panicked"}` for the per-row duration.
+
+`panicked` is a **subset of** `failed`, not a sibling of it: every panicked row
+is counted under both. A dashboard summing `kafkaman.scheduler.rows` across the
+`status` dimension therefore double-counts panics, and one that wants "failures"
+should query `status="failed"` alone. `kafkaman.dispatch.duration`'s `outcome`
+dimension is the opposite — its values are mutually exclusive, because
+`dispatch_once` handles exactly one row per call.
 
 Histogram bucket boundaries, in seconds, are declared rather than defaulted — the
 OpenTelemetry defaults are millisecond-scaled and would put every observation in
@@ -581,15 +609,259 @@ span kind/status through the tracing bridge:
 - `kafkaman.dispatch`: consumer
 
 Failures on enqueue, relay publish/mark, ingest, and dispatch record error
-status on the owning kafkaman span, through `kafkaman_core::record_error` and so
-with a bounded description. Successful spans leave status unset except where the
-Elastic APM enrichment derives `event.outcome` and transaction result.
+status on the owning kafkaman span, with a bounded description. Successful spans
+leave status unset except where the Elastic APM enrichment derives
+`event.outcome` and transaction result.
 
-`kafkaman.dispatch` marks ERROR only when the dispatch cycle itself could not
-complete. A handler that returns an error and gets a retry scheduled is a
-successful cycle by `dispatch_once`'s contract — the failure is recorded on the
-row and counted in `DispatchStats` — so marking the span would make an APM error
-rate count work the system is handling as designed.
+`kafkaman.dispatch` marks ERROR once a row-level failure has been **durably
+recorded**, not only when the cycle itself could not complete. `dispatch_once`
+still returns `Ok` — a handler error that schedules a retry is a successful cycle
+by its contract, and the row and `DispatchStats` are still where the retry policy
+reads from. The span status answers a different question: an APM transaction view
+splitting receive work by ok/failed needs the failed ones to be marked, and a
+dispatch that recorded a failure is one. Spans are marked only *after* the record
+commits, so a span never claims a failure the row does not have.
+
+### OpenTelemetry `exception` events on failure
+
+**Added 2026-08-30.** Every failure on the durable path now also emits an
+OpenTelemetry `exception` span event, which is what populates Elastic APM's error
+surfaces — error groups, per-type occurrence counts, and the
+transaction-to-error pivot. Before this, a failure produced a red transaction and
+no error document at all.
+
+The event carries two attributes:
+
+| Attribute | Value |
+| --- | --- |
+| `exception.type` | a permanent `urn:kafkaman:problem:*` URI (below) |
+| `exception.message` | the error's `Display` output, truncated to 256 bytes on a character boundary |
+
+The same bounded string is written to `otel.status_description`, deliberately:
+`tracing-opentelemetry`'s `error_events_to_status` is on by default and
+overwrites the status from the event, so the two writes must agree or the
+256-byte cap is silently defeated by whichever lands last. That cap exists
+because error text is attacker-influenced — a database error can quote the value
+that violated a constraint.
+
+**One failure produces one error document.** The event is emitted on the
+innermost span that owns the failure — `kafkaman.handler` for a handler failure,
+`kafkaman.dispatch` for a routing or bookkeeping one — and the enclosing spans
+carry status and the `kafkaman.failure.*` attributes without repeating the event.
+
+**Exception events are excluded from log export.** *Added 2026-08-30.* The event
+is emitted on the `kafkaman::telemetry` target — now
+`kafkaman_core::TELEMETRY_TARGET` — and carries **no message**, because that is
+the only shape `tracing-opentelemetry` rewrites into an `exception`. The OTLP log
+bridge saw the same event and exported it too, as a log record with an empty
+body: measured on the example stack, 13 of 13 ERROR log records were these, one
+for every error already reported as an error.
+
+`kafkaman_otel::init` now applies `EnvFilter.and(target != EXCEPTION_TARGET)` to
+the log layer alone. The span layer still receives the event, and so does a
+stdout formatter, which renders the fields legibly. A host composing its own
+registry through `builder` owns this filter; the crate docs show it, and
+`kafkaman_otel::EXCEPTION_TARGET` is public so it need not be spelled out.
+`kafkaman-otel` deliberately does not depend on kafkaman, so the constant is
+duplicated rather than imported, and
+`exception_events.rs::the_exception_target_matches_kafkaman_core` holds the two
+equal.
+
+**`kafkaman.ingest` reports a refused record as a failure.** *Added 2026-08-30.*
+It previously reported `Ok` for every record, including one it had quarantined —
+because quarantining is a *handled* outcome and `ingest_once` returns `Ok` for
+it. A poison message therefore produced no exception, no failed transaction and
+no APM error; the only record of it was a row in `received_ingest_failures`.
+
+The span is now marked `ERROR` and carries one exception event, typed by the
+`ReceivedIngestFailureKind`'s own problem URI, on all three refusal paths: an
+undecodable payload, an `ApplicationPanicked` during insert, and a `message_id`
+conflict. The **return value is unchanged** — still `Ok`, still one consumed
+record, still a committed offset — because the loop must keep moving past a
+record that will never parse. This is a telemetry change, not a behaviour change.
+Pinned by `ingest_span_covers_decode.rs`.
+`db.query` spans record error *status* and never an exception event, for the same
+reason. `tests/observability/tests/dispatch_failure_status.rs` pins the count.
+
+**`exception.type` is a new permanent vocabulary**, and finer-grained than the
+persisted one. `ReceivedFailureKind` has four values because they are written
+into stored rows and cannot churn. The exception type is derived from the error's
+own Rust type and has eighteen, which is what lets a handler *panic* group
+separately in APM (`urn:kafkaman:problem:handler-panicked`) from a handler that
+returned an error (`urn:kafkaman:problem:handler`), while both still dead-letter
+under the same stored kind. The two views reconcile on `attributes.error.type`,
+which both carry.
+
+The full set: `missing-handler`, `invalid-payload`, `infrastructure`, `handler`,
+`handler-panicked`, `application-panicked`, `configuration`, `schema`,
+`message-routing`, `cache-invariant`, `idempotency`, `topic`, `unsafe-replay`,
+`publish`, `breaker-tripped`, `constraint`, `contention`, `statement` — each
+prefixed `urn:kafkaman:problem:`. These are **stable**: they are the grouping key
+an APM error group is built on, and they are declared in one place as
+`kafkaman_core::problem::ALL_PROBLEM_TYPES`.
+
+**Added 2026-08-30: `constraint`, `contention`, `statement`.** A database error
+is now classified by what the database refused rather than lumped under
+`infrastructure`. `Error::Sqlx` wraps every `sqlx::Error`, so a closed pool and a
+unique violation used to be one class — and since a handler's own query is the
+most common way a handler fails, that was the largest and least informative group
+in APM.
+
+| URI | SQLSTATE | Meaning |
+| --- | --- | --- |
+| `constraint` | class 23 | the schema refused the write |
+| `contention` | class 40 | deadlock or serialization failure; expected under load, retry is correct |
+| `statement` | classes 22, 42 | the statement cannot run as written, by this role |
+
+Connection (08), resources (53), operator intervention (57), system (58),
+anything unrecognised, and the `sqlx::Error` variants that never reached the
+server stay `infrastructure`.
+
+**No stored data changes.** All three coarsen to `ReceivedFailureKind::Infrastructure`,
+and terminal-ness is unchanged. Anything grouping APM errors on
+`exception.type` will see three new groups split out of `infrastructure`.
+
+### Failure classification no longer depends on the frame
+
+**Changed 2026-08-30. This changes values written into rows — read the migration
+note below.**
+
+A failure's persisted class is now a function of the error alone. Previously two
+independent classifiers ran depending on where the failure surfaced, and the one
+used for handler failures ended in a catch-all that recorded everything as
+`Handler`. A database error returned by a handler therefore read:
+
+```
+Error::Sqlx(PoolClosed)   APM  exception.type    = urn:kafkaman:problem:infrastructure
+                          DLQ  latest_error.type = urn:kafkaman:problem:handler
+```
+
+One failure, one URI namespace, two values. An operator filtering the dead-letter
+queue for infrastructure failures found none of the rows a pool exhaustion had
+just parked there.
+
+`ReceivedFailureKind` is now derived from the error's `ProblemType` URI through a
+single total coarsening, `ReceivedFailureKind::coarsening`, and the frame is
+recorded separately as `FailureStage`.
+
+**What changes in stored data.** An error that surfaced through a handler frame
+and is not itself a handler error now records its own class instead of `Handler`:
+
+| Handler returns | Was | Now |
+| --- | --- | --- |
+| `Error::Sqlx(..)` | `Handler` | `Infrastructure` |
+| `Error::CacheOriginMismatch`, `MissingEntityKey`, `InvalidEntityKey` | `Handler` | `Infrastructure` |
+| `Error::MissingIdempotencyKey`, and other library classes | `Handler` | `Infrastructure` |
+| `Error::Handler(..)`, `Error::HandlerPanicked(..)` | `Handler` | `Handler` (unchanged) |
+| `Error::Serde(..)` | `InvalidPayload` | `InvalidPayload` (unchanged) |
+
+**Migration.** Existing rows are **not** rewritten — the `errors` array is an
+audit trail, and restating it to say something the system did not say at the time
+would be worse than the inconsistency. A table therefore spans both conventions
+at the boundary. Two consequences:
+
+- A saved `ReceivedFailureFilter::kind` or a `failure_kind` on a redrive request
+  selects a different population after upgrade. `Infrastructure` gains the rows
+  that were mislabelled; `Handler` loses them. This is the intended repair, and
+  it is the reason it is called out here.
+- To find pre-upgrade rows that would classify differently now, read
+  `latest_error.detail` — or check for `latest_error.stage`, whose absence marks
+  a row written before this change.
+
+**Terminal-ness also stops depending on the frame.** A handler returning
+`Error::CacheOriginMismatch`, `MissingEntityKey`, or `InvalidEntityKey` now
+dead-letters on the first attempt rather than spending its retry budget. The
+predicate those guards test cannot become true again on a retry regardless of who
+noticed it; the old behaviour was an artefact of terminal-ness living only in the
+classifier kafkaman used for its own failures.
+
+### `kafkaman_core::FailureStage` (new public type, new persisted value)
+
+**Added 2026-08-30.**
+
+```rust
+pub enum FailureStage { Routing, Handler, Bookkeeping }
+```
+
+The *blame* axis, where `ReceivedFailureKind` is the *taxonomy* axis. It answers
+"whose code produced this" and nothing else: `Routing` before any handler ran,
+`Handler` inside application code, `Bookkeeping` in kafkaman's own claim,
+savepoint, or commit.
+
+It was already exported as the `kafkaman.failure.stage` span attribute; this
+makes it a public type and persists it, so a trace and a row carry the same two
+axes. The three lowercase spellings — `routing`, `handler`, `bookkeeping` — are
+the ones the span attribute already used and are now a compatibility surface.
+
+`ReceivedError` gains a corresponding field:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub stage: Option<FailureStage>,
+```
+
+`None` means "written before stages were recorded", not "unknown frame", which is
+why it is an `Option` rather than a defaulted variant. It is omitted from the JSON
+when absent, so a row written before this round-trips byte-identically. It flows
+out through `DlqRowSummary.latest_error` with no route change.
+
+**Breaking for constructors.** `ReceivedError::new` takes a fourth argument. An
+unknown stage now fails deserialization rather than defaulting — unlike the
+failure *kind*, which still degrades, because an unreadable class must not make a
+row unreadable while an absent stage already has its own spelling.
+
+### `kafkaman_core::ProblemType` (new public trait)
+
+**Added 2026-08-30.**
+
+```rust
+pub trait ProblemType {
+    fn problem_type(&self) -> &'static str;
+}
+```
+
+The trait also carries a provided `failure_kind()`, which is the persisted
+four-value coarsening of `problem_type()`. It is provided rather than required so
+that no implementor can define a second relationship between the two
+vocabularies — which is exactly the defect described above.
+
+Implemented for `kafkaman_core::Error`, `kafkaman_sqlx::Error`,
+`kafkaman_rdkafka::Error`, `kafkaman_worker::Error`, and `ReceivedFailureKind`.
+Each impl is a hand-written exhaustive `match`, so a new error variant does not
+compile until someone decides how it appears in APM.
+
+Two things follow for compatibility. The trait is public API, so adding a
+required method to it is a breaking change. And **which URI a given error variant
+maps to is now a compatibility surface**, because it is the APM grouping key:
+moving a variant from one URI to another splits or merges an existing error group
+in every dashboard built on it.
+
+`record_exception` derives the type from the error rather than taking it as an
+argument, so a call site cannot mislabel a failure. One site is exempt and uses
+`record_exception_as`: `Publisher::publish` returns `Box<dyn Error + Send +
+Sync>` in a **public trait**, and requiring `ProblemType` there would break every
+implementor. It passes `urn:kafkaman:problem:publish` explicitly.
+
+`record_error` is unchanged and still exported — status without an event, which
+is what `db.query` spans and the `format_args!` caller in `kafkaman-axum` need.
+
+Also implemented for `ReceivedIngestFailureKind`, which reuses the dispatch
+vocabulary rather than growing one of its own: an operator asking "what is wrong
+with this message" wants the same answer whether it failed before or after it
+became a row.
+
+### `kafkaman_core::TELEMETRY_TARGET` and `kafkaman_otel::EXCEPTION_TARGET` (new public constants)
+
+**Added 2026-08-30.** Both are `"kafkaman::telemetry"`, the `tracing` target every
+exception event is emitted on.
+
+It is named rather than left as a literal because it is the seam a host filters
+at, and it has to be filtered *somewhere* — see the exception-event section for
+why. `kafkaman-otel` carries its own copy because that crate deliberately does not
+depend on kafkaman, which is what lets a host copy the file and own it; the two
+are held equal by a test in the one suite that depends on both.
+
+Changing the string is a breaking change for any host filtering on it.
 
 ### Bounding exported trace volume
 
@@ -659,37 +931,78 @@ first span that distinguishes the two.
 
 ### The `kafkaman::internal` span tier
 
-**Added 2026-08-29.** 74 functions across `kafkaman-sqlx`, `kafkaman-axum`,
-`kafkaman-worker`, and `kafkaman-rdkafka` carry
-`#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]`.
-Reach them with:
+**Added 2026-08-29. Split across two levels 2026-08-30 — behaviour change at the
+default filter, described below.** 76 functions across `kafkaman-sqlx`,
+`kafkaman-axum`, `kafkaman-worker`, and `kafkaman-rdkafka` carry
+`#[tracing::instrument(target = "kafkaman::internal", skip_all)]` with a level
+chosen by what makes the function run:
+
+- **`info` — runs because there is a message to describe.** 60 functions. These
+  are in the default trace and need nothing turned on. The dispatch path, the
+  cache path, the store and quarantine paths, `enqueue_inner`,
+  `publish_row_traced`, the mark paths, the migration runner, and the admin
+  route handlers.
+- **`debug` — runs on a timer whether or not there is work.** 16 functions,
+  reached with the directive below: `claim_batch`,
+  `collapse_stale_pending_rows`, `claim_received_row`, `relay_once`,
+  `dispatch_once`, `dispatch_once_sampled`, `dispatch_once_with_observer`,
+  `purge_outbox_once`, `refresh`, `collect`, `observe`,
+  `outbox_status_summary`, `received_status_summary`, `health`, `ready`, and
+  `enqueue`.
 
 ```
 RUST_LOG=info,kafkaman::internal=debug
 ```
 
-The dedicated target exists so that reaching kafkaman's functions does not also
-enable `sqlx` and `rdkafka` debug logging. `skip_all` is not stylistic: bare
-`#[instrument]` records every argument via `Debug`, which would put envelopes,
-rows, and payload bytes into spans and violate the no-payload rule above.
+The dedicated target exists so that reaching the second half does not also
+enable `sqlx` and `rdkafka` debug logging. `skip_all` is not stylistic on either
+half: bare `#[instrument]` records every argument via `Debug`, which would put
+envelopes, rows, and payload bytes into spans and violate the no-payload rule
+above.
 
-**These span names are not a compatibility surface.** They are function names and
-will change whenever the functions do. Build dashboards on the `kafkaman.*` phase
-spans and the `db.query` summaries.
+**These span names are not a compatibility surface, and neither is any
+function's level.** They are function names and will change whenever the
+functions do; expect individual functions to move between the two halves as the
+split is tuned. Build dashboards on the `kafkaman.*` phase spans and the
+`db.query` summaries.
 
-Fifteen functions are deliberately excluded, in four categories: those that build
-a phase span (a second one would nest a duplicate), those that run until shutdown
-(a span covering hours is not a waterfall row), those that read the ambient span
-(see the rule above), and bodiless trait declarations. `kafkaman-core` is
-excluded entirely — it performs no I/O, so there is no time there for a span to
-attribute.
+The last three `debug` entries are there for reasons other than shape.
+`outbox_status_summary` and `received_status_summary` are timer-shaped by way of
+their caller — the queue-metrics sampler runs both on `refresh_interval`.
+`health` and `ready` are probed forever by an orchestrator, which is the same
+cost from the other side. `enqueue` is excluded to preserve a trace *root*:
+`kafkaman.enqueue` is the root span in a service with no caller span, and a
+function span above it would move the root onto a name this note refuses to
+stabilize.
 
-**Measured cost.** A product-create request goes from 17 spans to 25. The
-scheduler loops dominate everything else: with the tier on for one example
-service and the stack otherwise idle, that service produced 2322 spans in two
-minutes against 5 from the service without it. Nearly all of the difference is
-`claim_batch`, `claim_received_row`, and the other per-cycle functions. This tier
-is for a debugging session, not for a deployment.
+Fifteen further functions carry no annotation at all, in four categories: those
+that build a phase span (a second one would nest a duplicate), those that run
+until shutdown (a span covering hours is not a waterfall row), those that read
+the ambient span (see the rule above), and bodiless trait declarations.
+`kafkaman-core` is excluded entirely — it performs no I/O, so there is no time
+there for a span to attribute.
+
+**Measured cost, and why the split is where it is.** A product-create request
+goes from 17 spans to 25 per service with the whole tier on. An *idle* service
+goes from 5 spans in two minutes to 2322. Re-measured after the split, at
+`RUST_LOG=info`: one product-create request is 38 spans end to end across both
+services — 1 HTTP, 5 `kafkaman.*`, 16 `db.query`, 16 promoted function spans —
+and an idle two-service stack exported **zero** spans in two minutes. Those two numbers are unrelated, and nearly all of
+the second is `claim_batch`, `claim_received_row`, `observe`, `refresh`, and the
+other per-cycle functions describing having found nothing. So the message-path
+half — where the eight spans are — is on by default, and the polling half is
+not. This is the same rule that already separates `db_span!` from
+`db_poll_span!`, now applied to function spans so a query span and the function
+that opens it are always on the same side of the line.
+
+**What changed for a consumer of this telemetry.** At `RUST_LOG=info`, a
+kafkaman trace now contains function spans it did not contain before, sitting
+between the `kafkaman.*` phase spans and the `db.query` spans beneath them. Two
+consequences follow. Anything asserting a *direct* parent/child edge between a
+phase span and a query span will now see an intermediate span; the causal
+relationship is unchanged, so assert descendant rather than child. And span
+counts per trace are higher — roughly eight per request on the example stack —
+which matters where a sampler or an ingest budget is tuned on span volume.
 
 The relay publish span now covers the post-publish outbox mark as well as the
 broker call, so a slow or failing `mark outbox published` appears under
@@ -1069,3 +1382,239 @@ Repeated `tracestate` *headers* on one record remain first-wins, matching
 `traceparent`. That is a documented deviation from the Recommendation's
 combine-with-commas rule, which exists for HTTP field splitting and does not
 describe a Kafka multimap; see the trace-context decision.
+
+## Handler Panic Containment, and Two Bugs Deliberate Failure Found (2026-08-29)
+
+Recorded from `wiki/decisions/handler-panic-containment-and-fault-injection.decision.md`.
+
+### A panicking handler no longer stops the service
+
+This is the behaviour change with the widest reach, and it is a change to what
+adopters observe rather than to any signature.
+
+**Before**, a panic in an application handler unwound out of the handler, out of
+the dispatcher's task, and out of the supervised runtime as
+`RuntimeError::Panicked`, exiting the process — HTTP server included. On restart
+the claim transaction had rolled back, so the row was still `Pending`, was
+claimed again, and panicked again. One bad message killed the service for as long
+as the restart policy allowed and then permanently.
+
+**Now** the panic is caught at the handler call boundary and becomes
+`Error::HandlerPanicked`, an ordinary retryable handler failure. An isolated row
+spends its budget and dead-letters; the dispatch loop and the HTTP server both
+keep running. A deploy that makes every claimed row panic is not treated as
+healthy background work: after ten consecutive *distinct rows* panic, the
+dispatcher returns
+`kafkaman_worker::Error::ConsecutivePanickingRowLimitExceeded` so runtime
+supervision can surface the bad deploy. A row that gets through clears the
+streak, and the limit is
+`[dispatcher].max_consecutive_panicking_rows`.
+
+**Distinct rows, not panics, and the difference is load-bearing.** A single
+poison message panicking through its whole retry budget never trips this, however
+many attempts that takes — absorbing it is exactly what the budget and the
+dead-letter queue are for. Counting panics instead cannot separate that from a
+bad deploy, because `dispatch_once` claims one row per cycle and only a
+successful claim ends a streak: one row on the default `max_attempts` of 10
+produces ten panics with nothing between them.
+
+Panics in kafkaman's *own* loops are unchanged and still fail fast. A deployment
+that wants the old behaviour has it already: `panic = "abort"` leaves no unwind
+to catch.
+
+### `kafkaman_sqlx::Error` gains `HandlerPanicked(String)`
+
+Source-breaking for an exhaustive `match` on the enum, like every previous
+variant addition here. It renders as `handler panicked: {message}`, with the
+panic payload downcast from `&'static str` or `String` and truncated at 512
+characters — a panic message is not authored for storage, and the row keeps
+`errors_limit` of them.
+
+It classifies as `ReceivedFailureKind::Handler`, so **no new problem-type URI**
+and no change to any stored DLQ vocabulary. Distinguish a panic by the message
+prefix, by `DispatchStats.panicked`, by
+`kafkaman.scheduler.rows{scheduler="dispatcher",status="panicked"}`, or by the
+span attribute below.
+
+`kafkaman_sqlx::Error` also gains `ApplicationPanicked { message_type,
+operation, message }`, used when application code panics outside a handler:
+serializing the typed payload, or resolving `KafkaMessage::partition_key()` or
+`entity_key()`. It is raised in **both directions**, which is the point — an
+application implementing `KafkaMessage` should not have to know which way its
+method is being called to predict what a bug in it does:
+
+- On **ingest**, the Redpanda consumer quarantines that Kafka record as
+  `InvalidPayload` rather than treating it as a transient SQL failure, and counts
+  it against the existing consecutive-skip breaker.
+- On **enqueue**, `enqueue`/`enqueue_on_connection` return the error instead of
+  unwinding into the caller — usually an application HTTP handler, whose task
+  would otherwise die with nothing written down about why.
+
+`kafkaman_rdkafka::Error` gains `PayloadPanicked`, used when
+`Deserialize` panics while decoding a consumed Kafka record. It is also
+quarantined as `InvalidPayload`.
+
+### `kafkaman.handler` gains `handler.outcome`
+
+Recorded only when the handler panicked, with the value `panicked`. That sparsity
+is the feature: `handler.outcome: panicked` selects exactly the panics with
+nothing to exclude. A returned error is already visible as the span's status.
+
+### Recorded receive failures now mark `kafkaman.dispatch`
+
+**Amended 2026-08-30.** A receive-side failure that is durably recorded on the
+row now marks the enclosing `kafkaman.dispatch` span/transaction with
+`otel.status_code = "ERROR"`. The inner failure span still carries the narrow
+location — for example `kafkaman.handler` for application handler failures — but
+APM transaction and service-overview views can now split messaging work by
+successful versus failed receive attempts.
+
+This changes telemetry only. `dispatch_once` still returns `Ok(DispatchStats)`
+when it successfully records a retryable or terminal row failure; the row status,
+retry scheduling, DLQ history, and `DispatchStats.failed` remain the durable
+contract.
+
+Failed dispatch and handler spans gain four bounded attributes:
+
+| Attribute | Value |
+| --- | --- |
+| `error.type` | The stable RFC 9457 problem URI, such as `urn:kafkaman:problem:handler`. |
+| `kafkaman.failure.type` | The same stable problem URI, namespaced for kafkaman dashboards. |
+| `kafkaman.failure.kind` | The persisted `ReceivedFailureKind` discriminant, such as `Handler` or `MissingHandler`. |
+| `kafkaman.failure.stage` | Where the failure was recorded: `routing`, `handler`, or `bookkeeping`. |
+
+The example Kibana dashboard now separates a failed-transaction panel from a
+failure-detail panel. The former filters transaction documents so APM outcome is
+visible; the latter keeps the raw `status.code: Error` span view for drilling
+into the exact failed phase.
+
+### `kafkaman_sqlx` gains `service_tables`, `service_table_access`, `ServiceTables`, and `TableAccess`
+
+`service_tables(&pool, &cfg)` asks the schema which of a configuration's outbox
+and received tables are usable by this role, in one round trip.
+`service_table_access(&pool, &schema, &table, &["SELECT", "UPDATE"])` asks the
+same question for one table and a named set of privileges, returning a
+`TableAccess` — `Ready`, `Missing`, `NotATable`, or `NoPrivilege` — rather than a
+bool, so the route can say which repair applies. `TableAccess::repair()` renders
+that as operator-facing text.
+
+Usable means a real table or partitioned table that the current database role
+holds **every** listed privilege on. `has_table_privilege`'s own comma-separated
+form means *any of these*, which is not what a caller listing what it is about to
+do wants, so the privileges are checked one per name. A view, index, sequence, or
+insufficiently-granted table no longer passes the filter and then fails in the
+route body — which is how a role with `SELECT` and no `UPDATE` used to reach a
+500 from the redrive statement.
+
+It exists because **every operator summary route was returning 500**. `/outbox`,
+`/received`, `/stuck` and `/dlq` each iterate every configured message type and
+build both an outbox and a received table for it, then query whichever the
+migrations never created. A service that publishes one type and consumes another
+— which is every realistic service — hit this on its first request. The
+configuration cannot distinguish the two sides: it records descriptors, not
+roles, and roles are declared above this crate.
+
+**Adopters who mount `admin_router` see summaries start working.** They also see
+message types disappear from the side they were never on, which is the fix: a
+publish-only type has no dead-letter queue to report.
+
+### `AdminError` gains `UnusableServiceTables(Vec<String>)` and `NotRedrivable`
+
+Source-breaking for an exhaustive `match` on the enum, and the enum is now
+`#[non_exhaustive]`.
+
+`UnusableServiceTables` returns **503**, naming the message types in the response
+body, when a configured type has no readable table on *either* side. The
+migrations create one table per side, so a declared type always has one here; if
+neither is readable the schema cannot back the configuration — unmigrated, or
+unreadable by this role.
+
+**Per type, not per service.** An earlier form of this check only fired when zero
+tables were readable anywhere, which caught the fully-unmigrated service and
+nothing else: a schema missing three of five types answered `200` with those
+three silently absent, and an operator reads that as *these queues are empty* —
+the most dangerous wrong answer a queue-depth route can give. One side missing is
+the normal shape of a service and is still skipped silently (at `debug`); both
+sides missing is a broken deployment and is now refused.
+
+`NotRedrivable { message_type, access }` returns **404** from
+`POST /dlq/{message_type}/redrive` when the named type is registered but has no
+redrivable received table here, which previously fell through to a 500. The body
+carries a `repair` field from the `TableAccess`, because the same 404 covers
+three different fixes: run your migrations, address the request to the service
+that consumes the type, or grant your database role `UPDATE`. Kept apart from
+`UnknownMessageType` because the caller named a real message type.
+
+### New optional `[dispatcher]` config section
+
+```toml
+[dispatcher]
+poll_interval = "250ms"             # defaults to relay.poll_interval
+max_consecutive_panicking_rows = 10
+```
+
+Both keys optional, and the section itself optional: omitting it reproduces the
+behaviour that predates it exactly, including the `relay.poll_interval` fallback
+the dispatcher has always read. Unknown keys inside it are a hard error like
+every other kafkaman-owned section.
+
+Separate from `[retry]`, which is otherwise the receive-dispatch section,
+because `[retry]` is per message type and these are per loop — one dispatcher
+covers one message type, so "poll this type faster" has no meaning that
+`[retry]` could express. It resolves onto the new `ResolvedConfig.dispatcher`.
+
+`kafkaman_core` gains `DispatcherConfig` and
+`Error::InvalidDispatcherConfig`, sitting beside `RelayConfig` and `PurgeConfig`
+for the same reason those are there: the loop is in `kafkaman-worker`, the
+resolved config is assembled in `kafkaman-sqlx`, and `kafkaman-core` is the crate
+both can see. `kafkaman_worker::Error::InvalidDispatcherConfig` is removed in
+favour of the core one, which reaches callers through the existing
+`Error::Core` conversion.
+
+### `kafkaman_core` gains `panic_message`
+
+One helper, replacing three near-identical private copies of "recover a panic
+payload as a string and bound it for storage" that had accumulated in
+`kafkaman-core`, `kafkaman-sqlx`, and `kafkaman-rdkafka`. Behaviour is unchanged:
+`&'static str` and `String` payloads are recovered, anything else reports
+`panicked with a non-string payload`, and the result is truncated at 512 bytes on
+a character boundary with a trailing `...`.
+
+### `RuntimeBuilder` now honours `[retry]`
+
+**A behaviour change that will look like one.** The builder constructed its
+received tables with `ReceivedTable::new`, which fills in
+`RetryPolicy::default()`, rather than `ReceivedTable::for_descriptor`, which
+attaches the message type's resolved policy. So every service booted through
+`RuntimeBuilder` silently ignored `max_attempts`, `initial_backoff`,
+`max_backoff`, `multiplier`, `errors_limit` and `dlq` from its own config file
+and retried on library defaults.
+
+Measured on the example, which declares eight attempts at 250ms doubling to a 10s
+cap: the observed gaps were 0.63, 1.59, 3.37, 7.91, 9.27, 24.97, 36.19 and 112.03
+seconds across more than ten attempts — 1s doubling to 300s, the library
+defaults, exactly. After the fix the same message dead-letters at eight attempts
+in 19 seconds.
+
+**If you declared a `[retry]` section and booted through `RuntimeBuilder`, your
+retry behaviour changes on upgrade — to what you asked for.** Adopters who
+relied on the observed timings rather than the declared ones should re-read their
+config before upgrading. Hand-wired services using `ReceivedTable::for_message`
+were always correct and are unaffected.
+
+### `ReceivedTable::new` versus `for_descriptor`
+
+Unchanged, but now documented as a trap and pinned by a test. `new` cannot see
+the configuration and fills in `RetryPolicy::default()`; use it only where the
+table's *name* is all that is wanted. Anything that dispatches, and therefore
+schedules retries, must use `for_descriptor` or `for_message`.
+
+### Examples only: a fault-injection endpoint
+
+`examples/product` gains `POST`/`GET`/`DELETE /faults`, making its dispatch
+handler return an error or panic on demand. It is in that binary alone. **No
+published crate carries fault injection**, at any feature combination.
+
+Both example services now mount `admin_router` merged with `redrive_router` at
+`/internal/kafkaman`. Neither router has authentication; see the note in
+`examples/README.md` for why that is acceptable only there.

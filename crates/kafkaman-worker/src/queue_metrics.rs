@@ -305,6 +305,8 @@ pub async fn run_queue_metrics(
 /// timestamp, so the depths keep their last known values and
 /// `kafkaman.queue.sample_age` keeps climbing. That pair is the signal: the
 /// numbers are still there, and the age says how much to trust them.
+// Stays in the debug tier: runs on `refresh_interval` forever.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn refresh(
     pool: &PgPool,
@@ -353,6 +355,8 @@ async fn refresh(
 }
 
 /// Query every table once.
+// Stays in the debug tier: runs on `refresh_interval` forever.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 async fn collect(
     pool: &PgPool,

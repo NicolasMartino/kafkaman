@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kafkaman_config::Config;
-use kafkaman_core::{KafkaMessage, MessageDescriptor, PurgeConfig, ReceivedMeta};
+use kafkaman_core::{DispatcherConfig, KafkaMessage, MessageDescriptor, PurgeConfig, ReceivedMeta};
 use kafkaman_rdkafka::{converge_topics, RdkafkaConsumer, RdkafkaPublisher, TopicAdmin};
 use kafkaman_sqlx::{
     migrate, BeforeHandlerFuture, HandlerFuture, MessageRouter, MigrationContext, OutboxTable,
@@ -404,12 +404,19 @@ impl RuntimeBuilder {
 
         let mut published = Vec::new();
         for descriptor in self.roles.published() {
-            published.push(table_for(&cfg, descriptor, OutboxTable::new)?);
+            published.push(table_for(&cfg, descriptor, OutboxTable::for_descriptor)?);
         }
 
         let mut consumed = Vec::new();
         for (_, entry) in self.consumed {
-            let received = table_for(&cfg, &entry.descriptor, ReceivedTable::new)?;
+            // `for_descriptor`, not `new`: it is what attaches this message
+            // type's resolved retry policy to the table the dispatcher fails
+            // rows against. `new` fills in `RetryPolicy::default()`, which threw
+            // away `max_attempts`, `initial_backoff`, `max_backoff`,
+            // `multiplier`, `errors_limit` and `dlq` from the config file — and
+            // silently, because a default policy retries perfectly well, just
+            // not the way the operator asked.
+            let received = table_for(&cfg, &entry.descriptor, ReceivedTable::for_descriptor)?;
             consumed.push(ConsumedPlan {
                 message_type: entry.descriptor.message_type.as_str().to_owned(),
                 topic: entry.descriptor.topic.clone(),
@@ -431,12 +438,18 @@ impl RuntimeBuilder {
 }
 
 /// Resolve one table, attributing the failure to the message type that caused it.
+///
+/// `build` takes the whole `ResolvedConfig` rather than just the schema, because
+/// a `ReceivedTable` carries its message type's resolved retry policy and
+/// `ReceivedTable::new` substitutes the library defaults for it. Handing the
+/// constructor a schema was enough to make the shorter one fit, and a builder-
+/// booted service therefore ignored every `[retry]` key in its own config file.
 fn table_for<T>(
     cfg: &ResolvedConfig,
     descriptor: &MessageDescriptor,
-    build: impl Fn(kafkaman_core::SqlIdentifier, MessageDescriptor) -> kafkaman_sqlx::Result<T>,
+    build: impl Fn(&ResolvedConfig, MessageDescriptor) -> kafkaman_sqlx::Result<T>,
 ) -> Result<T, BuildError> {
-    build(cfg.schema.clone(), descriptor.clone()).map_err(|source| BuildError::Table {
+    build(cfg, descriptor.clone()).map_err(|source| BuildError::Table {
         message_type: descriptor.message_type.as_str().to_owned(),
         source,
     })
@@ -612,11 +625,16 @@ impl Runtime {
 
             let pool = pool.clone();
             let router = self.router.clone();
-            let poll_interval = cfg.relay.poll_interval;
-            let lifecycle = cfg
-                .observability
-                .policy_for(&consumed.message_type)
-                .lifecycle_emission();
+            // Pacing and the panic breaker come from `[dispatcher]`; the
+            // lifecycle policy is per message type, so it is layered on here
+            // rather than resolved once for every dispatcher.
+            let dispatcher_cfg = DispatcherConfig {
+                lifecycle: cfg
+                    .observability
+                    .policy_for(&consumed.message_type)
+                    .lifecycle_emission(),
+                ..cfg.dispatcher.clone()
+            };
             let received = consumed.received;
             let shutdown = shutdown.clone();
             loops.push((
@@ -626,8 +644,7 @@ impl Runtime {
                         pool,
                         received,
                         router,
-                        poll_interval,
-                        lifecycle,
+                        dispatcher_cfg,
                         shutdown,
                     )
                     .await

@@ -1,6 +1,7 @@
 use kafkaman_core::ReceivedIngestFailureKind;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     Kafka(#[from] rdkafka::error::KafkaError),
@@ -35,6 +36,9 @@ pub enum Error {
 
     #[error("Kafka record had no payload")]
     MissingPayload,
+
+    #[error("payload deserializer panicked: {0}")]
+    PayloadPanicked(String),
 
     #[error("Kafka record must include kafkaman-idempotency-key")]
     MissingIdempotencyKey,
@@ -77,11 +81,39 @@ impl Error {
     pub(crate) fn ingest_failure_kind(&self) -> Option<ReceivedIngestFailureKind> {
         match self {
             Error::MissingPayload => Some(ReceivedIngestFailureKind::MissingPayload),
+            Error::PayloadPanicked(_) => Some(ReceivedIngestFailureKind::InvalidPayload),
             Error::MissingIdempotencyKey => Some(ReceivedIngestFailureKind::MissingIdempotencyKey),
             Error::Serde(_) => Some(ReceivedIngestFailureKind::InvalidPayload),
             Error::InvalidHeader { .. } => Some(ReceivedIngestFailureKind::InvalidHeader),
             Error::UnexpectedTopic { .. } => Some(ReceivedIngestFailureKind::UnexpectedTopic),
             _ => None,
+        }
+    }
+}
+
+impl kafkaman_core::ProblemType for Error {
+    fn problem_type(&self) -> &'static str {
+        use kafkaman_core::problem;
+        match self {
+            // Both wrappers are `#[error(transparent)]`, so they carry the inner
+            // error's message; they carry its classification for the same reason.
+            Self::Sqlx(error) => error.problem_type(),
+            Self::Core(error) => error.problem_type(),
+
+            Self::Kafka(_) | Self::Database(_) => problem::INFRASTRUCTURE,
+            #[cfg(feature = "internal-hooks")]
+            Self::Observer(_) => problem::INFRASTRUCTURE,
+
+            Self::Serde(_) | Self::MissingPayload | Self::InvalidHeader { .. } => {
+                problem::INVALID_PAYLOAD
+            }
+
+            Self::PayloadPanicked(_) => problem::APPLICATION_PANICKED,
+            Self::MissingIdempotencyKey => problem::IDEMPOTENCY,
+            Self::UnexpectedTopic { .. } => problem::MESSAGE_ROUTING,
+            Self::Delivery(_) => problem::PUBLISH,
+            Self::TopicAdmin { .. } => problem::TOPIC,
+            Self::ConsecutiveSkipLimitExceeded { .. } => problem::BREAKER_TRIPPED,
         }
     }
 }

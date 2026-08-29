@@ -26,7 +26,7 @@
 
 use std::time::Duration;
 
-use kafkaman_core::{LifecycleEmission, RelayConfig};
+use kafkaman_core::{DispatcherConfig, LifecycleEmission, RelayConfig};
 use kafkaman_sqlx::MessageRouter;
 use kafkaman_test::Harness;
 use observability_tests::{
@@ -234,8 +234,11 @@ async fn dispatch_all(harness: &Harness, count: usize) -> TestResult {
         harness.pool().clone(),
         table,
         router,
-        Duration::from_millis(25),
-        LifecycleEmission::new(true, 1.0),
+        DispatcherConfig {
+            poll_interval: Duration::from_millis(25),
+            lifecycle: LifecycleEmission::new(true, 1.0),
+            ..Default::default()
+        },
         shutdown.clone(),
     ));
 

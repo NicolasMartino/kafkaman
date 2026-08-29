@@ -6,15 +6,18 @@
 //! `product` anywhere in this file, which is the property the cache exists to
 //! provide.
 
+use kafkaman::InstrumentDb;
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use example_contracts::{OrderStatus, ProductStatus};
+use kafkaman::axum::{admin_router, redrive_router, AdminState};
 use kafkaman::sqlx::enqueue;
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 use uuid::Uuid;
 
 use utoipa::OpenApi;
@@ -56,6 +59,7 @@ use crate::{
 struct ApiDoc;
 
 pub fn build_router(state: AppState) -> Router {
+    let operator = operator_routes(&state);
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
@@ -65,7 +69,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/orders/{order_id}/cancel", post(cancel_order))
         .route("/products/{product_id}", get(read_cached_product))
         .with_state(state)
+        // After `with_state`, so the already-stated operator router nests
+        // without the two state types having to unify.
+        .nest("/internal/kafkaman", operator)
         .layer(kafkaman::axum::CorrelationLayer::new())
+}
+
+/// The operator routes kafkaman ships, mounted where an operator can reach them.
+///
+/// Unauthenticated, which is acceptable here and nowhere else: a disposable
+/// local stack on a private compose network with ports published to loopback.
+/// [`admin_router`]'s own `# Security` section is the canonical account of what
+/// these routes expose and how a real deployment should mount them; this is one
+/// of two example services and the warning belongs in the library, not copied
+/// into each of them.
+fn operator_routes(state: &AppState) -> Router {
+    let admin = AdminState::new(state.pool.clone(), Arc::clone(&state.cfg));
+    admin_router(admin.clone()).merge(redrive_router(admin))
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -166,7 +186,16 @@ async fn health() -> StatusCode {
     request_body = CreateOrderRequest,
     responses(
         (status = 201, description = "Accepted, and its snapshot enqueued.", body = OrderRecord),
-        (status = 400, description = "Quantity was not greater than zero.", body = ErrorBody),
+        (status = 400, description = "Quantity was not greater than zero, or the \
+                                      body was not valid JSON.", body = ErrorBody),
+        // Axum's `Json` extractor answers before any handler code runs, and
+        // with three statuses this route would otherwise not admit to. A client
+        // generated from this spec has to handle them: they are what it gets for
+        // a field it spelled wrong.
+        (status = 415, description = "Content-Type was not application/json.", body = ErrorBody),
+        (status = 422, description = "Well-formed JSON that does not match the \
+                                      request schema — an unknown, missing, or \
+                                      wrongly typed field.", body = ErrorBody),
         (status = 409, description = "Not yet propagated, a duplicate order_id, or \
                                       the cached product forbids it.", body = ErrorBody),
     ),
@@ -185,7 +214,7 @@ async fn create_order(
     let mut tx = state
         .pool
         .begin()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "BEGIN",
             "orders",
             "open order write transaction"
@@ -231,7 +260,7 @@ async fn create_order(
     .bind(String::from(order.status.clone()))
     .bind(order.version)
     .execute(&mut *tx)
-    .instrument(kafkaman::db_span!("INSERT", "orders", "insert order"))
+    .instrument_db(kafkaman::db_span!("INSERT", "orders", "insert order"))
     .await
     .map_err(|err| {
         if is_unique_violation(&err) {
@@ -248,7 +277,7 @@ async fn create_order(
         .map_err(|err| OrderError::Internal(format!("enqueue snapshot: {err}")))?;
 
     tx.commit()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "COMMIT",
             "orders",
             "commit order write transaction",
@@ -268,7 +297,7 @@ async fn list_orders(State(state): State<AppState>) -> Result<Json<Vec<OrderReco
         "SELECT {ORDER_COLUMNS} FROM orders ORDER BY created_at, order_id"
     ))
     .fetch_all(&state.pool)
-    .instrument(kafkaman::db_span!("SELECT", "orders", "list orders"))
+    .instrument_db(kafkaman::db_span!("SELECT", "orders", "list orders"))
     .await
     .map_err(internal("list orders"))?;
 
@@ -298,7 +327,7 @@ async fn read_order(
     ))
     .bind(order_id)
     .fetch_optional(&state.pool)
-    .instrument(kafkaman::db_span!("SELECT", "orders", "read order"))
+    .instrument_db(kafkaman::db_span!("SELECT", "orders", "read order"))
     .await
     .map_err(internal("read order"))?
     .ok_or(OrderError::NotFound)?;
@@ -368,7 +397,7 @@ async fn transition(
     let mut tx = state
         .pool
         .begin()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "BEGIN",
             "orders",
             "open order write transaction"
@@ -385,7 +414,7 @@ async fn transition(
     ))
     .bind(order_id)
     .fetch_optional(&mut *tx)
-    .instrument(kafkaman::db_span!("SELECT", "orders", "lock order"))
+    .instrument_db(kafkaman::db_span!("SELECT", "orders", "lock order"))
     .await
     .map_err(internal("read order"))?
     .ok_or(OrderError::NotFound)?;
@@ -396,7 +425,7 @@ async fn transition(
     // snapshot of state nothing changed.
     if current.status == target {
         tx.commit()
-            .instrument(kafkaman::db_span!(
+            .instrument_db(kafkaman::db_span!(
                 "COMMIT",
                 "orders",
                 "commit order no-op transaction",
@@ -422,7 +451,7 @@ async fn transition(
     .bind(String::from(target))
     .bind(order_id)
     .fetch_one(&mut *tx)
-    .instrument(kafkaman::db_span!("UPDATE", "orders", "transition order"))
+    .instrument_db(kafkaman::db_span!("UPDATE", "orders", "transition order"))
     .await
     .map_err(internal("update order"))?;
     let updated = order_from_row(&row).map_err(internal("decode order"))?;
@@ -434,7 +463,7 @@ async fn transition(
         .map_err(|err| OrderError::Internal(format!("enqueue snapshot: {err}")))?;
 
     tx.commit()
-        .instrument(kafkaman::db_span!(
+        .instrument_db(kafkaman::db_span!(
             "COMMIT",
             "orders",
             "commit order write transaction",

@@ -32,7 +32,7 @@ use kafkaman::sqlx::{
     migrate, try_changelog, Changeset, CreateCacheTable, CreateOutboxTable, CreateReceivedTable,
     InitSchema, MigrationContext, OutboxTable, ReceivedTable, ResolvedConfig,
 };
-use kafkaman::{worker, KafkaMessage};
+use kafkaman::{worker, DispatcherConfig, KafkaMessage};
 use sqlx::postgres::PgPoolOptions;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -134,14 +134,19 @@ pub async fn start(options: ServiceOptions) -> Result<RunningService, BoxError> 
     let router = dispatch_router(Arc::clone(&cfg))?;
     {
         let pool = pool.clone();
-        let poll_interval = cfg.relay.poll_interval;
-        let lifecycle = cfg
-            .observability
-            .policy_for(OrderSnapshot::MESSAGE_TYPE)
-            .lifecycle_emission();
+        // The same shape `RuntimeBuilder` assembles: `[dispatcher]` for pacing
+        // and the panic breaker, the per-message-type observability policy for
+        // lifecycle events.
+        let dispatcher_cfg = DispatcherConfig {
+            lifecycle: cfg
+                .observability
+                .policy_for(OrderSnapshot::MESSAGE_TYPE)
+                .lifecycle_emission(),
+            ..cfg.dispatcher.clone()
+        };
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
-            worker::run_dispatcher(pool, received, router, poll_interval, lifecycle, shutdown)
+            worker::run_dispatcher(pool, received, router, dispatcher_cfg, shutdown)
                 .await
                 .map_err(|err| Box::new(err) as BoxError)
         });

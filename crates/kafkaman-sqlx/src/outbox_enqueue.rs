@@ -1,3 +1,4 @@
+use kafkaman_core::InstrumentDb;
 use kafkaman_core::{Envelope, KafkaMessage, OutboxStatus, TraceContext};
 use serde::Serialize;
 use sqlx::{Connection, PgConnection, Postgres, Transaction};
@@ -5,9 +6,12 @@ use time::OffsetDateTime;
 use tracing::Instrument;
 use uuid::Uuid;
 
+use crate::catch_panic::catch_application_panic;
 use crate::lock_keys::outbox_entity_lock_key;
 use crate::{Error, OutboxTable, ResolvedConfig, Result};
 
+// Stays in the debug tier: see the module docs — promoting it would move the trace root onto a function name.
+// See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
 pub async fn enqueue<P>(
     tx: &mut Transaction<'_, Postgres>,
@@ -51,6 +55,7 @@ where
         "otel.kind" = "producer",
         "otel.status_code" = tracing::field::Empty,
         "otel.status_description" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
         message_type = P::MESSAGE_TYPE,
         messaging.system = "kafka",
         messaging.destination.name = P::TOPIC,
@@ -64,12 +69,12 @@ where
         .instrument(span.clone())
         .await;
     if let Err(err) = &result {
-        kafkaman_core::record_error(&span, err);
+        kafkaman_core::record_exception(&span, err);
     }
     result
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn enqueue_inner<P>(
     conn: &mut PgConnection,
     cfg: &ResolvedConfig,
@@ -83,8 +88,17 @@ where
     if let Some(reserved) = kafkaman_core::reserved_header(&evt.headers) {
         return Err(Error::ReservedHeader(reserved.to_owned()));
     }
-    let partition_key = evt.payload.partition_key();
-    let entity_key = evt.payload.entity_key();
+    // The application's own code, called by kafkaman. A panic in either would
+    // otherwise unwind out of `enqueue` into whatever called it — commonly an
+    // HTTP handler, whose task dies with no stored trace of why. The receive
+    // side wraps the same two calls; see `catch_application_panic`.
+    let message_type = table.descriptor.message_type.as_str();
+    let partition_key = catch_application_panic(message_type, "resolve partition key", || {
+        evt.payload.partition_key()
+    })?;
+    let entity_key = catch_application_panic(message_type, "resolve entity key", || {
+        evt.payload.entity_key()
+    })?;
     let mut headers = evt.headers.clone();
     // Carried for foreign consumers that cannot deserialize the typed payload.
     // kafkaman's own ingest does not rely on it: it resolves the entity key from
@@ -94,7 +108,10 @@ where
         headers.insert("kafkaman-entity-key".to_owned(), entity_key.clone());
     }
     let headers = serde_json::to_value(&headers)?;
-    let payload = serde_json::to_value(&evt.payload)?;
+    // The application's `Serialize` impl, for the same reason.
+    let payload = catch_application_panic(message_type, "serialize payload", || {
+        serde_json::to_value(&evt.payload)
+    })??;
     let identity = evt.idempotency_key.as_ref();
     let idempotency_key = identity.map(|identity| identity.key.to_string());
     let idempotency_source = identity
@@ -133,7 +150,7 @@ where
 
     let mut guard = conn
         .begin()
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "BEGIN",
             table.qualified_name(),
             "open outbox enqueue transaction",
@@ -146,7 +163,7 @@ where
         .await?;
     guard
         .commit()
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "COMMIT",
             table.qualified_name(),
             "commit outbox enqueue transaction",
@@ -173,7 +190,7 @@ struct InsertOutboxRow<'a> {
 }
 
 impl InsertOutboxRow<'_> {
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     async fn execute<'c, E>(
         self,
         executor: E,
@@ -219,7 +236,7 @@ impl InsertOutboxRow<'_> {
             .bind(self.payload)
             .bind(self.occurred_at)
             .execute(executor)
-            .instrument(kafkaman_core::db_span!(
+            .instrument_db(kafkaman_core::db_span!(
                 "INSERT",
                 self.table.qualified_name(),
                 "insert outbox row",
@@ -229,7 +246,7 @@ impl InsertOutboxRow<'_> {
     }
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn lock_outbox_entity(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
@@ -239,7 +256,7 @@ async fn lock_outbox_entity(
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(key)
         .execute(&mut **tx)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "SELECT",
             table.qualified_name(),
             "lock outbox entity",
@@ -248,7 +265,7 @@ async fn lock_outbox_entity(
     Ok(())
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 async fn supersede_pending_outbox_rows(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
@@ -268,7 +285,7 @@ async fn supersede_pending_outbox_rows(
     sqlx::query(&sql)
         .bind(entity_key)
         .execute(&mut **tx)
-        .instrument(kafkaman_core::db_span!(
+        .instrument_db(kafkaman_core::db_span!(
             "UPDATE",
             table.qualified_name(),
             "supersede pending outbox rows",

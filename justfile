@@ -166,7 +166,13 @@ clean-containers:
 # backend but without the message UI or the volume; `up` starts only the
 # infrastructure and leaves the services to cargo. The rest attach to whichever
 # is already running.
-[doc("Drive the example stack. arg: all (default) | demo | observe | up | ui | handoffs | telemetry-test | logs | down")]
+#
+# `down` is the only destructive arm: it removes the compose volumes, so the
+# Postgres data directory and Redpanda's log go with it. Everything the stack has
+# recorded — outbox history, dead-lettered rows, the DLQ you were about to
+# inspect — is gone. Stop the containers without that with
+# `docker compose -f examples/compose.yaml stop`.
+[doc("Drive the example stack. arg: all (default) | demo | observe | up | ui | faults | handoffs | telemetry-test | logs | down (DESTRUCTIVE: removes volumes)")]
 examples arg="all":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -206,6 +212,16 @@ examples arg="all":
         # histograms with a single observation each, which renders in Kibana as
         # something that looks broken.
         VOLUME_PRODUCTS="${VOLUME_PRODUCTS:-12}" examples/smoke.sh
+        # Two of the seven fault scenarios, so the telemetry has a failure side
+        # at all. Without this the stack is green everywhere: no span carries a
+        # failure status, no log record is above INFO, and every DLQ is empty —
+        # which is a demo of half the system.
+        #
+        # 1 and 2 only: they are the quick ones, and they deliberately leave a
+        # dead-lettered row behind rather than redriving it, so the DLQ has
+        # something in it when the dashboard is opened. `just examples faults`
+        # runs all seven, including the three that need Docker.
+        FAULT_SCENARIOS="1 2" examples/faults.sh
         echo ""
         echo "The whole stack is running:"
         echo "  order     http://127.0.0.1:3001/swagger-ui"
@@ -213,6 +229,10 @@ examples arg="all":
         echo "  Kibana    http://127.0.0.1:${KIBANA_PORT:-5601}/app/dashboards#/view/kafkaman-telemetry-dashboard?_g=(time:(from:now-4h,to:now),filters:!())"
         echo "  APM       http://127.0.0.1:${KIBANA_PORT:-5601}/app/apm/services?rangeFrom=now-4h&rangeTo=now&environment=ENVIRONMENT_ALL"
         echo "  messages  http://127.0.0.1:${CONSOLE_PORT:-8080}"
+        echo ""
+        echo "A dead-lettered row is waiting in product's DLQ, put there on purpose:"
+        echo "  curl -s http://127.0.0.1:3002/internal/kafkaman/dlq | jq"
+        echo "More failure modes, including a broker outage: just examples faults"
         echo ""
         echo "APM Trace samples show the product-to-order waterfall in one trace."
         echo "The dashboard separates traces, Kafka handoffs, queue metrics, and"
@@ -310,6 +330,18 @@ examples arg="all":
         echo "Redpanda Console  http://127.0.0.1:${CONSOLE_PORT:-8080}"
         echo "  Topics -> products / orders to read the snapshots the services exchange."
         ;;
+      faults)
+        # The counterpart to `smoke.sh`: the same stack, driven through its
+        # failure paths instead of its happy one. Attaches to whatever is
+        # already running rather than starting anything, because two of the six
+        # scenarios stop and start containers and would fight a concurrent `up`.
+        if ! curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:3002/faults"; then
+          echo "no fault endpoint on http://127.0.0.1:3002" >&2
+          echo "start the services first: just examples all (or demo)" >&2
+          exit 1
+        fi
+        examples/faults.sh
+        ;;
       handoffs)
         # For linked Kafka trace handoff mode, Kibana APM shows async span links
         # but does not reliably turn the producer-side link count into a
@@ -347,9 +379,11 @@ examples arg="all":
           cargo test -p example-telemetry-tests --test binary_telemetry -- --nocapture
         ;;
       logs)  "${compose[@]}" --profile services logs -f order product ;;
-      # `-v` so the next start is genuinely clean: the volumes hold the Postgres
-      # data directory and Redpanda's log, and provisioning is what rebuilds
-      # both.
+      # DESTRUCTIVE. `-v` so the next start is genuinely clean: the volumes hold
+      # the Postgres data directory and Redpanda's log, and provisioning is what
+      # rebuilds both. It also means every row the stack ever wrote is deleted —
+      # `docker compose -f examples/compose.yaml stop` is the non-destructive
+      # way to get the ports back.
       down)  "${compose[@]}" --profile services --profile ui --profile observability down -v ;;
-      *) echo "usage: just examples [all|demo|observe|up|ui|handoffs|telemetry-test|logs|down]" >&2; exit 1 ;;
+      *) echo "usage: just examples [all|demo|observe|up|ui|faults|handoffs|telemetry-test|logs|down]" >&2; exit 1 ;;
     esac

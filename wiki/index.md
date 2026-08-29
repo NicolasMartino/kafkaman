@@ -11,8 +11,15 @@ empty poll spans; reviewed and fixed the same day, including bounded unmatched
 routes, documented trace-volume knobs, and one shared span shape in
 `kafkaman-core`; then `kafkaman.handler`, an opt-in `kafkaman::internal` span
 tier behind its own `RUST_LOG` target, and the durable-capture fix that tier
-uncovered — continuous profiling measured and not adopted
-Updated: 2026-08-29
+uncovered — continuous profiling measured and not adopted; then the failure side:
+handler panics contained rather than fatal, a `/faults` switch on `product`, the
+operator routes mounted and fixed, `RuntimeBuilder` made to honour `[retry]`, and
+`just examples faults` driving six asserted failure scenarios into a Kibana
+failed-transaction panel plus failure-detail panel; failed receive attempts now
+mark `kafkaman.dispatch` as failed and carry bounded failure stage/kind fields;
+then a review pass that found the new panic breaker counted attempts rather than
+rows and so re-broke the very case it was added to protect
+Updated: 2026-08-30
 
 One-line: A Rust library plus optional worker runtime for Kafka-backed
 distributed caches of compact domain entity snapshots, using Postgres as the
@@ -239,6 +246,10 @@ durable entity propagation ledger and local cache store.
     description, the observability policy structs gain `Copy`, an unmatched HTTP
     request reports `http.route = "<unmatched>"`, seven scheduler poll summaries
     are debug-level rather than three, and the trace-volume knobs are documented.
+    Amended 2026-08-30: recorded receive failures now also mark
+    `kafkaman.dispatch` failed and carry `error.type` plus bounded
+    `kafkaman.failure.{kind,type,stage}` attributes; the example dashboard splits
+    failed transactions from failure-detail spans.
     Status: Active.
 
 - [compatibility/dispatch-handler-ordering.compat.md](compatibility/dispatch-handler-ordering.compat.md)
@@ -286,13 +297,56 @@ durable entity propagation ledger and local cache store.
   preserve link-based Kafka propagation by default while accepting
   `kafka_trace_handoff = "parented"` as the explicit single-record APM mode used
   by the examples. Status: Accepted.
+- [decisions/handler-panic-containment-and-fault-injection.decision.md](decisions/handler-panic-containment-and-fault-injection.decision.md)
+  - A panicking application handler no longer takes the service down: the panic is
+  caught at the handler call boundary, becomes a retryable
+  `ReceivedFailureKind::Handler`, and dead-letters like any other failure, while
+  isolated panics leave the loop running. A run of ten consecutive handler
+  panics stops the dispatcher with a breaker error and records panic-specific
+  row/duration metrics. Panics in kafkaman's own loops still fail fast. Fault
+  injection lives in `examples/product` and no published crate. Records the two
+  bugs that only a deliberate failure could surface — every operator summary
+  route returning 500 for any service that both publishes and consumes, and
+  `RuntimeBuilder` discarding the whole `[retry]` config section. Status:
+  Accepted.
+- [decisions/failure-taxonomy-and-blame-separation.decision.md](decisions/failure-taxonomy-and-blame-separation.decision.md)
+  - A failure's persisted class is a function of the error alone; the frame it
+  surfaced in is recorded separately as `FailureStage` rather than folded into
+  that class. Fixes a database error returned by a handler reading
+  `urn:kafkaman:problem:infrastructure` on its span and `urn:kafkaman:problem:handler`
+  in its row — one failure, one URI namespace, two values — which meant an
+  operator filtering the dead-letter queue for infrastructure failures found none
+  of the rows a pool exhaustion had parked there. Replaces two independent
+  classifiers with one, and `ReceivedFailureKind::coarsening` becomes the single
+  tested relationship between the fifteen-value telemetry vocabulary and the four
+  persisted values. Changes values written into rows and makes three deterministic
+  cache errors terminal from any frame. Status: Accepted.
+- [decisions/failures-as-typed-exceptions.decision.md](decisions/failures-as-typed-exceptions.decision.md)
+  - Every failure on the durable path emits an OpenTelemetry `exception` span
+  event, which is what populates Elastic APM's error groups — a red span alone
+  produced a failed transaction with nothing behind it to open. The class comes
+  from the error's own Rust type through the new public `kafkaman_core::ProblemType`
+  trait, so a call site cannot mislabel a failure and a new error variant does not
+  compile until someone decides how it appears in APM. Establishes fifteen
+  permanent `urn:kafkaman:problem:*` URIs, deliberately finer than the four
+  persisted `ReceivedFailureKind` values, so a handler panic groups separately
+  from a returned error while both dead-letter under the same stored kind. One
+  failure produces one error document; `db.query` spans carry status only. Status:
+  Accepted.
 - [decisions/method-level-timing-and-span-depth.decision.md](decisions/method-level-timing-and-span-depth.decision.md)
   - Spans mark boundaries and waits; profiles measure code. Adds `kafkaman.handler`
   as a stable phase span at the default filter, puts kafkaman's own internals
-  behind `RUST_LOG=info,kafkaman::internal=debug` with unstable function-derived
-  names, and fixes the rule that durable trace capture must name the span it
-  means — code that reads the ambient span must never itself be wrapped in one.
-  Status: Accepted.
+  behind their own target with unstable function-derived names, and fixes the rule
+  that durable trace capture must name the span it means — code that reads the
+  ambient span must never itself be wrapped in one. Amended 2026-08-30 twice:
+  recorded receive failures also mark the enclosing `kafkaman.dispatch` transaction
+  so APM can split messaging work by ok/failed; and the internal tier is split by
+  level rather than being off wholesale — a function that runs because there is a
+  message is `info` and in the default trace, one that runs on a timer stays
+  `debug` behind `RUST_LOG=info,kafkaman::internal=debug`. The split is what makes
+  a gapless waterfall affordable: measured, the message-path half costs eight spans
+  per service per request and the polling half costs 2322 spans per idle service
+  per two minutes. Status: Accepted.
 - [decisions/example-telemetry-integration-test-boundary.decision.md](decisions/example-telemetry-integration-test-boundary.decision.md)
   - Accepted test boundary for proving the examples' own OpenTelemetry wiring:
   launch the order and product binaries as child processes, capture decoded
@@ -680,6 +734,24 @@ durable entity propagation ledger and local cache store.
     around. The flush claim is arranged rather than hoped for: export intervals
     are pushed past the test's lifetime, so anything captured was forced out by
     `Telemetry::shutdown()`. Status: Accepted.
+- [proposals/22-failure-taxonomy-and-blame.proposal.md](proposals/22-failure-taxonomy-and-blame.proposal.md)
+  - Accepted proposal asking why one failure gets two different
+  `urn:kafkaman:problem:*` values depending on which surface it is read from, and
+  answering that `ReceivedFailureKind` is three taxonomy values and one blame
+  value in the same enum, so whichever is assigned last erases the other.
+  Proposes separating the two axes rather than merging the vocabularies: the
+  class becomes a function of the error alone and the frame becomes its own
+  field. Records why persisting the stage alone does not work, and why storing a
+  second URI beside the first makes the duplication worse. Status: Accepted.
+- [proposals/21-failure-examples-and-panic-containment.proposal.md](proposals/21-failure-examples-and-panic-containment.proposal.md)
+  - Accepted proposal to make the example stack's failure paths drivable, asserted
+  and visible, prompted by a measurement: 227,394 spans indexed with none carrying
+  a failure status, no log record above `INFO`, and every DLQ empty, so the error
+  half of the observability story was unproven rather than merely undemonstrated.
+  Proposes a fault switch on `product`, mounting the operator routes, a six-
+  scenario walkthrough, a Kibana failures panel — and containing handler panics in
+  the library, because the answer to "what happens if a handler panics" turned out
+  to be that one bad message killed the service permanently. Status: Accepted.
 - [proposals/20-method-level-timing.proposal.md](proposals/20-method-level-timing.proposal.md)
   - Accepted proposal answering "can we time every Rust method": not in the form a
   JVM agent gives, because Rust has no runtime agent and inlining erases most
@@ -700,6 +772,24 @@ durable entity propagation ledger and local cache store.
 
 ## Plans
 
+- [plans/failure-taxonomy-separation.plan.md](plans/failure-taxonomy-separation.plan.md)
+  - Executes the taxonomy/blame decision in five phases: the single coarsening in
+  `kafkaman-core`, one disposition function replacing two, `FailureStage` made
+  public and persisted on `ReceivedError`, regression tests for the exact
+  disagreement and for old rows still reading, and the compatibility note
+  carrying the stored-value migration. Status: Completed.
+- [plans/failure-examples.plan.md](plans/failure-examples.plan.md)
+  - Completed 2026-08-29. The panic boundary and its three deliberate-breakage
+  tests, expanded by review into pre-upsert, mid-query, destructor, and
+  consecutive-panic breaker coverage; the `/faults` switch;
+  `examples/faults.sh` with six asserted scenarios; and the Kibana failures
+  panel built on a field name verified against a real error document
+  (`status.code: Error`, with `status.message` and
+  `attributes.handler.outcome`). Records both bugs found by writing the
+  scenarios: the operator summaries 500ing for any one-sided message type, fixed
+  with `service_tables` asking the schema; and `RuntimeBuilder` ignoring
+  `[retry]`, caught by a permanently failing handler taking 64s and ten attempts
+  to dead-letter against a config declaring eight and ~19s. Status: Completed.
 - [plans/method-level-timing.plan.md](plans/method-level-timing.plan.md)
   - Completed 2026-08-29. Records the continuous-profiling measurement and why it
   was not adopted (eBPF profiling works on Docker Desktop arm64 and sees the Rust
@@ -784,7 +874,11 @@ durable entity propagation ledger and local cache store.
   The data view and a saved-search dashboard shipped 2026-08-29 with
   `just examples all`; the dashboard now separates signals and uses a four-hour
   example window so one-shot smoke traces/logs remain visible after the run.
-  Remaining dashboard work is visual polish rather than basic discoverability.
+  Amended 2026-08-30: failed receive attempts mark `kafkaman.dispatch`, the
+  dashboard separates failed transactions from failure-detail spans, and
+  `tests/observability/dispatch_failure_status` pins the APM failure status
+  surface. Remaining dashboard work is visual polish rather than basic
+  discoverability.
   Status: Active.
 - [plans/first-poc-outbox-publisher.plan.md](plans/first-poc-outbox-publisher.plan.md)
   - Smallest durable-send slice: per-type outbox table, minimal `migrate()`,

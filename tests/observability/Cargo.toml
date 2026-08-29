@@ -15,6 +15,10 @@ redpanda = ["durable-send-tests/redpanda", "dep:kafkaman-rdkafka", "dep:rdkafka"
 [dependencies]
 kafkaman-axum = { path = "../../crates/kafkaman-axum" }
 kafkaman-core = { path = "../../crates/kafkaman-core" }
+# Carried for one assertion: the companion crate names the exception target it
+# filters, and cannot import it, because it deliberately does not depend on
+# kafkaman. This suite depends on both and is where the two are held equal.
+kafkaman-otel = { path = "../../crates/kafkaman-otel" }
 kafkaman-rdkafka = { path = "../../crates/kafkaman-rdkafka", optional = true }
 kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
 kafkaman-test = { path = "../../crates/kafkaman-test" }

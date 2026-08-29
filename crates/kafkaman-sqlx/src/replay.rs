@@ -320,7 +320,7 @@ pub(crate) fn replay_received_filter_sql(replay: &Replay) -> Result<String> {
 ///
 /// `replay` must carry `max_rows`; an unbounded operational redrive would let a
 /// single request re-enqueue an entire DLQ.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn redrive_received(pool: &PgPool, cfg: &ResolvedConfig, replay: &Replay) -> Result<u64> {
     let table = ReceivedTable::new(cfg.schema.clone(), replay.descriptor.clone())?;
     let sql = replay_received_update_sql(&table, replay)?;

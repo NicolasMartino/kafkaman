@@ -29,18 +29,11 @@ pub(crate) fn received_failure_schedule(
     occurred_at: OffsetDateTime,
     disposition: FailureDisposition,
 ) -> ReceivedFailureSchedule {
-    // `attempts` is CHECK-constrained non-negative, but a negative value must
-    // not panic or wrap if a row ever violates that.
-    let current_attempts = u32::try_from(current_attempts).unwrap_or(0);
-    let next_attempts = current_attempts.saturating_add(1);
-    // A terminal failure skips straight to the end of the retry budget: another
-    // attempt would read the same row and fail identically, so scheduling one only
-    // delays the operator signal.
-    let exhausted = disposition.terminal || next_attempts >= table.retry.max_attempts;
+    let (_, exhausted) = received_retry_outcome(table, current_attempts, disposition);
     let next_attempt_at = if exhausted {
         None
     } else {
-        let base = retry_backoff(&table.retry, current_attempts);
+        let base = retry_backoff(&table.retry, clamp_attempts(current_attempts));
         Some(occurred_at + duration_to_time(jittered(base, &mut rand::thread_rng())))
     };
 
@@ -49,6 +42,32 @@ pub(crate) fn received_failure_schedule(
         next_attempt_at,
         errors_limit: i64::from(table.retry.errors_limit.max(1)),
     }
+}
+
+/// Which attempt this failure is, and whether it is the last one.
+///
+/// Split out of [`received_failure_schedule`] so the `kafkaman.dispatch` span can
+/// report both. Calling that function a second time would not do: it jitters
+/// `next_attempt_at` from a thread RNG, so two calls disagree — and the span
+/// would be describing a schedule the row did not get. This half is
+/// deterministic, which is what makes it safe to ask twice.
+pub(crate) fn received_retry_outcome(
+    table: &ReceivedTable,
+    current_attempts: i32,
+    disposition: FailureDisposition,
+) -> (u32, bool) {
+    let next_attempts = clamp_attempts(current_attempts).saturating_add(1);
+    // A terminal failure skips straight to the end of the retry budget: another
+    // attempt would read the same row and fail identically, so scheduling one only
+    // delays the operator signal.
+    let exhausted = disposition.terminal || next_attempts >= table.retry.max_attempts;
+    (next_attempts, exhausted)
+}
+
+/// `attempts` is CHECK-constrained non-negative, but a negative value must not
+/// panic or wrap if a row ever violates that.
+fn clamp_attempts(attempts: i32) -> u32 {
+    u32::try_from(attempts).unwrap_or(0)
 }
 
 /// Exponential backoff, saturating at `max_backoff`.

@@ -330,39 +330,89 @@ fn assert_waterfall_shape(captured: &Captured) -> TestResult {
     assert_span_kind(handler, "SPAN_KIND_INTERNAL")?;
 
     assert_no_default_poll_spans(captured)?;
-    assert_no_internal_tier_spans(captured)?;
+    assert_internal_tier_split(captured)?;
 
     Ok(())
 }
 
-/// No `kafkaman::internal` span may reach the wire at the default filter.
+/// Every function span that runs on a *poll* must stay off the wire, and the
+/// ones on the message path must reach it.
 ///
-/// Detected structurally rather than by listing function names. Every span this
-/// project opens deliberately is `kafkaman.*`, `db.query <summary>`, or
-/// `METHOD /route` — all of which carry a `.`, a `/`, or a space. A bare
-/// identifier can only have come from `#[instrument]` on a function, so this
-/// keeps working across the renames those spans are explicitly allowed to have.
-fn assert_no_internal_tier_spans(captured: &Captured) -> TestResult {
-    let leaked = captured
+/// The `kafkaman::internal` tier is no longer uniformly debug-level. It is split
+/// by the rule in the span-depth decision: a function that runs once there is a
+/// message to describe is `info` and belongs in the trace; a function that runs
+/// on a timer whether or not there is work is `debug`, because an idle service
+/// otherwise exports nothing but its own scheduler. This asserts both halves,
+/// because only the pair is a tier — either one alone is satisfied by turning
+/// the whole thing off.
+fn assert_internal_tier_split(captured: &Captured) -> TestResult {
+    // Function spans, found structurally rather than by listing names: every
+    // span this project opens deliberately is `kafkaman.*`, `db.query
+    // <summary>`, or `METHOD /route`, all of which carry a `.`, a `/`, or a
+    // space. A bare identifier can only have come from `#[instrument]` on a
+    // function, which survives the renames those spans are allowed to have.
+    let function_spans = captured
         .span_records
         .iter()
         .filter(|span| {
             !span.name.contains('.') && !span.name.contains('/') && !span.name.contains(' ')
         })
-        .map(|span| format!("{} {}", span.service, span.name))
         .collect::<Vec<_>>();
 
-    if leaked.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the `kafkaman::internal` span tier is debug-level and the examples run \
-             at RUST_LOG=info, so none of it may be exported. Leaked: {leaked:?}. \
-             Captured: {}",
+    // Named exactly, because these are the whole cost argument. Measured before
+    // the promotion: an idle stack exported 2322 spans in two minutes, and
+    // essentially all of it was these functions running on their intervals.
+    // A rename here is a deliberate act and should fail this test.
+    const POLL_TIER_FUNCTIONS: [&str; 16] = [
+        "claim_batch",
+        "collapse_stale_pending_rows",
+        "claim_received_row",
+        "relay_once",
+        "dispatch_once",
+        "dispatch_once_sampled",
+        "dispatch_once_with_observer",
+        "purge_outbox_once",
+        "refresh",
+        "collect",
+        "observe",
+        "outbox_status_summary",
+        "received_status_summary",
+        "health",
+        "ready",
+        // Not poll-shaped — excluded so `kafkaman.enqueue` stays a trace root
+        // in a service with no caller span. See `trace_root_enqueue`.
+        "enqueue",
+    ];
+
+    let leaked = function_spans
+        .iter()
+        .filter(|span| POLL_TIER_FUNCTIONS.contains(&span.name.as_str()))
+        .map(|span| format!("{} {}", span.service, span.name))
+        .collect::<Vec<_>>();
+    if !leaked.is_empty() {
+        return Err(format!(
+            "these functions run on a timer whether or not there is work, so they \
+             stay in the debug tier however deep the rest of it goes. Leaked: \
+             {leaked:?}. Captured: {}",
             captured.summary()
         )
-        .into())
+        .into());
     }
+
+    // The other half. Without it this test passes just as well against a tier
+    // that was reverted to debug wholesale, which is the regression the
+    // promotion is most likely to suffer.
+    if function_spans.is_empty() {
+        return Err(format!(
+            "no `kafkaman::internal` function span reached the wire at RUST_LOG=info. \
+             The message-path half of the tier is supposed to be visible by default \
+             — that is what makes the waterfall gapless. Captured: {}",
+            captured.summary()
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn assert_span_kind(span: &CapturedSpan, expected: &str) -> TestResult {
@@ -446,6 +496,14 @@ fn require_span<'a>(
         })
 }
 
+/// The nearest matching span *beneath* `parent`, at any depth.
+///
+/// Depth deliberately unpinned. Which functions carry a span is a tuning
+/// decision the span-depth decision reserves the right to change, and the
+/// waterfall's subject is causality — that this query belongs to that request —
+/// not the number of frames between them. Pinning the edge made every promotion
+/// of the `kafkaman::internal` tier a failure in a test that has no opinion
+/// about the tier.
 fn require_child_span<'a>(
     captured: &'a Captured,
     parent: &CapturedSpan,
@@ -460,7 +518,7 @@ fn require_child_span<'a>(
             span.name == name
                 && span.service == service
                 && has_attrs(span, attrs)
-                && span.descends_from(parent)
+                && captured.is_descendant_of(span, parent)
         })
         .ok_or_else(|| {
             missing_span_error(

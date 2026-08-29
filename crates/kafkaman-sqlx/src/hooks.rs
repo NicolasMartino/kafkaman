@@ -85,7 +85,7 @@ impl DispatchHooks {
     }
 
     /// Run the observer in `slot`, if one is installed.
-    #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     pub(crate) async fn run(
         &self,
         slot: DispatchHookSlot,

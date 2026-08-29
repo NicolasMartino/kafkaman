@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::schema_sql::sql_string_literal;
 use crate::{Error, ReceivedTable, Result};
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn received_row(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -29,7 +29,7 @@ pub async fn received_row(
     row.map(received_row_from_pg).transpose()
 }
 
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn received_row_by_idempotency_key(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -92,7 +92,7 @@ fn received_failed_where_sql(filter: &ReceivedFailureFilter) -> Result<String> {
 /// `filter` narrows by failure time and/or most-recent failure kind; `limit`
 /// bounds the page size (clamped to non-negative). Each row carries its
 /// preserved attempts and bounded error history intact.
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn received_failed_rows(
     pool: &PgPool,
     table: &ReceivedTable,
@@ -114,7 +114,7 @@ pub async fn received_failed_rows(
 
 /// Count terminal `Failed` (DLQ) receive rows matching `filter` (an empty filter
 /// counts the whole terminal backlog).
-#[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
 pub async fn received_failed_count(
     pool: &PgPool,
     table: &ReceivedTable,

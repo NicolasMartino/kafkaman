@@ -54,8 +54,10 @@ async fn dispatcher_loop_processes_due_rows_and_stops_on_cancellation() -> TestR
         harness.pool().clone(),
         table.clone(),
         router,
-        Duration::from_secs(60),
-        LifecycleEmission::default(),
+        DispatcherConfig {
+            poll_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
         worker_shutdown,
     ));
 
@@ -144,8 +146,10 @@ async fn dispatcher_loop_finishes_in_flight_dispatch_before_shutdown() -> TestRe
         harness.pool().clone(),
         table.clone(),
         router,
-        Duration::from_millis(10),
-        LifecycleEmission::default(),
+        DispatcherConfig {
+            poll_interval: Duration::from_millis(10),
+            ..Default::default()
+        },
         worker_shutdown,
     ));
 
