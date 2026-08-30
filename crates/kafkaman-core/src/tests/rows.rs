@@ -23,25 +23,6 @@ fn received_error_serializes_as_an_rfc9457_problem_detail() {
 }
 
 #[test]
-fn received_error_reads_pre_problem_detail_rows() {
-    // Rows written before the problem-detail format used `kind`/`message`
-    // with a bare RFC 3339 timestamp. They must stay readable.
-    let legacy = serde_json::json!({
-        "kind": "InvalidPayload",
-        "message": "could not decode",
-        "occurred_at": "2023-11-14T22:13:20Z",
-    });
-    let error: ReceivedError = serde_json::from_value(legacy).unwrap();
-
-    assert_eq!(error.kind, ReceivedFailureKind::InvalidPayload);
-    assert_eq!(error.detail, "could not decode");
-    assert_eq!(
-        error.occurred_at,
-        OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
-    );
-}
-
-#[test]
 fn unknown_problem_type_degrades_to_the_default_kind() {
     // A newer build may write a failure class this binary does not know.
     // Reading the audit trail must not fail because of it.
@@ -233,9 +214,10 @@ fn a_problem_detail_round_trips_with_and_without_a_stage() {
          carrying"
     );
 
-    // Rows written before the field existed omit it, and a row written now with
-    // no stage omits it again — so the absence is not turned into a value that
-    // claims a frame nobody recorded.
+    // An absent stage stays absent in both directions: omitted on write rather
+    // than serialized as null, and read back as `None` rather than defaulted to
+    // a frame nobody recorded. `stage` is optional because some failures are
+    // genuinely unattributable, not because older rows lack the field.
     let unstaged = ReceivedError::new(ReceivedFailureKind::Handler, "boom", occurred_at, None);
     let json = serde_json::to_value(&unstaged).unwrap();
     assert!(
@@ -243,15 +225,12 @@ fn a_problem_detail_round_trips_with_and_without_a_stage() {
         "an absent stage must not be serialized as null: {json}"
     );
 
-    let legacy = serde_json::json!({
+    let stageless = serde_json::json!({
         "type": "urn:kafkaman:problem:handler",
         "title": "Handler returned an error",
         "detail": "boom",
         "occurred_at": "2023-11-14T22:13:20Z[UTC]",
     });
-    let parsed: ReceivedError = serde_json::from_value(legacy).unwrap();
-    assert_eq!(
-        parsed.stage, None,
-        "a row from before this reads as unstaged"
-    );
+    let parsed: ReceivedError = serde_json::from_value(stageless).unwrap();
+    assert_eq!(parsed.stage, None, "an omitted stage reads as unstaged");
 }

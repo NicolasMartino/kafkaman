@@ -6,8 +6,9 @@
 # is an example config that rots. This file is loaded by `Config::discover()`
 # from the binary and asserted by this package's own tests.
 #
-# Intervals are short because two services and six loops have to converge inside
-# a test's patience. A real deployment would poll far less often.
+# Intervals are short because two services and their scheduler loops have to
+# converge inside a test's patience. A real deployment would poll far less
+# often.
 
 [database]
 schema = "kafkaman"

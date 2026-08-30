@@ -86,6 +86,47 @@ fn the_blessed_boot_files_name_no_kafkaman_internals() {
     );
 }
 
+#[test]
+fn the_worker_entry_point_is_no_http_and_explicit_about_subsystems() {
+    let relative = "product/src/bin/worker.rs";
+    let path = examples_dir().join(relative);
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+
+    assert!(
+        source.contains("RuntimeBuilder::new"),
+        "the worker should use the facade builder rather than low-level loops"
+    );
+    assert!(
+        source.contains(".subsystems(") && source.contains("Subsystems::PIPELINE"),
+        "the worker should make its runtime topology explicit"
+    );
+
+    for forbidden in [
+        "kafkaman::axum",
+        "build_router",
+        "TcpListener",
+        "SocketAddr",
+        "BIND_ADDR",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "examples/{relative} should not bind or assemble HTTP, but it names `{forbidden}`"
+        );
+    }
+
+    let internals = find_forbidden(&source);
+    assert!(
+        internals.is_empty(),
+        "the worker should stay on the facade surface:\n  {}",
+        internals
+            .into_iter()
+            .map(|(symbol, line)| format!("examples/{relative}:{line} names `{symbol}`"))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
 /// The escape hatch has to stay exercised, and it cannot be exercised by a file
 /// that does not exist.
 #[test]

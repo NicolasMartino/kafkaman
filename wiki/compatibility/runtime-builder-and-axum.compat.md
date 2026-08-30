@@ -10,8 +10,11 @@
 - Sources:
   - crates/kafkaman/src/runtime/builder.rs
   - crates/kafkaman/src/runtime/context.rs
+  - crates/kafkaman/src/runtime/subsystems.rs
   - crates/kafkaman/src/runtime/tasks.rs
+  - crates/kafkaman/src/runtime/error.rs
   - crates/kafkaman/src/axum.rs
+  - crates/kafkaman-axum/src/lib.rs
   - crates/kafkaman-sqlx/src/roles.rs
   - crates/kafkaman-sqlx/src/generated_changelog.rs
   - crates/kafkaman-sqlx/src/schema_sql.rs
@@ -30,7 +33,8 @@ loops, the publishers, the consumers, and the test harnesses.
 
 ### New on `kafkaman`, behind the existing `rdkafka` feature
 
-- `RuntimeBuilder`, `Runtime`, `RuntimeContext`, `RuntimeTasks`, `HandlerCtx`.
+- `RuntimeBuilder`, `Runtime`, `RuntimeContext`, `RuntimeTasks`, `HandlerCtx`,
+  `Subsystems`.
 - `BuildError` and `RuntimeError`, both `#[non_exhaustive]` `thiserror` enums.
   This is the facade's first error type and its first `thiserror` dependency.
 - `CancellationToken`, re-exported from `tokio-util`, because `Runtime::run` and
@@ -44,11 +48,19 @@ builder without librdkafka would be a builder that cannot build anything.
 ### New `axum` feature
 
 `kafkaman::axum::{serve, Serve, RunningService}`. The feature implies `rdkafka`:
-there is nothing to compose with otherwise. This supersedes the planned
-`kafkaman-axum` crate, which is retired — the facade already gates `rdkafka`, a
-C-linking dependency, specifically so an application never has to name a second
-kafkaman crate, and a pure-Rust optional dependency does not warrant weaker
-treatment.
+there is nothing to compose with otherwise.
+
+Amended 2026-08-31: the separate `kafkaman-axum` crate remains the low-level
+home for admin routes and correlation middleware, but its older direct
+supervision items (`RuntimeTask`, `RuntimeServer`, `serve`,
+`DEFAULT_DRAIN_TIMEOUT`, and `RuntimeError`) were first deprecated and then, the
+same day and before the V1 tag, **removed**. Shipping a deprecation in the first
+release would have meant an adopter's first encounter with kafkaman being two
+supervision surfaces, one already obsolete. `kafkaman-axum` is now HTTP-only.
+Through the facade, `kafkaman::axum::serve`, `RuntimeError`, and
+`DEFAULT_DRAIN_TIMEOUT` are the canonical runtime composition API — the only
+one, rather than the one that shadows another. See
+[v1-legacy-removal](v1-legacy-removal.compat.md).
 
 ### New on `kafkaman-sqlx`
 
@@ -165,6 +177,14 @@ exist to add. Those alters are the repair for three in-place edits. They are
 - **The purger is now wired.** `[retention]` has always been parsed and never
   spawned anything. The builder starts a purger per published type when the
   section is present. It stays opt-in: absent config deletes nothing.
+- **Worker-role topology is explicit.** `RuntimeBuilder::subsystems(Subsystems)`
+  filters only the loops this process starts; roles still drive schema, topic
+  convergence, migration, and handler installation. The default is
+  `Subsystems::all()`, preserving the original builder behavior, including
+  purgers when both `Subsystems::PURGE` and `[retention]` are present.
+  `Subsystems::PIPELINE` is the no-purge worker preset: relay, ingest, dispatch,
+  and queue metrics. Disabling `INGEST` also removes the consumer-group
+  requirement, because the process never constructs a Kafka consumer.
 - **Publishing and consuming one type is legal and is a loop.** A service that
   declares `publish::<T>()` and `handle::<T>` where the handler republishes `T`
   will feed itself forever. The example's `product` avoids this only because it
@@ -189,8 +209,9 @@ exist to add. Those alters are the repair for three in-place edits. They are
   Redpanda: convergence running before the migration and leaving no tables behind
   when it fails, the generated changelog creating exactly the tables the roles
   imply and nothing else, building twice being idempotent, `build()` starting no
-  loops, a pre-cancelled runtime draining promptly, and the router being an
-  ordinary `MessageRouter`.
+  loops, subsystem selection starting only selected loops, an empty selector
+  starting no loops, a pre-cancelled runtime draining promptly, and the router
+  being an ordinary `MessageRouter`.
 - `crates/kafkaman-sqlx/src/tests/{roles,generated_changelog}.rs` — conflict
   rules, order independence, pinned versions, template slot arithmetic, and a
   forced band collision driven through the real code path.

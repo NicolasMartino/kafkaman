@@ -28,6 +28,15 @@ schema = "kafkaman"
 # [kafka]
 # brokers = "localhost:9092"
 
+# OPTIONAL. How boot should reconcile registered entity topics with the broker.
+# Absent means `verify`, not "skip". `verify` reads the broker's topic
+# configuration and refuses to start on a missing or non-compacted topic.
+# `create` creates topics that are missing; an existing topic with the wrong
+# cleanup policy still fails boot rather than being repaired in place. `off`
+# disables topic checks and leaves all responsibility with the host deployment.
+[topics]
+mode = "verify"
+
 # REQUIRED. Drives the outbox relay: how it claims rows, how long it owns them,
 # and how fast it polls. Every key below is mandatory — there are no defaults.
 [relay]
@@ -168,13 +177,18 @@ max_consecutive_panicking_rows = 10
 
 # OPTIONAL. Reclaims terminal outbox rows. Omit the section and nothing is ever
 # deleted — the outbox grows for the life of the application, which is the
-# historical behaviour. Present config alone does nothing either: you must also
-# run `kafkaman_worker::run_purger`.
+# historical behaviour. With `RuntimeBuilder`, a configured published role starts
+# its purger automatically only in the default/all topology or when
+# `Subsystems::PURGE` is selected. Low-level users must run
+# `kafkaman_worker::run_purger` themselves.
 #
 # Scope is the outbox alone, and deliberately so. Received tables are the only
 # durable record of what was done, and their dedupe window *is* their retention
 # window — purging a processed row lets a Kafka redelivery re-run the handler.
-# Cache tables are the state. See wiki/decisions/outbox-retention-policy.decision.md.
+# Cache tables are the state. The schema-wide `received_ingest_failures`
+# quarantine is also retained: it is the only durable diagnosis for records
+# skipped before a received row existed. See
+# wiki/decisions/outbox-retention-policy.decision.md.
 [retention]
 # Age past which a terminal outbox row is reclaimable, measured from `created_at`
 # against the database clock. Must be > 0; zero would delete rows the instant they

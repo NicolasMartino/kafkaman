@@ -1,10 +1,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-//! Axum integration for kafkaman: request correlation, operator routes, and
-//! runtime supervision.
+//! Axum integration for kafkaman: request correlation and operator routes.
 //!
 //! Nothing here is required to use kafkaman. It exists so applications do not
-//! each rewrite the same health check, the same queue-depth query, and the same
-//! "shut the server down when a worker dies" plumbing.
+//! each rewrite the same health check and the same queue-depth query.
+//!
+//! Supervision is not here. Running the HTTP server as one more loop beside the
+//! relay, the ingester, and the dispatcher is [`kafkaman::axum::serve`], which
+//! needs the runtime this crate deliberately knows nothing about.
+//!
+//! [`kafkaman::axum::serve`]: https://docs.rs/kafkaman
 //!
 //! # Security
 //!
@@ -17,7 +21,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{MatchedPath, Path, State};
@@ -29,19 +32,14 @@ use axum::{Json, Router};
 use kafkaman_core::{MessageDescriptor, ReceivedError, ReceivedFailureKind};
 use kafkaman_sqlx::{
     outbox_status_summary, outbox_stuck_rows, received_failed_count, received_failed_rows,
-    received_status_summary, received_stuck_rows, redrive_received, service_table_access,
-    service_tables, OutboxStatusSummary, OutboxStuckRow, OutboxTable, ReceivedFailureFilter,
-    ReceivedStatusSummary, ReceivedStuckRow, ReceivedTable, Replay, ResolvedConfig, ServiceTables,
-    TableAccess,
+    received_ingest_failure_summary, received_status_summary, received_stuck_rows,
+    redrive_received, service_table_access, service_tables, OutboxStatusSummary, OutboxStuckRow,
+    OutboxTable, ReceivedFailureFilter, ReceivedIngestFailureSummary, ReceivedStatusSummary,
+    ReceivedStuckRow, ReceivedTable, Replay, ResolvedConfig, ServiceTables, TableAccess,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use time::OffsetDateTime;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio::task::JoinError;
-use tokio::time::timeout;
-use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -239,6 +237,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/ready", get(ready))
         .route("/outbox", get(outbox_summary))
         .route("/received", get(received_summary))
+        .route("/ingest-failures", get(ingest_failure_summary))
         .route("/stuck", get(stuck_rows))
         .route("/dlq", get(dlq_summary))
         .with_state(state)
@@ -371,6 +370,22 @@ async fn received_summary(
             .extend(received_status_summary(&state.pool, &table, now, policy.max_queue_age).await?);
     }
     Ok(Json(summaries))
+}
+
+/// Schema-wide quarantine depth for records that never became received rows.
+///
+/// This is intentionally a summary, not a row listing. Quarantine rows can carry
+/// the raw payload and Kafka headers that failed to decode, and returning those
+/// from the unauthenticated read-only router would turn a storage-growth
+/// diagnostic into a payload-inspection endpoint.
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+async fn ingest_failure_summary(
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<ReceivedIngestFailureSummary>>, AdminError> {
+    let now = OffsetDateTime::now_utc();
+    Ok(Json(
+        received_ingest_failure_summary(&state.pool, &state.cfg, now).await?,
+    ))
 }
 
 /// Rows that are overdue on either side of the ledger.
@@ -915,258 +930,10 @@ impl IntoResponse for AdminError {
     }
 }
 
-/// A named background task supervised alongside the HTTP server.
-///
-/// The name exists for the error message: "a task exited" is not actionable,
-/// "the `relay:order_created` task exited" is.
-#[derive(Debug)]
-pub struct RuntimeTask {
-    name: String,
-    handle: tokio::task::JoinHandle<Result<(), String>>,
-}
-
-impl RuntimeTask {
-    /// Spawns `future` immediately and adopts it under `name`.
-    ///
-    /// The error is flattened to a `String` at the spawn boundary so tasks with
-    /// different error types can be supervised in one collection.
-    pub fn spawn<F, E>(name: impl Into<String>, future: F) -> Self
-    where
-        F: Future<Output = Result<(), E>> + Send + 'static,
-        E: std::fmt::Display + Send + 'static,
-    {
-        let handle = tokio::spawn(async move { future.await.map_err(|err| err.to_string()) });
-        Self {
-            name: name.into(),
-            handle,
-        }
-    }
-}
-
-/// An Axum server awaiting [`RuntimeServer::with_runtime`].
-#[derive(Debug)]
-pub struct RuntimeServer {
-    listener: TcpListener,
-    app: Router,
-}
-
-/// Binds `app` to `listener`, to be supervised by
-/// [`RuntimeServer::with_runtime`].
-pub fn serve(listener: TcpListener, app: Router) -> RuntimeServer {
-    RuntimeServer { listener, app }
-}
-
-/// How long [`RuntimeServer::with_runtime`] waits for background tasks to
-/// finish their current cycle after shutdown is signalled.
-///
-/// Workers observe the cancellation token between cycles, so a healthy drain
-/// takes about one poll interval. This bound exists for the unhealthy case — a
-/// task blocked on a slow broker or a stuck query — where waiting forever turns
-/// a graceful shutdown into a hang.
-pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
-impl RuntimeServer {
-    /// Runs the server and `tasks` together, with a shared shutdown signal.
-    ///
-    /// Whichever stops first stops the rest: a cancelled `shutdown` ends the
-    /// server, and a task that exits before shutdown is treated as a fault —
-    /// the relay finishing "successfully" while the process keeps serving would
-    /// mean silently dropping outbox delivery.
-    ///
-    /// # Draining
-    ///
-    /// After the server stops, this cancels `shutdown` and then **waits for the
-    /// tasks to finish**, up to [`DEFAULT_DRAIN_TIMEOUT`]. That wait is the
-    /// whole point: returning as soon as the listener closes would drop the
-    /// runtime mid-cycle and cut in-flight publishes, which is exactly the
-    /// failure an outbox exists to prevent. Use
-    /// [`RuntimeServer::with_runtime_drain_timeout`] to change the bound.
-    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
-    pub async fn with_runtime(
-        self,
-        tasks: Vec<RuntimeTask>,
-        shutdown: CancellationToken,
-    ) -> Result<(), RuntimeError> {
-        self.with_runtime_drain_timeout(tasks, shutdown, DEFAULT_DRAIN_TIMEOUT)
-            .await
-    }
-
-    /// [`RuntimeServer::with_runtime`] with an explicit drain bound.
-    ///
-    /// A zero timeout skips the drain entirely.
-    pub async fn with_runtime_drain_timeout(
-        self,
-        tasks: Vec<RuntimeTask>,
-        shutdown: CancellationToken,
-        drain_timeout: Duration,
-    ) -> Result<(), RuntimeError> {
-        let server = axum::serve(self.listener, self.app).with_graceful_shutdown({
-            let shutdown = shutdown.clone();
-            async move {
-                shutdown.cancelled().await;
-            }
-        });
-
-        if tasks.is_empty() {
-            let result = server.await;
-            // Cancel even with nothing to supervise: the caller's token may also
-            // gate work this function never saw.
-            shutdown.cancel();
-            return result.map_err(RuntimeError::Server);
-        }
-
-        // Adopt every handle into one stream of completions. `handles` keeps the
-        // abort handles so a drain timeout can stop stragglers instead of
-        // leaking them past process shutdown.
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut handles = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            let tx = tx.clone();
-            let name = task.name.clone();
-            let handle = task.handle;
-            let abort = handle.abort_handle();
-            handles.push(abort);
-            tokio::spawn(async move {
-                let result = handle.await;
-                let _ = tx.send((name, result));
-            });
-        }
-        drop(tx);
-
-        let outcome = tokio::select! {
-            result = server => result.map_err(RuntimeError::Server),
-            task = rx.recv() => Err(exited_before_shutdown(task)),
-        };
-
-        // Signal first, then wait. Workers check the token between cycles, so
-        // this is what turns "stop accepting" into "finish what you started".
-        shutdown.cancel();
-        let drained = drain(&mut rx, drain_timeout).await;
-        for handle in handles {
-            handle.abort();
-        }
-
-        // A real failure outranks a drain timeout: the timeout is a symptom, the
-        // original error is the cause.
-        match (outcome, drained) {
-            (Err(err), _) => Err(err),
-            (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(())) => Ok(()),
-        }
-    }
-}
-
-/// What a supervised task reported: its name, and either its own result or the
-/// join failure that replaced it.
-type TaskCompletion = (String, Result<Result<(), String>, JoinError>);
-
-/// Waits for the remaining supervised tasks to report in.
-///
-/// A task that returns an error during drain is reported; a task that is simply
-/// slow trips [`RuntimeError::DrainTimeout`]. Both leave the process free to
-/// exit, which is the requirement — the point of the bound is that shutdown
-/// always terminates.
-async fn drain(
-    rx: &mut mpsc::UnboundedReceiver<TaskCompletion>,
-    drain_timeout: Duration,
-) -> Result<(), RuntimeError> {
-    if drain_timeout.is_zero() {
-        return Ok(());
-    }
-    let drain_all = async {
-        let mut failure = None;
-        while let Some((name, result)) = rx.recv().await {
-            match result {
-                // Cancelled tasks are the expected shape of a clean drain.
-                Ok(Ok(())) => {}
-                Ok(Err(message)) => {
-                    failure.get_or_insert(RuntimeError::WorkerExited { name, message });
-                }
-                Err(err) if err.is_cancelled() => {}
-                Err(err) => {
-                    failure.get_or_insert(RuntimeError::WorkerJoin { name, source: err });
-                }
-            }
-        }
-        match failure {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
-    };
-
-    match timeout(drain_timeout, drain_all).await {
-        Ok(result) => result,
-        Err(_) => Err(RuntimeError::DrainTimeout {
-            timeout: drain_timeout,
-        }),
-    }
-}
-
-/// Classifies a task completion that arrived while the server was still running.
-fn exited_before_shutdown(task: Option<TaskCompletion>) -> RuntimeError {
-    match task {
-        Some((name, Ok(Ok(())))) => RuntimeError::WorkerExited {
-            name,
-            message: "completed before shutdown".to_owned(),
-        },
-        Some((name, Ok(Err(message)))) => RuntimeError::WorkerExited { name, message },
-        Some((name, Err(err))) => RuntimeError::WorkerJoin { name, source: err },
-        None => RuntimeError::WorkerExited {
-            name: "runtime".to_owned(),
-            message: "all runtime tasks completed before shutdown".to_owned(),
-        },
-    }
-}
-
-/// Why the supervised runtime stopped.
-#[derive(Debug)]
-pub enum RuntimeError {
-    /// The HTTP server itself failed.
-    Server(std::io::Error),
-    /// A supervised task returned before shutdown was signalled. Includes clean
-    /// exits: a worker loop that ends while the server is still up is a fault.
-    WorkerExited { name: String, message: String },
-    /// A supervised task panicked or was aborted.
-    WorkerJoin { name: String, source: JoinError },
-    /// Shutdown was signalled but tasks did not finish in time. In-flight work
-    /// may have been cut short.
-    DrainTimeout { timeout: Duration },
-}
-
-impl std::fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Server(err) => write!(f, "server failed: {err}"),
-            Self::WorkerExited { name, message } => {
-                write!(f, "runtime task `{name}` exited before shutdown: {message}")
-            }
-            Self::WorkerJoin { name, source } => {
-                write!(f, "runtime task `{name}` join failed: {source}")
-            }
-            Self::DrainTimeout { timeout } => write!(
-                f,
-                "runtime tasks did not finish within {timeout:?} of shutdown; \
-                 in-flight work may have been interrupted"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Server(err) => Some(err),
-            Self::WorkerJoin { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use kafkaman_core::ReceivedFailureKind;
     use time::format_description::well_known::Rfc3339;
@@ -1263,16 +1030,14 @@ mod tests {
     /// pointing at the cause. `set_default` being thread-local is not enough;
     /// the level hint it adjusts is not.
     ///
-    /// Poisoning is stepped over rather than propagated: one failing test
-    /// should not turn every other subscriber test into a second failure
-    /// reporting the first one's panic.
-    static SUBSCRIBER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Async because the guarded scope intentionally drives a request while the
+    /// subscriber is installed. A sync mutex guard across that await blocks an
+    /// executor worker thread and trips clippy for the right reason.
+    static SUBSCRIBER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn lock_subscriber() -> std::sync::MutexGuard<'static, ()> {
+    async fn lock_subscriber() -> tokio::sync::MutexGuard<'static, ()> {
         ensure_permissive_global();
-        SUBSCRIBER_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        SUBSCRIBER_LOCK.lock().await
     }
 
     /// Install a permissive subscriber globally, once, before any test opens a
@@ -1304,7 +1069,7 @@ mod tests {
     /// Drives one request through a real router with the layer applied, and
     /// returns the `(http.route, otel.name)` its span recorded.
     async fn recorded_route(uri: &str) -> (String, String) {
-        let _serialized = lock_subscriber();
+        let _serialized = lock_subscriber().await;
         use tracing_subscriber::layer::SubscriberExt as _;
 
         let recorded = RecordedRoutes::default();
@@ -1356,22 +1121,24 @@ mod tests {
     /// The `kafkaman::internal` tier is split by level, and its poll half is
     /// reachable by its own target.
     ///
-    /// Three things are pinned, and they are three because the tier is no longer
-    /// one thing:
+    /// Two things are pinned here:
     ///
     /// 1. A function that runs on a timer ([`health`], which an orchestrator
     ///    probes forever and which touches nothing) stays out of the default
     ///    filter. This is the whole cost argument for the tier being visible at
     ///    all — an idle service that exports its own scheduler exports nothing
     ///    else worth reading.
-    /// 2. A function on the message path ([`RuntimeServer::with_runtime`],
-    ///    standing in for the sixty of them, since it is the one promoted
-    ///    function in this crate that needs no database) *is* in the default
-    ///    filter. Without this half the test passes just as well against a tier
-    ///    reverted to debug wholesale.
-    /// 3. The directive `examples/README.md` documents still reaches the poll
+    /// 2. The directive `examples/README.md` documents still reaches the poll
     ///    half — and still does not require turning on `debug` globally, which
     ///    would drown it in `sqlx` and `rdkafka` output.
+    ///
+    /// The other half of the split — that a *message-path* function **is** in
+    /// the default filter, without which this test passes just as well against a
+    /// tier reverted to debug wholesale — is pinned by
+    /// `running_service_run_is_visible_under_the_default_filter` in
+    /// `kafkaman::axum`. It moved there with the supervision code: every
+    /// promoted function left in this crate needs a database, so the assertion
+    /// belongs where the one that does not now lives.
     #[tokio::test]
     async fn the_internal_span_tier_is_split_by_level_and_reachable_by_target() {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -1383,15 +1150,7 @@ mod tests {
         async fn spans_opened_under(directive: &str) -> Vec<String> {
             use tracing_subscriber::Layer as _;
 
-            // Bound outside the guarded scope below. Binding inside it would put
-            // an `await` on the OS between installing a subscriber and removing
-            // it again, and that window is exactly what the lock exists to keep
-            // short.
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("binding an ephemeral port");
-
-            let _serialized = lock_subscriber();
+            let _serialized = lock_subscriber().await;
             let recorded = RecordedSpans::default();
             {
                 let _guard = tracing::subscriber::set_default(
@@ -1402,19 +1161,6 @@ mod tests {
                     ),
                 );
                 let _ = health().await;
-
-                // Returns immediately: the shutdown token is already cancelled,
-                // so the server stops before accepting anything and the drain
-                // has no tasks to wait for. The span is what is under test, not
-                // the serving.
-                let shutdown = CancellationToken::new();
-                shutdown.cancel();
-                let _ = RuntimeServer {
-                    listener,
-                    app: axum::Router::new(),
-                }
-                .with_runtime(Vec::new(), shutdown)
-                .await;
             }
             let names = recorded
                 .0
@@ -1430,13 +1176,6 @@ mod tests {
             "a function an orchestrator polls forever must stay out of the default \
              filter; opened: {default_filter:?}"
         );
-        assert!(
-            default_filter.contains(&"with_runtime".to_owned()),
-            "the message-path half of the tier is supposed to be visible by \
-             default — that is what makes the waterfall gapless; opened: \
-             {default_filter:?}"
-        );
-
         assert!(
             spans_opened_under("info,kafkaman::internal=debug")
                 .await
@@ -1878,140 +1617,5 @@ mod tests {
         // No pool is involved: liveness must not fail because storage blipped.
         let Json(value) = health().await;
         assert_eq!(value["status"], "ok");
-    }
-
-    // ---- runtime supervision ----------------------------------------------
-
-    async fn test_listener() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral port should be available")
-    }
-
-    #[tokio::test]
-    async fn with_runtime_waits_for_tasks_to_drain_before_returning() {
-        // The point of the drain: a worker mid-cycle when shutdown fires must
-        // reach its own completion, not be cut off with the listener.
-        let finished = Arc::new(AtomicUsize::new(0));
-        let shutdown = CancellationToken::new();
-
-        let task = {
-            let finished = Arc::clone(&finished);
-            let token = shutdown.clone();
-            RuntimeTask::spawn("drainer", async move {
-                token.cancelled().await;
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                finished.fetch_add(1, Ordering::SeqCst);
-                Ok::<(), Infallible>(())
-            })
-        };
-
-        let listener = test_listener().await;
-        let server = serve(listener, admin_free_router());
-
-        let trigger = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            trigger.cancel();
-        });
-
-        server
-            .with_runtime(vec![task], shutdown)
-            .await
-            .expect("a clean shutdown should not be an error");
-
-        assert_eq!(
-            finished.load(Ordering::SeqCst),
-            1,
-            "with_runtime returned before the task finished its work"
-        );
-    }
-
-    #[tokio::test]
-    async fn with_runtime_fails_when_a_task_exits_early() {
-        // A relay that "succeeds" while the server keeps serving is a silent
-        // outage, so an early exit is an error even when it is `Ok(())`.
-        let shutdown = CancellationToken::new();
-        let task = RuntimeTask::spawn("relay", async { Ok::<(), Infallible>(()) });
-
-        let listener = test_listener().await;
-        let err = serve(listener, admin_free_router())
-            .with_runtime(vec![task], shutdown.clone())
-            .await
-            .expect_err("an early task exit must fail the runtime");
-
-        match err {
-            RuntimeError::WorkerExited { name, .. } => assert_eq!(name, "relay"),
-            other => panic!("expected WorkerExited, got {other:?}"),
-        }
-        assert!(
-            shutdown.is_cancelled(),
-            "a failing runtime must signal everything else to stop"
-        );
-    }
-
-    #[tokio::test]
-    async fn with_runtime_reports_a_failing_task_by_name() {
-        let shutdown = CancellationToken::new();
-        let task = RuntimeTask::spawn("dispatcher", async {
-            Err::<(), _>("database is gone".to_owned())
-        });
-
-        let err = serve(test_listener().await, admin_free_router())
-            .with_runtime(vec![task], shutdown)
-            .await
-            .expect_err("a task error must fail the runtime");
-
-        let rendered = err.to_string();
-        assert!(rendered.contains("dispatcher"), "got {rendered}");
-        assert!(rendered.contains("database is gone"), "got {rendered}");
-    }
-
-    #[tokio::test]
-    async fn with_runtime_bounds_the_drain_of_a_wedged_task() {
-        // A task that ignores the shutdown signal must not hang the process.
-        let shutdown = CancellationToken::new();
-        let task = RuntimeTask::spawn("wedged", async {
-            std::future::pending::<()>().await;
-            Ok::<(), Infallible>(())
-        });
-
-        let trigger = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            trigger.cancel();
-        });
-
-        let err = serve(test_listener().await, admin_free_router())
-            .with_runtime_drain_timeout(vec![task], shutdown, Duration::from_millis(100))
-            .await
-            .expect_err("a wedged task should trip the drain timeout");
-
-        assert!(
-            matches!(err, RuntimeError::DrainTimeout { .. }),
-            "got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn with_runtime_cancels_the_token_even_with_no_tasks() {
-        let shutdown = CancellationToken::new();
-        let trigger = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            trigger.cancel();
-        });
-
-        serve(test_listener().await, admin_free_router())
-            .with_runtime(Vec::new(), shutdown.clone())
-            .await
-            .expect("a clean shutdown should not be an error");
-
-        assert!(shutdown.is_cancelled());
-    }
-
-    /// A router with no state, for supervision tests that never issue a request.
-    fn admin_free_router() -> Router {
-        Router::new().route("/health", get(health))
     }
 }

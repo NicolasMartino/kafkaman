@@ -1,7 +1,7 @@
 # Method-Level Timing Plan
 
 - Document Class: Plan
-- Status: Completed 2026-08-29.
+- Status: Completed
 - Date: 2026-08-29
 - Category: Observability execution
 - Scope: Records the continuous-profiling measurement, the `kafkaman.handler` span, the `kafkaman::internal` span tier, and the durable-capture fix that the tier uncovered.

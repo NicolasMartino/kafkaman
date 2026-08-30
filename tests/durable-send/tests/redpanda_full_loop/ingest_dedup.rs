@@ -144,6 +144,120 @@ async fn full_loop_consume_then_produce_deduplicates_duplicate_input() -> TestRe
 }
 
 #[tokio::test]
+async fn ack_before_mark_republish_is_deduplicated_after_real_broker_hop() -> TestResult {
+    let _test_guard = redpanda_test_lock().lock().await;
+    let (_postgres, _redpanda, brokers, harness) = start_redpanda_harness().await?;
+    let outbox = harness.outbox_table::<OrderCreated>().await?;
+    let received = harness.received_table::<OrderCreated>().await?;
+
+    recreate_effect_table(
+        harness.pool(),
+        "handled_orders",
+        "order_id TEXT PRIMARY KEY",
+    )
+    .await?;
+
+    let event = Envelope::new(OrderCreated {
+        order_id: "order-rp-ack-before-mark".to_owned(),
+    })
+    .with_idempotency_key("idem-rp-ack-before-mark");
+    let message_id = event.message_id;
+    harness.enqueue(&event).await?;
+
+    let mut tx = harness.pool().begin().await?;
+    let claimed = claim_batch(&mut tx, &outbox, "manual-crash", Duration::from_secs(30), 1).await?;
+    tx.commit().await?;
+    assert_eq!(claimed.len(), 1);
+
+    let publisher = RdkafkaPublisher::from_brokers(&brokers)?;
+    let first_ack = publisher.publish_row(&claimed[0]).await?;
+    assert_eq!(first_ack.topic, OrderCreated::TOPIC);
+
+    let row = harness.outbox_row::<OrderCreated>(message_id).await?;
+    assert_eq!(
+        row.status,
+        OutboxStatus::Publishing,
+        "the simulated crash happens after the broker ack but before mark_published"
+    );
+
+    let expire_sql = format!(
+        "UPDATE {} SET claim_expires_at = now() - interval '1 second' WHERE message_id = $1",
+        outbox.qualified_name()
+    );
+    sqlx::query(&expire_sql)
+        .bind(message_id)
+        .execute(harness.pool())
+        .await?;
+
+    let relay_stats = harness.relay_once::<OrderCreated>().await?;
+    assert_eq!(relay_stats.claimed, 1);
+    assert_eq!(relay_stats.published, 1);
+    harness
+        .assert_status::<OrderCreated>(message_id, OutboxStatus::Published)
+        .await?;
+
+    let consumer =
+        RdkafkaConsumer::from_brokers(&brokers, &format!("kafkaman-ackmark-{}", Uuid::new_v4()))?;
+    consumer.subscribe(&[OrderCreated::TOPIC])?;
+
+    let inserted = tokio::time::timeout(
+        Duration::from_secs(30),
+        consumer.ingest_once::<OrderCreated>(harness.pool(), &harness.config()),
+    )
+    .await??;
+    assert_eq!(inserted.inserted, 1);
+    assert_eq!(inserted.duplicates, 0);
+    assert_eq!(inserted.committed, 1);
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(30),
+        consumer.ingest_once::<OrderCreated>(harness.pool(), &harness.config()),
+    )
+    .await??;
+    assert_eq!(duplicate.inserted, 0);
+    assert_eq!(duplicate.duplicates, 1);
+    assert_eq!(duplicate.committed, 1);
+    assert_eq!(duplicate.partition, inserted.partition);
+    assert!(
+        duplicate.offset > inserted.offset,
+        "the republish must be a second broker record, not a hidden database retry"
+    );
+
+    let row = harness
+        .received_row_by_idempotency_key::<OrderCreated>("idem-rp-ack-before-mark")
+        .await?;
+    assert_eq!(
+        row.source_offset, inserted.offset,
+        "the duplicate broker record must not rewrite the durable received row"
+    );
+
+    let router = MessageRouter::new().handler::<OrderCreated>(|conn, _meta, msg| {
+        Box::pin(async move {
+            sqlx::query("INSERT INTO handled_orders (order_id) VALUES ($1)")
+                .bind(msg.order_id)
+                .execute(conn)
+                .await?;
+            Ok(())
+        })
+    });
+    let dispatch_stats = dispatch_once(
+        harness.pool(),
+        &received,
+        &router,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
+    assert_eq!(dispatch_stats.processed, 1);
+
+    let handled: i64 = sqlx::query_scalar("SELECT count(*) FROM handled_orders")
+        .fetch_one(harness.pool())
+        .await?;
+    assert_eq!(handled, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn ingest_deduplicates_redelivery_after_crash_before_offset_commit() -> TestResult {
     let _test_guard = redpanda_test_lock().lock().await;
     let (_postgres, _redpanda, brokers, harness) = start_redpanda_harness().await?;

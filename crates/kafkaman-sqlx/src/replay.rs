@@ -35,11 +35,13 @@ impl Replay {
     /// repair row and correctly wins. See the entity-first propagation decision,
     /// point 9.
     ///
-    /// This constructor is retained rather than deleted so the failure names the
-    /// reason at the call site instead of vanishing into a compile error.
+    /// This exists as a refusal rather than as an absent function on purpose: an
+    /// operator reaching for outbox replay during an incident gets the reason
+    /// and the safe alternative, where a missing constructor would give them
+    /// only "no such method" and an afternoon of reinventing it by hand.
     /// [`Replay::received`] is unaffected: redriven inbound rows keep their
     /// original `source_offset`, so redrive cannot invent a newer ordinal.
-    pub fn outbox<P: KafkaMessage>(_version: i64) -> Result<Self> {
+    pub fn outbox<P: KafkaMessage>() -> Result<Self> {
         Err(Error::UnsafeOutboxReplay {
             message_type: P::MESSAGE_TYPE.to_owned(),
         })

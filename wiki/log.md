@@ -1,3 +1,475 @@
+## [2026-08-31] fix | the broker-outage scenario counted terminal rows as backlog
+
+Ran the examples from scratch against the V1 tree — `just examples down`, then
+`just examples all`, then the full seven-scenario fault suite — and scenario 6
+failed: "the outbox did not drain after the broker returned (1 left)". The
+outbox had drained. Nothing was pending.
+
+`examples/faults.sh` measured backlog as every outbox row whose status is not
+`Published`. `Superseded` is not `Published`, and `OutboxStatus` says outright
+what it is: "the one that is not a step: it marks a row a newer snapshot of the
+same entity overtook before it was ever published." It is terminal and correct —
+drained work, not pending work. Any stack that has already served traffic
+accumulates them, so the smoke run's twelve-product volume phase left one behind
+and scenario 6 could never reach zero. The documented sequence in
+`examples/README.md` — `just examples all`, then `just examples faults` for the
+other five scenarios — therefore failed on any machine that followed it.
+
+The half worth reading twice is the other assertion. The same filter feeds the
+during-outage check that the outbox *did* back up, so the leftover row inflated
+that count from 1 to 2 — and a scenario that never backed anything up would
+still have passed it, on the strength of a row created minutes earlier by
+something else. It was a failing assertion covering for a passing one that had
+stopped meaning anything.
+
+Backlog is now `Pending` plus `Publishing`. Re-verified: scenario 6 alone
+reports the genuine single row and drains, and the full suite passes end to end
+against the already-used stack — seven scenarios, 26 assertions, no skips.
+
+Not a library change. `examples/faults.sh` was last touched well before the V1
+legacy removal, and nothing in that removal touches supersede semantics or the
+outbox summary route; the scenario had been wrong since it was written and only
+fired here because this was the first run against a stack with prior traffic.
+
+Pages affected: `examples/faults.sh`, `wiki/log.md`.
+
+## [2026-08-31] remove | every legacy path, before the tag rather than after
+
+Deleted every deprecated shim and every upgrade path that existed only to repair
+kafkaman's own pre-release history. The rule applied: kafkaman has not shipped,
+so "pre-existing table", "row written before this format", and "existing
+adopters" all name the empty set, and carrying any of it past the tag would
+freeze development history into the permanent public surface.
+
+Four removals. The duplicate supervision surface in `kafkaman-axum` —
+`RuntimeTask`, `RuntimeServer`, `serve`, `DEFAULT_DRAIN_TIMEOUT`, `RuntimeError`
+and the two `with_runtime` methods — went from deprecated to deleted; shipping a
+deprecation in a first release would have meant an adopter's first encounter
+being two supervision surfaces, one already obsolete. That crate is now
+HTTP-only and the `#![allow(deprecated)]` both crates carried is gone.
+
+Nine upgrade changesets went with it, along with their SQL builders.
+`schema_sql.rs` had said outright that those alters were "the repair for three
+in-place template edits" made while nothing was deployed. `RECEIVED_TEMPLATE_VERSION`
+drops from 1 to 0, so every table kind is at slot 0 and V1's generated changelog
+is one create per table — and `RemoveReceivedProcessingStatus`, which had been
+running on every fresh database as a no-op `UPDATE` plus a constraint
+drop-and-recreate, no longer runs at boot. The `upgrades` mechanism is kept and
+returns empty: it is what the first post-V1 template bump registers against, and
+the slot-0 assertion is what forces the bump and the registration to land
+together. Generated versions are unchanged; the removed changesets were all at
+slot 1.
+
+Third, `changelog_history.checksum` and `applied_by` become `NOT NULL`, dropping
+two `ADD COLUMN IF NOT EXISTS` repairs, an `applied_by` backfill, and — the part
+that mattered — the "no checksum recorded, skip verification" branch. Every
+applied changeset is now verified. Fourth, the `kind`/`message` serde aliases on
+`ReceivedError` that read the pre-RFC-9457 stored shape.
+
+One thing was renamed rather than removed, and it is the judgement call worth
+reviewing: the legacy-string idempotency conversion is kept, because it is
+load-bearing for the `&str`/`String` conversions the suite uses in about thirty
+places and a single unique string is a legitimate identity. What went is its
+framing as a compatibility path — `derive_legacy_string` → `derive_from_string`,
+and the namespace `"kafkaman:legacy-string:v1"` → `"kafkaman:string-source:v1"`.
+The namespace is hashed into the digest, so every string-derived key changes;
+harmless now, and the last time that will be true.
+
+Two things read as legacy and were deliberately kept, with their justifications
+rewritten to stop citing history: `Replay::outbox`, which is a refusal naming a
+cache-corruption hazard rather than a vestige, and `Subsystems::all()` as the
+builder default, which is right because `PURGE` starts nothing without a
+`[retention]` section — not because it "preserves the pre-M7 behavior".
+
+Deleting the deprecated supervision code removed the only `info`-level
+`kafkaman::internal` span on that path, which a test pinned deliberately as the
+half of the tier split without which the tier could silently revert to `debug`
+wholesale. `RunningService::run` is instrumented in its place and the assertion
+moved to `kafkaman::axum` beside it.
+
+Recorded in a new compatibility note. Six current-state pages asserted the
+removed surfaces and were corrected; plans and reviews were left alone, because
+they are historical record and were accurate when written.
+
+Pages affected: `crates/kafkaman-axum/src/lib.rs`,
+`crates/kafkaman-axum/Cargo.toml`, `crates/kafkaman/src/axum.rs`,
+`crates/kafkaman/src/lib.rs`, `crates/kafkaman/Cargo.toml`,
+`crates/kafkaman/src/runtime/builder.rs`,
+`crates/kafkaman/src/runtime/subsystems.rs`,
+`crates/kafkaman-sqlx/src/changesets.rs`,
+`crates/kafkaman-sqlx/src/schema_sql.rs`,
+`crates/kafkaman-sqlx/src/generated_changelog.rs`,
+`crates/kafkaman-sqlx/src/migration_runner.rs`,
+`crates/kafkaman-sqlx/src/replay.rs`, `crates/kafkaman-sqlx/src/lib.rs`,
+`crates/kafkaman-core/src/idempotency.rs`, `crates/kafkaman-core/src/rows.rs`,
+`crates/kafkaman-core/src/lib.rs`, `crates/kafkaman-test/src/envelope_ext.rs`,
+`tests/durable-send/`, `tests/distributed-cache/tests/runtime_builder.rs`,
+`wiki/compatibility/v1-legacy-removal.compat.md`,
+`wiki/compatibility/runtime-builder-and-axum.compat.md`,
+`wiki/compatibility/typed-idempotency-identity-api.compat.md`,
+`wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/specs/m1-durable-send.spec.md`,
+`wiki/specs/m2-change-engine-config.spec.md`,
+`wiki/specs/entity-first-propagation.spec.md`,
+`wiki/decisions/schema-and-change-management.decision.md`,
+`wiki/decisions/runtime-builder-and-axum-composition.decision.md`,
+`wiki/decisions/observability-operability-policy.decision.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-31] lint | wiki reconciliation before the V1 tag
+
+Verified the M7 hardening review remediation against the tree — all ten findings
+hold, and `just lint` is green — then ran the wiki's own lint rules over the
+whole tree and reconciled what they surfaced. Three things came out of it.
+
+First, metadata format: nineteen pages carried the plain `Status:` header form
+instead of the bullet block `project_guidelines.md` specifies, which is why a
+naive `^- Status:` scan had been silently skipping them. All nineteen are
+normalized; every page under `wiki/` now uses the documented block, and a
+per-class status check passes with zero off-vocabulary values.
+
+Second, the three foundation decisions the roadmap deliberately held at `Draft`
+behind its revisit gate — consumer-test-tooling, library-test-strategy, and
+runtime-composition-and-topology — are ratified to `Accepted`, because their
+milestones have all closed. Ratifying them as written would have been wrong,
+though: each specifies API that V1 does not ship, so each carries a dated
+ratification section recording shipped versus specified. The largest gap is
+consumer-test-tooling, which promises adopters `tower::ServiceExt::oneshot`
+handler tests, an injectable `Clock`, `#[kafkaman::test]` with a
+`kafkaman-test-macros` crate, `TestMessage` builders, an assertion family, and a
+`testcontainers` feature — none of which exist. What ships is the smaller
+explicit `Harness`. runtime-composition's point 5 is the same shape: no
+`axum-sqlx-tx` dependency, no `Sender` extractor, no quarantined
+`send_non_transactional`; the send-side UX is point 6's explicit
+`kafkaman::sqlx::enqueue`, which the examples use.
+
+Third, and the reason this mattered before a release tag rather than after: the
+roadmap's M3 entry claimed six of those unbuilt items as *delivered* — the
+`MessageRouter` Tower stack, `FromMessage` extractors, `#[derive(KafkaMessage)]`,
+`oneshot` handler tests, `#[kafkaman::test]`, and the injectable `Clock` — and
+its exit criterion asserted handler stacks are `oneshot`-testable. The M3 spec
+had been accurate about this the whole time, recording those ergonomics as
+deferred, and proposal 16 is still `Proposed`. The roadmap was the single
+document overstating the shipped surface, which is the document a reader opens
+first. Corrected in place, along with the Cross-Cutting Track's reference to a
+`testcontainers` *feature* on `kafkaman-test` that was never a feature. The M3
+execution plan, `Active` since June with a stale "Remaining M3 work" list, is
+closed with those items split into the three that shipped and the four that did
+not.
+
+Left alone deliberately: `apm-waterfall-traces.plan.md` and
+`opentelemetry-completion.plan.md` stay `Active`, both having genuine residual or
+deferred items of their own.
+
+Pages affected: `wiki/decisions/consumer-test-tooling.decision.md`,
+`wiki/decisions/library-test-strategy.decision.md`,
+`wiki/decisions/runtime-composition-and-topology.decision.md`,
+`wiki/decisions/message-consumption-and-handler-model.decision.md`,
+`wiki/decisions/dispatch-infrastructure-error-classification.decision.md`,
+`wiki/decisions/dispatch-stats-semantics.decision.md`,
+`wiki/decisions/ingest-poison-quarantine-policy.decision.md`,
+`wiki/decisions/kafka-ingest-identity-and-ordering.decision.md`,
+`wiki/decisions/missing-handler-dispatch-policy.decision.md`,
+`wiki/decisions/outbox-retention-policy.decision.md`,
+`wiki/decisions/receive-handler-surface-scope.decision.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`,
+`wiki/plans/m3-durable-receive.plan.md`,
+`wiki/plans/m3-durable-completion.plan.md`,
+`wiki/specs/entity-first-propagation.spec.md`,
+`wiki/specs/m2-change-engine-config.spec.md`,
+`wiki/specs/m3-durable-receive.spec.md`,
+`wiki/specs/m4-retry-backoff-dlq.spec.md`,
+`wiki/proposals/03-direct-transport-mode.proposal.md`,
+`wiki/proposals/04-observability-logging-policy.proposal.md`,
+`wiki/proposals/05-deep-durability-testing.proposal.md`,
+`wiki/compatibility/m2-change-engine-config-schema-and-api.compat.md`,
+`wiki/compatibility/m3-durable-receive-review-fix-api.compat.md`,
+`wiki/compatibility/module-test-separation-internal-hooks.compat.md`,
+`wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-31] remediate | M7 hardening review
+
+Double-checked the M7 hardening review findings against the code and docs, then
+remediated the confirmed defects and low-risk shape/hygiene gaps. The durable
+surface now removes legacy received `Processing` state through a received-table
+template bump and upgrade changeset; generated role changelogs include the new
+upgrade row. Observability override merging is exhaustive, DLQ reads emit
+`db.query` spans, facade boot/runtime errors implement `ProblemType`, derived
+idempotency keys use explicit canonical JSON ordering, and the relay drains
+non-empty batches without waiting for the poll interval.
+
+Cleaned the public surface around runtime supervision by deprecating the older
+`kafkaman-axum` supervision half and making the facade shadow the canonical
+runtime names. Removed `Subsystems::non_destructive()` and the dead
+`_meta_is_public` rustdoc helper, changed `Replay::outbox::<T>()` to stop
+accepting an ignored version, re-exported the missing trace-context schema SQL
+helpers, made topic create re-verify after creation, and aligned the product
+worker's default consumer group with the HTTP service.
+
+Fixed the review's documentation and wiki hygiene findings: topic create wording
+in the example config, duplicate proposal numbering, stale status vocabulary,
+the orphan M2 plan index entry, the dead local-only decision link, and the M7
+compatibility amendments. Also fixed the CI/local test surface so CI calls
+`just` recipes directly and `just test all` builds/passes the example binary
+paths required by the telemetry binary suite.
+
+Verification:
+
+- `just lint` passed.
+- `rtk just features` passed.
+- `just test all` passed.
+- `rtk git diff --check` and `rtk git diff --cached --check` passed.
+- Focused gates run during remediation also passed: durable receive, durable
+  send, observability admin HTTP, product worker check, clippy, opt-out, and the
+  affected order/product example tests.
+
+Pages affected include `wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/compatibility/typed-idempotency-identity-api.compat.md`,
+`wiki/compatibility/topic-convergence-api.compat.md`,
+`wiki/compatibility/runtime-builder-and-axum.compat.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`, `wiki/index.md`, and `wiki/log.md`.
+
+## [2026-08-31] closeout | M7/V1 documentation
+
+Completed M7 Phase 5. The repository README now states that M7 implementation
+is closed and release management remains. The examples documentation now matches
+the current builder, no-HTTP worker, admin route, retention, topic, failure, and
+test-tier surfaces, including the seven asserted failure scenarios and the
+separate Redpanda/Postgres full-loop gate.
+
+Promoted the V1 acceptance envelope to `wiki/specs/v1-acceptance.spec.md`.
+Amended the active M1, M4, and M6 specs with the M7 evidence for real-broker
+ack-before-mark duplicate absorption, Redpanda-input retry/DLQ/redrive, and
+read-only ingest quarantine summaries. Amended the runtime-composition decision
+to correct the old subsystem-default claim: `RuntimeBuilder::new()` defaults to
+`Subsystems::all()` for compatibility, while `Subsystems::PIPELINE` is the
+no-purge worker preset.
+
+Closed `wiki/plans/m7-v1-hardening.plan.md`, updated the V1 roadmap to `Ready
+for V1 tag`, and refreshed `wiki/index.md`.
+
+Verification:
+
+- `rtk cargo fmt --all -- --check` passed.
+- `rtk git diff --check` passed.
+- `rtk cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+- `rtk cargo test --workspace --all-features --lib` passed with 317 tests across 18 suites.
+- `rtk cargo test --workspace --lib` passed with 317 tests across 18 suites.
+- `rtk just lint` passed outside the sandbox after the sandboxed run hit the known Axum local-socket `PermissionDenied`.
+
+Pages affected: `README.md`, `examples/README.md`, `examples/order/README.md`,
+`examples/product/README.md`, `examples/order/kafkaman.toml`,
+`examples/product/kafkaman.toml`, `examples/product/src/http.rs`,
+`kafkaman.example.toml`, `wiki/specs/v1-acceptance.spec.md`,
+`wiki/specs/m1-durable-send.spec.md`, `wiki/specs/m4-retry-backoff-dlq.spec.md`,
+`wiki/specs/m6-observability-operability.spec.md`,
+`wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/decisions/runtime-composition-and-topology.decision.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`, `wiki/plans/m7-v1-hardening.plan.md`,
+`wiki/index.md`, and `wiki/log.md`.
+
+## [2026-08-31] implement | M7 phase 4 full-loop acceptance
+
+Completed M7 Phase 4 by tightening the broker-backed acceptance tier rather than
+adding new public surface. The existing `redpanda_full_loop` suite already
+covered broker publish/readback, ingest, dispatch, duplicate ingest, poison
+quarantine, consecutive-skip breaker behavior, offset-commit uncertainty, and
+consume-then-produce success. The remaining high-risk gaps were the send-side
+ack-before-mark crash window through a real broker and retry/DLQ/redrive from
+real broker input.
+
+Added `ack_before_mark_republish_is_deduplicated_after_real_broker_hop`, which
+publishes with `RdkafkaPublisher`, leaves the outbox row in `Publishing`, expires
+the claim, republishes through the harness relay, ingests both broker records,
+and proves only the first source offset is retained and the handler runs once.
+
+Added `redpanda_input_exhausts_dlq_and_redrives_to_success`, which publishes a
+real broker record, ingests it, exhausts a two-attempt dispatch retry budget,
+observes the terminal `Failed` row, redrives it with history/source offset
+preserved, and processes it successfully.
+
+The fast gate also exposed two quality issues that were fixed in the same phase:
+a public `kafkaman-core` doc comment linked to a private macro module under
+`cargo doc -D warnings`, and the facade Axum external-shutdown test cancelled
+immediately after spawn instead of waiting for the listener.
+
+Verification:
+
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop ack_before_mark_republish_is_deduplicated_after_real_broker_hop -- --nocapture` passed with 1 test.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop redpanda_input_exhausts_dlq_and_redrives_to_success -- --nocapture` passed with 1 test.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --features redpanda --test redpanda_full_loop -- --test-threads=1 --nocapture` passed with 13 tests.
+- `rtk cargo test -p distributed-cache-tests --test two_service_cache -- --test-threads=1 --nocapture` passed with 3 tests.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive retry_budget -- --nocapture` passed with 3 tests.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive redrive -- --nocapture` passed with 6 tests.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_send ack_before_mark -- --nocapture` passed with 1 test.
+- `rtk cargo test -p kafkaman --all-features running_service_wait_allows_http_exit_after_external_shutdown -- --nocapture` passed with 1 test.
+- `rtk just lint` passed outside the sandbox after the sandboxed workspace lib
+  test hit local-socket `PermissionDenied`.
+
+Pages affected: `tests/durable-send/tests/redpanda_full_loop/main.rs`,
+`tests/durable-send/tests/redpanda_full_loop/ingest_dedup.rs`,
+`tests/durable-send/tests/redpanda_full_loop/retry_dlq.rs`,
+`crates/kafkaman-core/src/failure_kind.rs`, `crates/kafkaman/src/axum.rs`,
+`wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/plans/m7-v1-hardening.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-31] implement | M7 phase 3 worker-role topology
+
+Completed M7 Phase 3 by making worker-role topology an explicit facade builder
+choice. Added `Subsystems` and `RuntimeBuilder::subsystems(Subsystems)` so roles
+continue to declare schema, topics, table handles, and handlers, while a host
+binary selects only the loops this process owns. The default remains
+`Subsystems::all()`, preserving existing builder behavior; purgers still require
+both `Subsystems::PURGE` and `[retention]`.
+
+Added `Subsystems::PIPELINE` as the no-purge worker preset for relay, ingest,
+dispatch, and queue metrics. Consumer-group validation now keys off selected
+ingest rather than consumed roles, so dispatch-only and migration-only workers do
+not require a Kafka group they never use.
+
+The `examples/product` package now ships `product-worker`, a no-HTTP binary that
+uses the facade builder, the product derive handler, and
+`.subsystems(Subsystems::PIPELINE)` without Axum, a listener, or table/transport
+internals. Source-level and Redpanda/Postgres tests pin the worker surface and
+selected-loop counts.
+
+Verification:
+
+- `rtk cargo test -p kafkaman --all-features subsystem` passed with 1 test.
+- `rtk cargo test -p kafkaman --all-features dispatch_only_runtime` passed with 1 test.
+- `rtk cargo check -p example-product --bin product-worker` passed.
+- `rtk cargo test -p distributed-cache-tests --test boot_surface` passed with 4 tests.
+- `rtk cargo test -p distributed-cache-tests --test runtime_builder -- --nocapture` passed with 1 test.
+- `rtk cargo test -p kafkaman --all-features` passed with 25 tests.
+- `rtk cargo test -p example-product --all-targets` passed with 11 tests.
+- `rtk cargo clippy -p kafkaman -p example-product -p distributed-cache-tests --all-targets --all-features -- -D warnings` was clean.
+- `rtk cargo fmt --all -- --check` was clean.
+
+Pages affected: `crates/kafkaman/src/runtime/subsystems.rs`,
+`crates/kafkaman/src/runtime/builder.rs`, `crates/kafkaman/src/runtime/mod.rs`,
+`crates/kafkaman/src/runtime/tests.rs`, `crates/kafkaman/src/lib.rs`,
+`examples/product/Cargo.toml`, `examples/product/src/bin/worker.rs`,
+`tests/distributed-cache/tests/runtime_builder.rs`,
+`tests/distributed-cache/tests/boot_surface.rs`, `README.md`,
+`examples/README.md`, `wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/compatibility/runtime-builder-and-axum.compat.md`,
+`wiki/plans/m7-v1-hardening.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-31] implement | M7 phase 2 facade runtime supervision
+
+Completed M7 Phase 2 by hardening the facade runtime supervisor. `RuntimeTasks`
+now treats clean loop completion before shutdown as a supervision error, even
+when the caller goes directly to `shutdown()`. Shutdown is bounded by
+`DEFAULT_DRAIN_TIMEOUT` by default, callers can use `shutdown_with_timeout`, and
+stragglers are aborted after the bound. A loop error observed during drain
+outranks a later timeout from another wedged task.
+
+Loop names are now owned strings so builder-created tasks can include role and
+message type: `relay:{message_type}`, `purger:{message_type}`,
+`ingester:{message_type}`, and `dispatcher:{message_type}`. Panic errors also
+carry the named loop. The facade Axum wrapper exposes
+`RunningService::shutdown_with_timeout` and has tests for clean external HTTP
+shutdown and delegated drain timeout.
+
+Updated the public doc examples to store the `wait()` result, drain, and then
+combine both results, so supervision failures still get cleanup.
+
+Verification:
+
+- `rtk cargo test -p kafkaman --all-features runtime` passed with 21 tests.
+- `rtk cargo test -p kafkaman --all-features running_service -- --nocapture` passed with 2 tests.
+- `rtk cargo test -p kafkaman --all-features` passed with 23 tests.
+- `rtk cargo test -p kafkaman --all-features --doc` passed with 2 doctests.
+- `rtk cargo test -p kafkaman-worker` passed with 2 tests.
+- `rtk cargo test -p kafkaman-axum --all-features runtime` passed with 5 tests.
+- `rtk cargo test -p kafkaman-axum --all-features` passed with 25 tests and 2 ignored.
+- `rtk cargo test -p distributed-cache-tests --test runtime_builder -- --nocapture` passed with 1 test.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_send relay_and_publish -- --nocapture` passed with 5 tests.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive dispatcher_loop -- --nocapture` passed with 2 tests.
+- `rtk cargo test -p observability-tests --test queue_gauges -- --nocapture` passed with 1 test.
+- `rtk cargo test -p observability-tests --test queue_gauge_staleness -- --nocapture` passed with 1 test.
+- `rtk cargo test -p observability-tests --test queue_gauge_ordering -- --nocapture` passed with 1 test.
+- `rtk cargo clippy -p kafkaman --all-targets --all-features -- -D warnings` was clean.
+- `rtk cargo fmt --all -- --check` was clean.
+
+Pages affected: `crates/kafkaman/src/runtime/tasks.rs`,
+`crates/kafkaman/src/runtime/error.rs`,
+`crates/kafkaman/src/runtime/builder.rs`, `crates/kafkaman/src/runtime/mod.rs`,
+`crates/kafkaman/src/runtime/tests.rs`, `crates/kafkaman/src/axum.rs`,
+`crates/kafkaman/src/lib.rs`, `wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/plans/m7-v1-hardening.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-31] implement | M7 phase 1 quarantine growth visibility
+
+Completed M7 Phase 1 by keeping the storage policy conservative and making the
+remaining unbounded surface visible. Outbox remains the only table family with a
+purge loop. Received rows are still retained because they are the
+processed-marker/dedupe ledger; cache rows are still retained because they are
+state; ingest quarantine rows are still retained because they are the only
+durable diagnosis for records skipped before a received row existed.
+
+Added `kafkaman_sqlx::ReceivedIngestFailureSummary` and
+`received_ingest_failure_summary(pool, cfg, now)`, grouped by `message_type`,
+`expected_topic`, and `failure_kind`, with count and oldest-row age. Added
+read-only `GET /ingest-failures` to `kafkaman_axum::admin_router`. The route is
+summary-only: it does not return quarantined payloads, headers, keys, or stored
+error strings.
+
+Also corrected the root README's stale active-milestone line from M5 to M7 and
+documented the new operator route in the example README. Corrected the retention
+docs to distinguish `RuntimeBuilder` services, which auto-start configured
+purgers for published roles, from low-level manually wired services, which must
+still spawn `run_purger`.
+
+Verification:
+
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test durable_receive received_ingest_failure_summary -- --nocapture` passed with 1 test.
+- `rtk cargo test --manifest-path tests/durable-send/Cargo.toml --test outbox_retention -- --nocapture` passed with 8 tests.
+- `rtk cargo test -p kafkaman-core purge_config` passed with 2 tests.
+- `rtk cargo test -p kafkaman-config retention` passed with 2 tests.
+- `rtk cargo test -p observability-tests --test admin_http every_admin_route_answers_over_http -- --nocapture` passed with 1 test.
+- `rtk cargo test -p kafkaman-axum --all-features` passed with 25 tests and 2 ignored.
+- `rtk cargo test -p kafkaman-sqlx --lib the_shipped_example_config_resolves_and_covers_every_section` passed with 1 test.
+- `rtk cargo clippy -p kafkaman-sqlx -p kafkaman-axum -p observability-tests --all-targets --all-features -- -D warnings` was clean.
+- `rtk cargo clippy --manifest-path tests/durable-send/Cargo.toml --test outbox_retention --all-features -- -D warnings` was clean.
+- `rtk cargo fmt --all -- --check` was clean.
+
+Pages affected: `crates/kafkaman-sqlx/src/operability.rs`,
+`crates/kafkaman-sqlx/src/lib.rs`, `crates/kafkaman-axum/src/lib.rs`,
+`tests/durable-send/tests/durable_receive/`, `tests/observability/tests/admin_http.rs`,
+`tests/durable-send/tests/outbox_retention.rs`, `README.md`,
+`kafkaman.example.toml`, `examples/README.md`,
+`wiki/compatibility/m5-outbox-retention.compat.md`,
+`wiki/compatibility/m7-hardening-api.compat.md`,
+`wiki/plans/m7-v1-hardening.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-08-31] update | M7 phase 0 baseline validated
+
+Completed the M7 baseline phase without code changes. The branch already carries
+the corrected panic breaker that counts distinct panicking rows rather than
+attempts, and the focused regression suite proved the exact shapes that matter:
+one poison row below the breaker, two poison rows below the breaker, distinct
+rows tripping it, and successful work clearing the streak.
+
+Verification: `rtk cargo test --manifest-path tests/durable-send/Cargo.toml
+--test durable_receive dispatch_handler_panic -- --nocapture` passed with 9
+tests; `rtk cargo test -p kafkaman-core dispatcher_config` passed with 4 tests;
+`rtk cargo test -p kafkaman-config dispatcher` passed with 6 tests.
+
+Pages affected: `wiki/plans/m7-v1-hardening.plan.md`, `wiki/index.md`,
+`wiki/log.md`.
+
+## [2026-08-31] create | M7 V1 hardening plan
+
+Created the active M7 execution plan and linked it from the V1 roadmap and wiki
+index. The plan scopes M7 as ship-quality hardening rather than a new product
+pillar, with separate phase commits for panic-breaker baseline validation,
+storage-growth policy, graceful shutdown ordering, worker-role topology polish,
+full-loop testcontainers acceptance, and docs/examples closeout.
+
+Pages affected: `wiki/plans/m7-v1-hardening.plan.md`, `wiki/index.md`,
+`wiki/roadmaps/path-to-v1.roadmap.md`, `wiki/log.md`.
+
 ## [2026-08-30] implement | a refused record is a reported failure
 
 Three things the M6 work had left open, closed before the milestone merges.

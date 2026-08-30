@@ -48,7 +48,7 @@ fn a_service_may_publish_and_consume_the_same_message_type() {
     assert_eq!(
         roles.changelog().unwrap().len(),
         4,
-        "init_schema plus outbox, received and cache for the one type"
+        "init_schema plus outbox, received, and cache for the one type"
     );
 }
 
@@ -150,9 +150,9 @@ fn every_conflict_is_detectable_without_a_pool_or_a_broker() {
 // ---------------------------------------------------------------------------
 
 /// The whole point: a service author says "I publish orders and cache products",
-/// and the four changesets they used to hand-number fall out of it.
+/// and the changesets they used to hand-number fall out of it.
 #[test]
-fn the_order_services_roles_generate_its_four_changesets() {
+fn the_order_services_roles_generate_their_changesets() {
     let mut roles = RoleRegistry::new();
     roles.declare(order(), Role::Publish).unwrap();
     roles.declare(product(), Role::Cache).unwrap();

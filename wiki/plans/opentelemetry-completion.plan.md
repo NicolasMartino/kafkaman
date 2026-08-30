@@ -1,7 +1,7 @@
 # OpenTelemetry Completion Plan
 
 - Document Class: Plan
-- Status: Active — Phases 0-3, 5, and 6 completed 2026-08-25 and corrected across two review passes on 2026-08-25/26; Phase 4's example pipeline and compose profile ported 2026-08-27, its end-to-end exit run the same day (it failed, and the fix is recorded in Phase 4), the data view shipped 2026-08-29 with `just examples all`, leaving only a packaged Kibana dashboard outstanding
+- Status: Active
 - Date: 2026-08-25
 - Category: Observability execution
 - Scope: Turns M6's OpenTelemetry instrumentation into a working, verified, exportable telemetry pipeline — metrics, traces, and logs — and proves it end to end against a real backend.

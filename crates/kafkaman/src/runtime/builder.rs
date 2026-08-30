@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kafkaman_config::Config;
-use kafkaman_core::{DispatcherConfig, KafkaMessage, MessageDescriptor, PurgeConfig, ReceivedMeta};
+use kafkaman_core::{DispatcherConfig, KafkaMessage, MessageDescriptor, PurgeConfig};
 use kafkaman_rdkafka::{converge_topics, RdkafkaConsumer, RdkafkaPublisher, TopicAdmin};
 use kafkaman_sqlx::{
     migrate, BeforeHandlerFuture, HandlerFuture, MessageRouter, MigrationContext, OutboxTable,
@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::context::{HandlerCtx, RuntimeContext};
 use super::error::{BuildError, RuntimeError};
+use super::subsystems::Subsystems;
 use super::tasks::{BoxError, LoopFuture, RuntimeTasks};
 
 /// Installs one registered handler into the router, once the config is resolved.
@@ -102,8 +103,9 @@ struct ConsumedType {
 ///     .await?;
 ///
 /// let mut tasks = runtime.into_tasks()?;
-/// tasks.wait().await?;
-/// tasks.shutdown().await?;
+/// let first = tasks.wait().await;
+/// let drained = tasks.shutdown().await;
+/// first.and(drained)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -114,6 +116,7 @@ pub struct RuntimeBuilder {
     brokers: Option<String>,
     consumer_group: Option<String>,
     migration_context: Option<MigrationContext>,
+    subsystems: Subsystems,
     roles: RoleRegistry,
     installers: Vec<RouterInstaller>,
     consumed: BTreeMap<String, ConsumedType>,
@@ -128,6 +131,7 @@ impl std::fmt::Debug for RuntimeBuilder {
             .field("roles", &self.roles)
             .field("brokers", &self.brokers)
             .field("consumer_group", &self.consumer_group)
+            .field("subsystems", &self.subsystems)
             .field("errors", &self.errors.len())
             .finish_non_exhaustive()
     }
@@ -180,6 +184,18 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn migration_context(mut self, ctx: MigrationContext) -> Self {
         self.migration_context = Some(ctx);
+        self
+    }
+
+    /// Which runtime loops this process should start.
+    ///
+    /// Roles still decide the schema, topics, and table handles. Subsystems only
+    /// decide the running topology. The default is [`Subsystems::all`];
+    /// [`Subsystems::PURGE`] requires an explicit `[retention]` section before
+    /// any purger loop is started, which is what makes that default safe.
+    #[must_use]
+    pub fn subsystems(mut self, subsystems: Subsystems) -> Self {
+        self.subsystems = subsystems;
         self
     }
 
@@ -339,6 +355,11 @@ impl RuntimeBuilder {
             return Err(BuildError::NoRoles);
         }
         let consumer_group = match self.consumed.values().next() {
+            // Dispatch-only and migration-only workers need the consumed tables,
+            // handlers, and topics, but they never join Kafka. Requiring a
+            // group for them would make the topology selector cosmetic rather
+            // than operational.
+            Some(_) if !self.subsystems.contains(Subsystems::INGEST) => self.consumer_group,
             Some(consumed) => {
                 Some(
                     self.consumer_group
@@ -430,6 +451,7 @@ impl RuntimeBuilder {
             brokers,
             consumer_group,
             retention,
+            subsystems: self.subsystems,
             router,
             published,
             consumed,
@@ -470,6 +492,7 @@ pub struct Runtime {
     brokers: String,
     consumer_group: Option<String>,
     retention: Option<PurgeConfig>,
+    subsystems: Subsystems,
     router: MessageRouter,
     published: Vec<OutboxTable>,
     consumed: Vec<ConsumedPlan>,
@@ -480,6 +503,7 @@ impl std::fmt::Debug for Runtime {
         f.debug_struct("Runtime")
             .field("brokers", &self.brokers)
             .field("consumer_group", &self.consumer_group)
+            .field("subsystems", &self.subsystems)
             .field("published", &self.published.len())
             .field("consumed", &self.consumed.len())
             .field("router", &self.router)
@@ -506,12 +530,13 @@ impl Runtime {
 
     /// Construct every loop and start it, under a fresh cancellation token.
     ///
-    /// The loops are one relay per published type, one ingester and one
-    /// dispatcher per consumed type, a purger when `[retention]` is configured,
-    /// and — under the `metrics` feature, when this runtime owns any outbox or
-    /// received table — a single queue-depth sampler covering all of them. Count
-    /// on the roles you declared, not on a fixed number: the sampler in
-    /// particular appears or not depending on a feature.
+    /// The default loop set is one relay per published type, one ingester and
+    /// one dispatcher per consumed type, a purger when `[retention]` is
+    /// configured, and — under the `metrics` feature, when this runtime owns any
+    /// outbox or received table — a single queue-depth sampler covering all of
+    /// them. [`RuntimeBuilder::subsystems`] can narrow that set for worker-role
+    /// binaries. Count on the roles and subsystems you declared, not on a fixed
+    /// number: the sampler in particular appears or not depending on a feature.
     pub fn into_tasks(self) -> Result<RuntimeTasks, BuildError> {
         self.into_tasks_with(CancellationToken::new())
     }
@@ -525,7 +550,8 @@ impl Runtime {
     pub fn into_tasks_with(self, shutdown: CancellationToken) -> Result<RuntimeTasks, BuildError> {
         let pool = self.context.pool().clone();
         let cfg = Arc::clone(self.context.config());
-        let mut loops: Vec<(&'static str, LoopFuture)> = Vec::new();
+        let subsystems = self.subsystems;
+        let mut loops: Vec<(String, LoopFuture)> = Vec::new();
 
         // Cloned before the role loops below take ownership of the originals.
         //
@@ -540,33 +566,39 @@ impl Runtime {
         // obtain it without giving up the property the builder exists to provide,
         // which is why the example ran without these gauges for as long as it did.
         #[cfg(feature = "metrics")]
-        let queue_outbox: Vec<OutboxTable> = self.published.clone();
+        let queue_outbox: Vec<OutboxTable> = if subsystems.contains(Subsystems::QUEUE_METRICS) {
+            self.published.clone()
+        } else {
+            Vec::new()
+        };
         #[cfg(feature = "metrics")]
-        let queue_received: Vec<ReceivedTable> = self
-            .consumed
-            .iter()
-            .map(|plan| plan.received.clone())
-            .collect();
+        let queue_received: Vec<ReceivedTable> = if subsystems.contains(Subsystems::QUEUE_METRICS) {
+            self.consumed
+                .iter()
+                .map(|plan| plan.received.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         for outbox in self.published {
-            let publisher = RdkafkaPublisher::from_brokers(&self.brokers).map_err(|source| {
-                BuildError::Transport {
-                    brokers: self.brokers.clone(),
-                    source,
-                }
-            })?;
-            let relay_cfg = cfg.relay.clone();
+            let message_type = outbox.descriptor.message_type.as_str().to_owned();
             let retention = self.retention.clone();
             let purge_table = outbox.clone();
-            // Cloned before the relay's future takes ownership of its own.
-            let purge_pool = pool.clone();
-            let purge_shutdown = shutdown.clone();
 
-            {
+            if subsystems.contains(Subsystems::RELAY) {
+                let publisher =
+                    RdkafkaPublisher::from_brokers(&self.brokers).map_err(|source| {
+                        BuildError::Transport {
+                            brokers: self.brokers.clone(),
+                            source,
+                        }
+                    })?;
+                let relay_cfg = cfg.relay.clone();
                 let pool = pool.clone();
                 let shutdown = shutdown.clone();
                 loops.push((
-                    "relay",
+                    format!("relay:{message_type}"),
                     Box::pin(async move {
                         kafkaman_worker::run(pool, publisher, outbox, relay_cfg, shutdown)
                             .await
@@ -577,80 +609,85 @@ impl Runtime {
 
             // Only when `[retention]` is configured. Absent means nothing is
             // deleted, which is the status quo and the safe default.
-            if let Some(purge_cfg) = retention {
-                let pool = purge_pool;
-                let shutdown = purge_shutdown;
-                loops.push((
-                    "purger",
-                    Box::pin(async move {
-                        kafkaman_worker::run_purger(pool, purge_table, purge_cfg, shutdown)
-                            .await
-                            .map_err(|err| Box::new(err) as BoxError)
-                    }),
-                ));
+            if subsystems.contains(Subsystems::PURGE) {
+                if let Some(purge_cfg) = retention {
+                    let pool = pool.clone();
+                    let shutdown = shutdown.clone();
+                    loops.push((
+                        format!("purger:{message_type}"),
+                        Box::pin(async move {
+                            kafkaman_worker::run_purger(pool, purge_table, purge_cfg, shutdown)
+                                .await
+                                .map_err(|err| Box::new(err) as BoxError)
+                        }),
+                    ));
+                }
             }
         }
 
         for consumed in self.consumed {
-            let group =
-                self.consumer_group
-                    .as_deref()
-                    .ok_or_else(|| BuildError::MissingConsumerGroup {
+            if subsystems.contains(Subsystems::INGEST) {
+                let group = self.consumer_group.as_deref().ok_or_else(|| {
+                    BuildError::MissingConsumerGroup {
                         message_type: consumed.message_type.clone(),
-                    })?;
-            let consumer =
-                RdkafkaConsumer::from_brokers(&self.brokers, group).map_err(|source| {
-                    BuildError::Transport {
-                        brokers: self.brokers.clone(),
-                        source,
                     }
                 })?;
-            consumer
-                .subscribe(&[consumed.topic.as_str()])
-                .map_err(|source| BuildError::Transport {
-                    brokers: self.brokers.clone(),
-                    source,
-                })?;
+                let consumer =
+                    RdkafkaConsumer::from_brokers(&self.brokers, group).map_err(|source| {
+                        BuildError::Transport {
+                            brokers: self.brokers.clone(),
+                            source,
+                        }
+                    })?;
+                consumer
+                    .subscribe(&[consumed.topic.as_str()])
+                    .map_err(|source| BuildError::Transport {
+                        brokers: self.brokers.clone(),
+                        source,
+                    })?;
 
-            loops.push((
-                "ingester",
-                (consumed.start_ingest)(
-                    consumer,
-                    pool.clone(),
-                    Arc::clone(&cfg),
-                    cfg.relay.retry_after,
-                    shutdown.clone(),
-                ),
-            ));
+                loops.push((
+                    format!("ingester:{}", consumed.message_type),
+                    (consumed.start_ingest)(
+                        consumer,
+                        pool.clone(),
+                        Arc::clone(&cfg),
+                        cfg.relay.retry_after,
+                        shutdown.clone(),
+                    ),
+                ));
+            }
 
-            let pool = pool.clone();
-            let router = self.router.clone();
-            // Pacing and the panic breaker come from `[dispatcher]`; the
-            // lifecycle policy is per message type, so it is layered on here
-            // rather than resolved once for every dispatcher.
-            let dispatcher_cfg = DispatcherConfig {
-                lifecycle: cfg
-                    .observability
-                    .policy_for(&consumed.message_type)
-                    .lifecycle_emission(),
-                ..cfg.dispatcher.clone()
-            };
-            let received = consumed.received;
-            let shutdown = shutdown.clone();
-            loops.push((
-                "dispatcher",
-                Box::pin(async move {
-                    kafkaman_worker::run_dispatcher(
-                        pool,
-                        received,
-                        router,
-                        dispatcher_cfg,
-                        shutdown,
-                    )
-                    .await
-                    .map_err(|err| Box::new(err) as BoxError)
-                }),
-            ));
+            if subsystems.contains(Subsystems::DISPATCH) {
+                let pool = pool.clone();
+                let router = self.router.clone();
+                // Pacing and the panic breaker come from `[dispatcher]`; the
+                // lifecycle policy is per message type, so it is layered on here
+                // rather than resolved once for every dispatcher.
+                let dispatcher_cfg = DispatcherConfig {
+                    lifecycle: cfg
+                        .observability
+                        .policy_for(&consumed.message_type)
+                        .lifecycle_emission(),
+                    ..cfg.dispatcher.clone()
+                };
+                let received = consumed.received;
+                let shutdown = shutdown.clone();
+                loops.push((
+                    format!("dispatcher:{}", consumed.message_type),
+                    Box::pin(async move {
+                        kafkaman_worker::run_dispatcher(
+                            pool,
+                            received,
+                            router,
+                            dispatcher_cfg,
+                            shutdown,
+                        )
+                        .await
+                        .map_err(|err| Box::new(err) as BoxError)
+                    }),
+                ));
+            }
         }
 
         // Queue depth and age, sampled once for every table this runtime derived.
@@ -662,7 +699,9 @@ impl Runtime {
         // nothing to sample does not open a Postgres connection every interval to
         // ask about no tables.
         #[cfg(feature = "metrics")]
-        if !queue_outbox.is_empty() || !queue_received.is_empty() {
+        if subsystems.contains(Subsystems::QUEUE_METRICS)
+            && (!queue_outbox.is_empty() || !queue_received.is_empty())
+        {
             // `pool` is not cloned: this is its last use, and the sampler is the
             // final loop assembled.
             let shutdown = shutdown.clone();
@@ -674,7 +713,7 @@ impl Runtime {
                 ..Default::default()
             };
             loops.push((
-                "queue-metrics",
+                "queue-metrics".to_owned(),
                 Box::pin(async move {
                     match kafkaman_worker::run_queue_metrics(
                         pool,
@@ -726,7 +765,3 @@ impl Runtime {
         first.and(drained)
     }
 }
-
-/// Only used to keep `ReceivedMeta` in the public docs graph of this module.
-#[allow(dead_code)]
-fn _meta_is_public(_: &ReceivedMeta) {}

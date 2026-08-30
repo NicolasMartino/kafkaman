@@ -1,20 +1,20 @@
 # Direct Transport Mode
 
-Document Class: Proposal
-Status: Proposed
-Date: 2026-06-21
-Category: Runtime modes
-Scope: Proposes explicit non-durable Kafka producer and consumer modes for workloads that intentionally bypass kafkaman's Postgres message ledger.
-Sources:
-- User design discussion, 2026-06-21
-- wiki/index.md
-- wiki/proposals/01-kafkaman-objectives.proposal.md
-- wiki/decisions/messaging-scope-and-receive-model.decision.md
-- wiki/decisions/message-consumption-and-handler-model.decision.md
-- wiki/decisions/runtime-composition-and-topology.decision.md
-Related:
-- wiki/proposals/04-observability-logging-policy.proposal.md
-- wiki/roadmaps/path-to-v1.roadmap.md
+- Document Class: Proposal
+- Status: Proposed
+- Date: 2026-06-21
+- Category: Runtime modes
+- Scope: Proposes explicit non-durable Kafka producer and consumer modes for workloads that intentionally bypass kafkaman's Postgres message ledger.
+- Sources:
+  - User design discussion, 2026-06-21
+  - wiki/index.md
+  - wiki/proposals/01-kafkaman-objectives.proposal.md
+  - wiki/decisions/messaging-scope-and-receive-model.decision.md
+  - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/runtime-composition-and-topology.decision.md
+- Related:
+  - wiki/proposals/04-observability-logging-policy.proposal.md
+  - wiki/roadmaps/path-to-v1.roadmap.md
 
 ## Context
 

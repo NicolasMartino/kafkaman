@@ -1,25 +1,15 @@
 # Wiki Index
 
 Project: kafkaman
-Stage: M6 observability completed; M7 hardening active; runtime-builder examples
-shipped; example OpenTelemetry wiring active; `just examples all` ships the
-Kibana data view, Kafka handoff panel, Elastic APM enrichment, and parented
-example Kafka handoff; APM trace samples show the product-to-order flow in one
-trace, while `just examples handoffs` remains the linked-mode/debug helper;
-binary telemetry gate asserts APM waterfall span shape/kind and excludes default
-empty poll spans; reviewed and fixed the same day, including bounded unmatched
-routes, documented trace-volume knobs, and one shared span shape in
-`kafkaman-core`; then `kafkaman.handler`, an opt-in `kafkaman::internal` span
-tier behind its own `RUST_LOG` target, and the durable-capture fix that tier
-uncovered — continuous profiling measured and not adopted; then the failure side:
-handler panics contained rather than fatal, a `/faults` switch on `product`, the
-operator routes mounted and fixed, `RuntimeBuilder` made to honour `[retry]`, and
-`just examples faults` driving six asserted failure scenarios into a Kibana
-failed-transaction panel plus failure-detail panel; failed receive attempts now
-mark `kafkaman.dispatch` as failed and carry bounded failure stage/kind fields;
-then a review pass that found the new panic breaker counted attempts rather than
-rows and so re-broke the very case it was added to protect
-Updated: 2026-08-30
+Stage: M7 hardening complete. Phase 0 validated the distinct-row panic breaker.
+Phase 1 completed storage-growth policy by keeping outbox as the only purged
+table family and adding read-only ingest quarantine summaries. Phase 2 hardened
+facade runtime supervision with early clean-exit errors, named loop failures,
+and bounded drain. Phase 3 added explicit subsystem selection and a no-HTTP
+product worker. Phase 4 completed the Redpanda/Postgres full-loop acceptance
+pass. Phase 5 promoted the V1 acceptance envelope and closed implementation
+status. Release tagging remains outside the M7 implementation milestone.
+Updated: 2026-08-31
 
 One-line: A Rust library plus optional worker runtime for Kafka-backed
 distributed caches of compact domain entity snapshots, using Postgres as the
@@ -30,7 +20,8 @@ durable entity propagation ledger and local cache store.
 - [specs/m1-durable-send.spec.md](specs/m1-durable-send.spec.md) - Validated M1
   durable-send behavior: transactional enqueue, per-type outbox DDL, minimal
   migrate, claim-lease relay, publisher boundary, Harness seed, and Axum example.
-  Status: Active.
+  M7 adds real-broker evidence that ack-before-mark republish duplicates are
+  absorbed before dispatch side effects repeat. Status: Active.
 - [specs/m2-change-engine-config.spec.md](specs/m2-change-engine-config.spec.md) -
   Validated M2 behavior: `kafkaman.toml` loader, fail-fast resolved config,
   migration reports, checksums, `applied_by`, `changelog!`, dry-run, and guarded
@@ -41,6 +32,7 @@ durable entity propagation ledger and local cache store.
   bounded error history, the `received_failed_rows`/`received_failed_count` DLQ
   inspect surface with `ReceivedFailureFilter`, and guarded `Replay::received`
   redrive (kind filter, history-preserving by default, opt-in `clear_history`).
+  M7 adds broker-input retry/DLQ/redrive acceptance evidence.
   Status: Active.
 - [specs/entity-first-propagation.spec.md](specs/entity-first-propagation.spec.md)
   - Validated M5 entity-cache behavior: required `entity_key`, per-type cache
@@ -67,7 +59,14 @@ durable entity propagation ledger and local cache store.
   redrive route lives in its own router, the queue gauges read a snapshot a
   background loop maintains rather than querying from the callback, and M6 ships
   no example-application change at all — `apps/` is byte-identical to `main`.
+  M7 adds read-only ingest quarantine summaries to the admin route surface.
   Status: Active.
+- [specs/v1-acceptance.spec.md](specs/v1-acceptance.spec.md) - Validated V1
+  acceptance envelope after M7: compact entity-cache propagation; durable send
+  and receive; retry, DLQ, and redrive; entity cache convergence; runtime
+  builder and worker topology; bounded supervision; admin/telemetry surfaces;
+  explicit storage-growth policy; and the fast plus testcontainers evidence
+  that backs those claims. Status: Active.
 
 ## Reviews
 
@@ -139,6 +138,16 @@ durable entity propagation ledger and local cache store.
 
 ## Compatibility
 
+- [compatibility/v1-legacy-removal.compat.md](compatibility/v1-legacy-removal.compat.md)
+  - Everything deleted before the V1 tag because it existed only for a database
+  or a caller that never existed: the duplicate `kafkaman-axum` supervision
+  surface, all nine upgrade changesets (received template slot 1 → 0, so V1 is
+  one create per table), the nullable `changelog_history` checksum path, and the
+  pre-RFC-9457 `ReceivedError` field aliases. Also records the legacy-string
+  idempotency namespace rename, which changes every string-derived digest, and
+  the two things that read as legacy and were deliberately kept. Read this
+  before assuming any older compat note's upgrade path still exists.
+  Status: Active.
 - [compatibility/m1-durable-send-schema-and-api-changes.compatibility.md](compatibility/m1-durable-send-schema-and-api-changes.compatibility.md)
   - Records the review-fix schema/API changes: durable `idempotency_key` column
   plus its `AddIdempotencyKey` upgrade changeset for pre-existing tables,
@@ -148,7 +157,7 @@ durable entity propagation ledger and local cache store.
   - M2 schema/API changes: nullable `checksum` and `applied_by`
     `changelog_history` columns, `migrate(..., MigrationContext, ...) ->
     MigrationReport` signature break, dry-run, and guarded replay behavior.
-    Status: Draft.
+    Status: Active.
 - [compatibility/m3-durable-receive-review-fix-api.compat.md](compatibility/m3-durable-receive-review-fix-api.compat.md)
   - M3 receive review-fix API and operational-data changes:
     `IngestStats.skipped`, `RdkafkaConsumer::Error::UnexpectedTopic`,
@@ -251,6 +260,20 @@ durable entity propagation ledger and local cache store.
     `kafkaman.failure.{kind,type,stage}` attributes; the example dashboard splits
     failed transactions from failure-detail spans.
     Status: Active.
+- [compatibility/m7-hardening-api.compat.md](compatibility/m7-hardening-api.compat.md)
+  - M7 hardening surface. Phase 1 adds the SQL
+  `received_ingest_failure_summary` and read-only
+  `GET /ingest-failures` admin route for schema-wide quarantine growth
+  visibility, without adding any quarantine purge behavior. Phase 2 adds bounded
+  facade runtime drain, early clean-exit supervision errors, named loop panic
+  reporting, and role/message-specific builder task names. Phase 3 adds
+  `Subsystems`, `RuntimeBuilder::subsystems`, the no-purge `PIPELINE` preset,
+  ingest-scoped consumer-group validation, and the `product-worker` no-HTTP
+  example. Phase 4 adds no public surface but records broker-backed acceptance
+  for relay ack-before-mark republish dedupe and Redpanda-input
+  retry/DLQ/redrive. Phase 5 adds no API surface and records the V1 acceptance
+  spec/docs closeout.
+  Status: Active.
 
 - [compatibility/dispatch-handler-ordering.compat.md](compatibility/dispatch-handler-ordering.compat.md)
   - Breaking and **silent**: `MessageRouter::handler` now runs after the cache
@@ -264,7 +287,7 @@ durable entity propagation ledger and local cache store.
     Status: Active.
 - [compatibility/runtime-builder-and-axum.compat.md](compatibility/runtime-builder-and-axum.compat.md)
   - Additive: `RuntimeBuilder`, `Runtime`, `RuntimeContext`, `RuntimeTasks`,
-    `HandlerCtx`, `BuildError`/`RuntimeError`, and a re-exported
+    `HandlerCtx`, `Subsystems`, `BuildError`/`RuntimeError`, and a re-exported
     `CancellationToken` on the facade behind the existing `rdkafka` feature, plus
     a new `axum` feature carrying `kafkaman::axum`. Adds `Role`/`RoleRegistry`
     and the generated-version scheme to `kafkaman-sqlx`. Records that generated
@@ -493,17 +516,22 @@ durable entity propagation ledger and local cache store.
   enqueue/relay core. Amended 2026-08-26: the planned `kafkaman-axum` crate
   becomes `kafkaman::axum` behind a feature on the facade. The HTTP-free core
   boundary this decision draws is unchanged and is why the later decision holds;
-  only the crate boundary became a module boundary. Status: Draft.
+  only the crate boundary became a module boundary. Amended 2026-08-31:
+  subsystem selection ships with `RuntimeBuilder::new()` defaulting to
+  `Subsystems::all()` for compatibility, while `Subsystems::PIPELINE` is the
+  no-purge worker preset. Ratified 2026-08-31 at the V1 gate; point 5's
+  `axum-sqlx-tx` `Sender` extractor and quarantined non-transactional send were
+  never built, so the send-side UX is point 6's explicit
+  `kafkaman::sqlx::enqueue`. Status: Accepted.
 - [decisions/runtime-builder-and-axum-composition.decision.md](decisions/runtime-builder-and-axum-composition.decision.md)
   - Core kafkaman gets a role-driven runtime builder for
     publish/cache/handle/handle_before declarations, generated kafkaman
     changelogs identified by `(role, message_type, template_version)`, topic
     convergence, migrations, worker loops, and shutdown wiring. Axum composition
     ships as a facade feature rather than a separate crate, retiring the planned
-    `kafkaman-axum`; the builder takes a `PgPool` and an explicit `Meter` and
-    never resolves a global. A normative list of host-owned concerns keeps the
-    Tokio runtime, business schema, signals, process exit, telemetry install,
-    config discovery, and the **topic-creation decision** with the caller —
+    `kafkaman-axum`. A normative list of host-owned concerns keeps the Tokio
+    runtime, business schema, signals, process exit, telemetry install, config
+    discovery, and the **topic-creation decision** with the caller —
     `build()` runs convergence in whatever mode the host configured and never
     defaults to or upgrades to `create`. Generated version bands carry a
     normative width, reserved range, hash-stability rule, and collision error.
@@ -535,10 +563,16 @@ durable entity propagation ledger and local cache store.
   dogfooding-first where tests sit at or above toolkit abstractions. Durable-send
   Postgres tests now use owned containers per test/harness because
   Testcontainers cleanup is `Drop`-based and static `OnceCell<ContainerAsync<_>>`
-  sharing leaked containers. Status: Draft.
+  sharing leaked containers. Ratified 2026-08-31 at the V1 gate; point 5's
+  injected `Clock` was never built — retry eligibility comes from the database
+  clock, so time-dependent tests set `next_attempt_at` directly. Status: Accepted.
 - [decisions/consumer-test-tooling.decision.md](decisions/consumer-test-tooling.decision.md)
   - `kafkaman-test` is the consumer-facing test toolkit with Harness,
-  deterministic one-step drivers, and future macro sugar. Status: Draft.
+  deterministic one-step drivers, and future macro sugar. Ratified 2026-08-31 at
+  the V1 gate as direction only: the `tower` `oneshot` handler tests, the
+  injectable `Clock`, `#[kafkaman::test]` and its macro crate, the `TestMessage`
+  builders and assertion family, and the `testcontainers` feature were never
+  built. What ships is the smaller explicit `Harness`. Status: Accepted.
 
 - [decisions/topic-convergence-and-rebuild.decision.md](decisions/topic-convergence-and-rebuild.decision.md)
   - A topic's required configuration belongs on `MessageDescriptor`, defaulted to
@@ -556,16 +590,18 @@ durable entity propagation ledger and local cache store.
 
 - [roadmaps/path-to-v1.roadmap.md](roadmaps/path-to-v1.roadmap.md) - Seven
   milestones to V1. M1 durable send, M2 change-engine/config, M3 durable
-  receive, M4 retry/DLQ, M5 entity-first propagation, and M6 observability are all Completed,
-  merged, and promoted to specs.
-  **Updated 2026-08-13:** entity-first propagation is Active as M5 ahead of
+  receive, M4 retry/DLQ, M5 entity-first propagation, M6 observability, and M7
+  hardening are completed and promoted to specs or closeout records.
+  **Updated 2026-08-13:** entity-first propagation was inserted as M5 ahead of
   observability, because it changes the table layout dashboards would otherwise
   be built on; observability and hardening shift to M6 and M7. **Updated
   2026-08-14:** M5 is compact entity-cache purview only; delete-retention
   work-item APIs are removed from the public surface. **Updated 2026-08-24:**
   M5 is completed; M6 observability proceeded in parallel with the two-service
-  example. **Updated 2026-08-24:** M6 is completed; M7 hardening is active while
-  the two-service example remains active in parallel. Status: Draft.
+  example. **Updated 2026-08-24:** M6 is completed and M7 hardening was the
+  remaining V1 milestone. **Updated 2026-08-31:** M7 is completed,
+  `v1-acceptance.spec.md` records the accepted envelope, and the roadmap is
+  ready for a V1 tag. Status: Completed.
 
 ## References
 
@@ -668,7 +704,7 @@ durable entity propagation ledger and local cache store.
     of carrying `delete` compatibility forward. Status: Accepted, promoted as
     amendments to the entity-first propagation and messaging-scope decisions.
 
-- [proposals/13-topic-convergence-and-environment-provisioning.proposal.md](proposals/13-topic-convergence-and-environment-provisioning.proposal.md)
+- [proposals/23-topic-convergence-and-environment-provisioning.proposal.md](proposals/23-topic-convergence-and-environment-provisioning.proposal.md)
   - Closes the deferred boot-time compact-topic validation, and establishes topic
   rebuild as the answer to repartitioning. Motivated by direct evidence: the
   example services were observed running with `cleanup.policy=delete` on both
@@ -772,6 +808,15 @@ durable entity propagation ledger and local cache store.
 
 ## Plans
 
+- [plans/m7-v1-hardening.plan.md](plans/m7-v1-hardening.plan.md)
+  - Completed execution plan for the final V1 hardening milestone. Phase 0
+  validated the distinct-row panic breaker on 2026-08-31; Phase 1 added
+  quarantine-growth visibility without adding purge behavior; Phase 2 hardened
+  facade runtime shutdown ordering and supervision; Phase 3 added explicit
+  subsystem selection and a no-HTTP `product-worker` example; Phase 4 completed
+  broker-backed full-loop acceptance for the highest-risk durable windows; Phase
+  5 promoted the V1 acceptance envelope and closed docs/examples status.
+  Status: Completed.
 - [plans/failure-taxonomy-separation.plan.md](plans/failure-taxonomy-separation.plan.md)
   - Executes the taxonomy/blame decision in five phases: the single coarsening in
   `kafkaman-core`, one disposition function replacing two, `FailureStage` made
@@ -887,10 +932,16 @@ durable entity propagation ledger and local cache store.
 - [plans/m1-durable-send-implementation.plan.md](plans/m1-durable-send-implementation.plan.md)
 - Code-level M1 implementation plan for workspace/crate layout, core types,
 SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
+- [plans/m2-change-engine-config.plan.md](plans/m2-change-engine-config.plan.md)
+- Completed M2 execution plan for config parsing, changelog history checksums,
+  dry-run previews, migration context, and the original replay guardrails later
+  narrowed by entity-first outbox replay rejection. Status: Completed.
 - [plans/m3-durable-receive.plan.md](plans/m3-durable-receive.plan.md)
-- Active M3 execution plan for durable receive: received tables, deterministic
+- M3 execution plan for durable receive: received tables, deterministic
   dispatch, handler API, Harness maturity, and Kafka ingest. First Postgres
-  storage/dispatch slice implemented 2026-06-21. Status: Active.
+  storage/dispatch slice implemented 2026-06-21; closed 2026-08-31, with the
+  extractor/Tower, `Clock`, test-macro, and derive work recorded as deferred
+  rather than pending. Status: Completed.
 - [plans/m3-durable-completion.plan.md](plans/m3-durable-completion.plan.md)
 - Sequenced completion of M3 after the first slice and its review fixes.
   Tests-lead phases: harden the `dispatch_once` seam against the deep-testing
@@ -976,7 +1027,7 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
   were demonstrated by deliberate breakage rather than assumed. All five phases
   landed 2026-08-25: `example-provision` builds the databases and the compacted
   topics, both services verify at boot, `examples/initdb` is gone, and both M5
-  compatibility notes strike the boot-time-validation deferral. Status: Complete.
+  compatibility notes strike the boot-time-validation deferral. Status: Completed.
 
 ## Checklists
 

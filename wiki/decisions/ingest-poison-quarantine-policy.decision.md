@@ -1,12 +1,12 @@
 # Ingest Poison Quarantine Policy
 
-Document Class: Decision
-Status: Accepted
-Date: 2026-06-22
-Category: Durable receive ingest safety
-Scope: Defines how Kafka ingest handles malformed records, schema/deploy mismatches, and receive identity conflicts before committing offsets.
-Sources: wiki/reviews/m3-durable-completion-implementation-review.reference.md; wiki/plans/m3-durable-completion.plan.md
-Related: wiki/decisions/kafka-ingest-identity-and-ordering.decision.md; wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- Document Class: Decision
+- Status: Accepted
+- Date: 2026-06-22
+- Category: Durable receive ingest safety
+- Scope: Defines how Kafka ingest handles malformed records, schema/deploy mismatches, and receive identity conflicts before committing offsets.
+- Sources: wiki/reviews/m3-durable-completion-implementation-review.reference.md; wiki/plans/m3-durable-completion.plan.md
+- Related: wiki/decisions/kafka-ingest-identity-and-ordering.decision.md; wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
 
 ## Decision
 

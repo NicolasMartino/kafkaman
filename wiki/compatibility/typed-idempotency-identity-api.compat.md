@@ -22,10 +22,26 @@ unstructured optional string. The public typed model is:
 - `IdempotencyIdentity`: digest plus optional retained source material.
 
 `Envelope::with_idempotency_key` accepts values that convert into
-`IdempotencyIdentity`; the retained legacy string-source conversion derives a
-digest under a compatibility namespace. New code should prefer explicit
+`IdempotencyIdentity`; a bare string converts by deriving a digest under a
+dedicated namespace. New code should prefer explicit
 `IdempotencyIdentity::derive(namespace, source)` calls so the business identity
 namespace is visible.
+
+Amended 2026-08-31: that conversion was previously framed as a retained *legacy*
+compatibility path. It is kept as a deliberate convenience for callers whose
+identity genuinely is one already-unique string, and renamed to say so —
+`derive_legacy_string` becomes `derive_from_string`, and
+`LEGACY_STRING_IDEMPOTENCY_NAMESPACE` (`"kafkaman:legacy-string:v1"`) becomes
+`STRING_SOURCE_IDEMPOTENCY_NAMESPACE` (`"kafkaman:string-source:v1"`). **The
+namespace is hashed into the digest, so every key derived from a bare string
+changes** — safe only because no stored key existed yet, and the last time that
+will be true. See [v1-legacy-removal](v1-legacy-removal.compat.md).
+
+Amended 2026-08-31: `IdempotencyIdentity::derive` renders canonical JSON with
+recursively sorted object keys before hashing. This preserves the pinned digest
+format while removing the old dependency on serde_json's default map ordering;
+an adopter enabling serde_json's `preserve_order` feature no longer changes
+derived keys through Cargo feature unification.
 
 Outbox and received rows now expose typed `idempotency_key` fields and
 `idempotency_source` JSON values. Fresh outbox/received table DDL includes

@@ -11,7 +11,7 @@
 - Sources:
   - crates/kafkaman-core/src/lib.rs
   - crates/kafkaman-sqlx/src/lib.rs
-  - wiki/proposals/13-topic-convergence-and-environment-provisioning.proposal.md
+  - wiki/proposals/23-topic-convergence-and-environment-provisioning.proposal.md
 - Related:
   - wiki/decisions/entity-first-propagation-model.decision.md
   - wiki/proposals/12-entity-only-message-model.proposal.md

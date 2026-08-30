@@ -21,14 +21,13 @@ use crate::{IdempotencyKey, OutboxStatus, ReceiveStatus, ReceivedFailureKind};
 /// extension member, which RFC 9457 permits.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReceivedError {
-    /// RFC 9457 `type`. Reads also accept the pre-problem-detail `kind` field.
-    #[serde(rename = "type", alias = "kind", with = "crate::problem_type", default)]
+    /// RFC 9457 `type`.
+    #[serde(rename = "type", with = "crate::problem_type", default)]
     pub kind: ReceivedFailureKind,
     /// RFC 9457 `title`: human-readable summary of the failure class.
     #[serde(default)]
     pub title: String,
     /// RFC 9457 `detail`: explanation specific to this occurrence.
-    #[serde(alias = "message")]
     pub detail: String,
     /// RFC 9457 extension member carrying an RFC 9557 timestamp.
     #[serde(with = "crate::rfc9557")]

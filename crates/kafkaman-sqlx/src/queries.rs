@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use kafkaman_core::{
-    IdempotencyKey, ReceiveStatus, ReceivedError, ReceivedFailureKind, ReceivedRow,
+    IdempotencyKey, InstrumentDb, ReceiveStatus, ReceivedError, ReceivedFailureKind, ReceivedRow,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -25,6 +25,11 @@ pub async fn received_row(
     let row = sqlx::query(&sql)
         .bind(message_id)
         .fetch_optional(pool)
+        .instrument_db(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "select received row by message id"
+        ))
         .await?;
     row.map(received_row_from_pg).transpose()
 }
@@ -42,6 +47,11 @@ pub async fn received_row_by_idempotency_key(
     let row = sqlx::query(&sql)
         .bind(idempotency_key.to_string())
         .fetch_optional(pool)
+        .instrument_db(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "select received row by idempotency key"
+        ))
         .await?;
     row.map(received_row_from_pg).transpose()
 }
@@ -108,7 +118,15 @@ pub async fn received_failed_rows(
         where_sql = received_failed_where_sql(filter)?,
         failure_order = received_failure_order_sql(),
     );
-    let rows = sqlx::query(&sql).bind(limit.max(0)).fetch_all(pool).await?;
+    let rows = sqlx::query(&sql)
+        .bind(limit.max(0))
+        .fetch_all(pool)
+        .instrument_db(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "select received failed rows"
+        ))
+        .await?;
     rows.into_iter().map(received_row_from_pg).collect()
 }
 
@@ -125,7 +143,14 @@ pub async fn received_failed_count(
         name = table.qualified_name(),
         where_sql = received_failed_where_sql(filter)?,
     );
-    Ok(sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await?)
+    Ok(sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .instrument_db(kafkaman_core::db_span!(
+            "SELECT",
+            table.qualified_name(),
+            "count received failed rows"
+        ))
+        .await?)
 }
 
 /// The column carrying the time of the most recent recorded failure.

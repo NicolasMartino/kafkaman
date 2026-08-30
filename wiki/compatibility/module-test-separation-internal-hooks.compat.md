@@ -1,12 +1,12 @@
 # Module/Test Separation and Internal Hooks Compatibility
 
-Document Class: Compatibility Note
-Status: Active
-Date: 2026-08-25
-Category: Test API and source organization compatibility
-Scope: Records the M6-prep refactor that keeps production crates smaller and moves test-hook ergonomics behind `kafkaman-test`.
-Sources: crates/kafkaman-sqlx/src/lib.rs; crates/kafkaman-sqlx/src/migration_runner.rs; crates/kafkaman-core/src/lib.rs; crates/kafkaman-config/src/config.rs; crates/kafkaman-test/src/harness.rs; tests/durable-send/src/lib.rs
-Related: wiki/decisions/consumer-test-tooling.decision.md; wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+- Document Class: Compatibility Note
+- Status: Active
+- Date: 2026-08-25
+- Category: Test API and source organization compatibility
+- Scope: Records the M6-prep refactor that keeps production crates smaller and moves test-hook ergonomics behind `kafkaman-test`.
+- Sources: crates/kafkaman-sqlx/src/lib.rs; crates/kafkaman-sqlx/src/migration_runner.rs; crates/kafkaman-core/src/lib.rs; crates/kafkaman-config/src/config.rs; crates/kafkaman-test/src/harness.rs; tests/durable-send/src/lib.rs
+- Related: wiki/decisions/consumer-test-tooling.decision.md; wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
 
 ## Summary
 

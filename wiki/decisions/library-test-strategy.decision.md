@@ -1,7 +1,7 @@
 # Library Test Strategy (testing kafkaman itself)
 
 - Document Class: Decision
-- Status: Draft
+- Status: Accepted
 - Date: 2026-06-20
 - Category: Quality and testing
 - Scope: How kafkaman is tested internally — the test pyramid, infrastructure, the durability/idempotency invariants that must be covered, and CI gates. The consumer-facing test *toolkit* kafkaman ships is a separate concern (see the consumer test-tooling decision).
@@ -16,6 +16,32 @@
   - wiki/decisions/consumer-test-tooling.decision.md
   - wiki/decisions/schema-and-change-management.decision.md
   - wiki/plans/first-poc-outbox-publisher.plan.md
+
+## Ratification, 2026-08-31: accepted, with point 5's mechanism corrected
+
+The V1 roadmap held this decision at `Draft` behind a revisit gate that ratifies
+only what a milestone validates. The strategy is now visible in the tree and the
+status moves to `Accepted`: the three tiers exist (`cargo test --workspace --lib`
+in the fast gate, the Postgres suites under `tests/`, and the Redpanda full loop);
+`testcontainers` containers are owned per test/harness rather than shared through
+statics; the crash-injection gates of point 3 are real files, not intentions; the
+invariants of point 4 have randomized coverage — redelivery convergence, bounded
+`errors`, concurrent `migrate()`; and point 6's gates run as `just lint`,
+`just features`, and a separate coverage-floor job.
+
+**Point 5's mechanism did not survive contact with the implementation.** It says
+time-dependent tests "advance the injected `Clock`". There is no `Clock` type in
+the workspace and no injection seam for one, because retry eligibility is
+computed from the *database* clock (`now() + interval`) so that claim eligibility
+and retry eligibility share one clock — an application-side `Clock` would not
+have governed the thing the tests need to move. Those tests set `next_attempt_at`
+directly in SQL instead. The half of the promise that carries the value holds:
+schedulers are stepped explicitly through `dispatch_once` rather than auto-started.
+The literal "never `sleep`" does not — the full-loop and telemetry tiers poll for
+convergence with real sleeps, which is a property of waiting on a broker, not of
+scheduler nondeterminism. See the matching note in
+[consumer-test-tooling](consumer-test-tooling.decision.md), which specifies the
+same `Clock` from the consumer side.
 
 ## Decision
 

@@ -11,6 +11,7 @@
 mod builder;
 mod context;
 mod error;
+mod subsystems;
 mod tasks;
 
 #[cfg(test)]
@@ -19,7 +20,11 @@ mod tests;
 pub use builder::{Runtime, RuntimeBuilder};
 pub use context::{HandlerCtx, RuntimeContext};
 pub use error::{BuildError, RuntimeError};
-pub use tasks::RuntimeTasks;
+pub use subsystems::Subsystems;
+pub use tasks::{RuntimeTasks, DEFAULT_DRAIN_TIMEOUT};
+
+#[doc(inline)]
+pub use kafkaman_core::ReceivedMeta;
 
 pub use tasks::BoxError as BoxLoopError;
 

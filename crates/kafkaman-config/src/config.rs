@@ -31,8 +31,17 @@ impl Config {
 
         loop {
             let candidate = current.join("kafkaman.toml");
-            if candidate.exists() {
+            if candidate.is_file() {
                 return Self::from_path(candidate).map(Some);
+            }
+            if candidate.exists() {
+                return Err(ConfigError::Io {
+                    path: candidate,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "kafkaman.toml exists but is not a regular file",
+                    ),
+                });
             }
 
             if !current.pop() {

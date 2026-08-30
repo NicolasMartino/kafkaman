@@ -29,11 +29,19 @@ The reason is a gap in the migration engine rather than a style preference.
 `version;name;message_type;topic` — it does not cover the DDL at all. An
 in-place template edit is therefore invisible: existing databases keep the old
 shape, fresh ones get the new shape, and the checksum matches either way. That
-has already happened — `create_outbox_table_sql` contains `idempotency_key`,
-`idempotency_source`, and `entity_key`, which is exactly what
-`AddIdempotencyKey`, `AddIdempotencySource`, and `AddOutboxEntityKey` exist to
-catch up. A fresh database replaying create-then-alter costs a few extra
-statements and is always correct.
+happened repeatedly before V1 — `create_outbox_table_sql` gained
+`idempotency_key`, `idempotency_source`, and `entity_key` by in-place edit, and
+`AddIdempotencyKey`, `AddIdempotencySource`, and `AddOutboxEntityKey` were
+written to catch up the databases those edits had stranded.
+
+**Amended 2026-08-31.** Those catch-up changesets were removed at the V1 tag,
+because the stranded databases only ever existed on developer machines and
+freezing their repair into the shipped changelog would have made kafkaman's
+development history part of every adopter's first migration. Every table kind is
+back at template slot 0. This does not weaken the rule above — it is the reason
+the rule starts binding *now*: from the tag the templates are shipped, and the
+next change to any of them is an upgrade changeset rather than an edit. See
+[v1-legacy-removal](../compatibility/v1-legacy-removal.compat.md).
 
 Generated changelogs additionally identify changesets by
 `(role, message_type, template_version)` rather than registration order, since

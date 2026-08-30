@@ -1,18 +1,18 @@
 # Dispatch Stats Semantics
 
-Document Class: Decision
-Status: Accepted
-Date: 2026-06-22
-Category: Durable receive
-Scope: Meaning of `DispatchStats` counters returned by `dispatch_once` and the receive dispatcher loop.
-Sources:
-- wiki/plans/m3-durable-completion.plan.md
-- wiki/reviews/m3-durable-receive-implementation-review.reference.md
-- crates/kafkaman-sqlx/src/lib.rs
-- tests/durable-send/tests/durable_receive.rs
-Related:
-- wiki/decisions/missing-handler-dispatch-policy.decision.md
-- wiki/decisions/dispatch-infrastructure-error-classification.decision.md
+- Document Class: Decision
+- Status: Accepted
+- Date: 2026-06-22
+- Category: Durable receive
+- Scope: Meaning of `DispatchStats` counters returned by `dispatch_once` and the receive dispatcher loop.
+- Sources:
+  - wiki/plans/m3-durable-completion.plan.md
+  - wiki/reviews/m3-durable-receive-implementation-review.reference.md
+  - crates/kafkaman-sqlx/src/lib.rs
+  - tests/durable-send/tests/durable_receive.rs
+- Related:
+  - wiki/decisions/missing-handler-dispatch-policy.decision.md
+  - wiki/decisions/dispatch-infrastructure-error-classification.decision.md
 
 ## Decision
 

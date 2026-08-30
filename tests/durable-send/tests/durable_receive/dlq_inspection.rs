@@ -2,6 +2,87 @@
 use super::*;
 
 #[tokio::test]
+async fn received_ingest_failure_summary_reports_quarantine_growth_without_payloads() -> TestResult
+{
+    let _test_guard = receive_test_lock().lock().await;
+    let (_postgres, harness) = start_harness().await?;
+    let cfg = harness.config();
+
+    let seed = [
+        (
+            11,
+            "orders",
+            "orders",
+            "order_created",
+            ReceivedIngestFailureKind::InvalidPayload,
+            "payload was not json",
+        ),
+        (
+            12,
+            "orders",
+            "orders",
+            "order_created",
+            ReceivedIngestFailureKind::InvalidPayload,
+            "payload was still not json",
+        ),
+        (
+            21,
+            "wrong-orders",
+            "orders",
+            "order_created",
+            ReceivedIngestFailureKind::UnexpectedTopic,
+            "unexpected topic",
+        ),
+    ];
+    for (offset, source_topic, expected_topic, message_type, kind, error) in seed {
+        let failure = ReceivedIngestFailure {
+            source_topic: source_topic.to_owned(),
+            source_partition: 0,
+            source_offset: offset,
+            key: Some(format!("key-{offset}").into_bytes()),
+            headers: serde_json::json!({ "kafka": ["header"] }),
+            payload: Some(format!("payload-{offset}").into_bytes()),
+            message_type: message_type.to_owned(),
+            expected_topic: expected_topic.to_owned(),
+            kind,
+            error: error.to_owned(),
+        };
+        let mut tx = harness.pool().begin().await?;
+        assert!(
+            insert_received_ingest_failure(&mut tx, &cfg, &failure).await?,
+            "each source offset is unique and should insert"
+        );
+        tx.commit().await?;
+    }
+
+    let summary =
+        received_ingest_failure_summary(harness.pool(), &cfg, OffsetDateTime::now_utc()).await?;
+    assert_eq!(summary.len(), 2);
+
+    let invalid_payload = summary
+        .iter()
+        .find(|row| row.failure_kind == ReceivedIngestFailureKind::InvalidPayload)
+        .expect("invalid payload bucket should be present");
+    assert_eq!(invalid_payload.message_type, "order_created");
+    assert_eq!(invalid_payload.expected_topic, "orders");
+    assert_eq!(invalid_payload.count, 2);
+    assert!(
+        invalid_payload.oldest_age_ms < 60_000,
+        "a just-written quarantine bucket should report a bounded age, got {}ms",
+        invalid_payload.oldest_age_ms
+    );
+
+    let unexpected_topic = summary
+        .iter()
+        .find(|row| row.failure_kind == ReceivedIngestFailureKind::UnexpectedTopic)
+        .expect("unexpected-topic bucket should be present");
+    assert_eq!(unexpected_topic.expected_topic, "orders");
+    assert_eq!(unexpected_topic.count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn received_failed_rows_inspect_surface_lists_terminal_dlq_rows() -> TestResult {
     let _test_guard = receive_test_lock().lock().await;
     let schema = format!("kafkaman_dlq_{}", uuid::Uuid::new_v4().simple());

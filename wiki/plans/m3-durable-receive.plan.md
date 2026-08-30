@@ -1,22 +1,23 @@
 # M3 Durable Receive Implementation Plan
 
-Document Class: Plan
-Status: Active
-Date: 2026-06-21
-Category: Delivery execution
-Scope: Tactical implementation sequence for M3 durable receive, deterministic dispatch, and receive-side toolkit maturity.
-Sources:
-- wiki/roadmaps/path-to-v1.roadmap.md
-- wiki/decisions/message-consumption-and-handler-model.decision.md
-- wiki/decisions/consumer-test-tooling.decision.md
-- wiki/decisions/library-test-strategy.decision.md
-- wiki/decisions/schema-and-change-management.decision.md
-- wiki/decisions/message-identity-and-header-namespace.decision.md
-- wiki/decisions/retry-backoff-dlq-policy.decision.md
-Related:
-- wiki/specs/m1-durable-send.spec.md
-- wiki/specs/m2-change-engine-config.spec.md
-- wiki/roadmaps/path-to-v1.roadmap.md
+- Document Class: Plan
+- Status: Completed
+- Date: 2026-06-21
+- Category: Delivery execution
+- Scope: Tactical implementation sequence for M3 durable receive, deterministic dispatch, and receive-side toolkit maturity.
+- Sources:
+  - wiki/roadmaps/path-to-v1.roadmap.md
+  - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/consumer-test-tooling.decision.md
+  - wiki/decisions/library-test-strategy.decision.md
+  - wiki/decisions/schema-and-change-management.decision.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
+- Related:
+  - wiki/specs/m1-durable-send.spec.md
+  - wiki/specs/m2-change-engine-config.spec.md
+  - wiki/specs/m3-durable-receive.spec.md
+  - wiki/roadmaps/path-to-v1.roadmap.md
 
 ## Deliverable
 
@@ -33,10 +34,9 @@ the handler stack inside the same kafkaman-owned transaction, and commits the
 handler's business writes plus kafkaman's `Processed` mark together.
 
 Received rows do not get M1-style persistent claim/lease columns in M3. The row
-lock is the claim. `Processing` is an in-transaction transition for the dispatch
-path, not a durable lease state that another worker can reclaim. A crash or
-process kill during dispatch rolls back the transaction, leaving the row in its
-prior claimable state with no committed business effect.
+lock is the claim. Dispatch never commits a durable `Processing` state; a crash
+or process kill during dispatch rolls back the transaction, leaving the row in
+its prior claimable state with no committed business effect.
 
 This accepts a deliberate tradeoff: a dispatch worker holds one Postgres
 connection and one row lock while user code runs. M3 controls the blast radius
@@ -63,8 +63,8 @@ controlling the bound timestamp.
 - Greenfield received-table identity with `idempotency_key NOT NULL` and a
   per-type unique constraint from creation.
 - Dedup-as-log insert behavior using per-type unique `idempotency_key`.
-- Receive row state machine needed by dispatch: `Pending`, `Processing`,
-  `Processed`, `Retryable`, and `Failed`.
+- Receive row state machine needed by dispatch: `Pending`, `Processed`,
+  `Retryable`, and `Failed`.
 - Nullable `next_attempt_at` for parked M3 retryables; due rows use an injected
   `Clock` timestamp.
 - Bounded `errors` JSONB ring that M4 retry/backoff/DLQ will reuse.
@@ -238,10 +238,22 @@ Adding `tower` to workspace dependencies is part of M3, but the HTTP-specific
   "land at least metadata access" bar (M1) and documents the L3 nullability choice
   inline. The broader `FromMessage`/`Rx`/state and Tower handler abstractions
   remain pending.
-- Remaining M3 work: `FromMessage`/`Rx`/state extractors and Tower layer
-  compatibility, `Replay::received::<T>`, injected Harness `Clock`,
-  `#[kafkaman::test]`, derive macro, Kafka ingest, and full-loop Redpanda
-  coverage.
+- 2026-08-31 (closure): this plan is marked `Completed`. It had stood at `Active`
+  since 2026-06-21 while every one of its closure criteria was met elsewhere —
+  `wiki/specs/m3-durable-receive.spec.md` exists and the roadmap has recorded M3
+  as completed since M4 opened.
+
+  Of the "Remaining M3 work" this section previously listed, three shipped and
+  four were dropped. Shipped: `Replay::received::<T>`, the Kafka ingest engine
+  with offset-after-durable-write, and full-loop Redpanda coverage under
+  `tests/durable-send/tests/redpanda_full_loop/`. Never built, and now recorded
+  as deferred rather than pending: `FromMessage`/`Rx`/state extractors with Tower
+  layer compatibility, the injected `Harness` `Clock`, `#[kafkaman::test]`, and
+  `#[derive(KafkaMessage)]` — the last is still open as `Proposed` proposal 16.
+  The accepted M3 handler surface is the minimal closure-based one, which the
+  spec states directly. See the 2026-08-31 ratification notes on
+  [consumer-test-tooling](../decisions/consumer-test-tooling.decision.md) and
+  [library-test-strategy](../decisions/library-test-strategy.decision.md).
 
 ## Wiki Updates
 

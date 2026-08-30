@@ -43,6 +43,52 @@ async fn worker_run_loop_relays_until_shutdown() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn worker_run_loop_continues_after_non_empty_batches() -> TestResult {
+    let (_postgres, harness) = start_harness().await?;
+    let table = harness.outbox_table::<OrderCreated>().await?;
+    let mut relay = harness.config().relay.clone();
+    relay.batch_limit = 1;
+    relay.poll_interval = Duration::from_secs(60);
+
+    for index in 0..2 {
+        harness
+            .enqueue(
+                &Envelope::new(OrderCreated {
+                    order_id: format!("order-backlog-{index}"),
+                })
+                .with_idempotency_key(format!("idem-order-backlog-{index}")),
+            )
+            .await?;
+    }
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(kafkaman_worker::run(
+        harness.pool().clone(),
+        harness.publisher(),
+        table,
+        relay,
+        shutdown.clone(),
+    ));
+
+    let drained = tokio::time::timeout(Duration::from_secs(2), async {
+        while harness.published_on(OrderCreated::TOPIC).len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    shutdown.cancel();
+    worker.await??;
+
+    assert!(
+        drained.is_ok(),
+        "a non-empty relay batch must continue immediately instead of sleeping on poll_interval"
+    );
+    assert_eq!(harness.published_on(OrderCreated::TOPIC).len(), 2);
+    Ok(())
+}
+
 /// A relay handed an already-cancelled token must publish nothing.
 ///
 /// The loop used to check for shutdown only *after* a cycle, so a relay started

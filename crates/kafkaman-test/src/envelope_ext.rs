@@ -7,7 +7,7 @@ use kafkaman_core::{Envelope, IntoIdempotencyIdentity};
 /// a library API. Tests pass literals they control, so panicking there is both
 /// safe and the clearest way to fail.
 pub trait EnvelopeTestExt: Sized {
-    /// Derive a legacy-string idempotency identity and attach it.
+    /// Derive an idempotency identity from the value and attach it.
     ///
     /// # Panics
     /// If the value is empty or whitespace.

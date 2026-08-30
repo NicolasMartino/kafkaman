@@ -93,9 +93,10 @@ pub fn build_router(state: AppState) -> Router {
 /// The operator routes kafkaman ships, mounted where an operator can reach them.
 ///
 /// `admin_router` is read-only — queue depth by status, rows stuck past their
-/// threshold, and the dead-letter queue. `redrive_router` is the one destructive
-/// route, and kafkaman keeps it in a separate router precisely so that mounting
-/// it is a decision rather than a side effect of wanting dashboards.
+/// threshold, ingest quarantine summaries, and the dead-letter queue.
+/// `redrive_router` is the one destructive route, and kafkaman keeps it in a
+/// separate router precisely so that mounting it is a decision rather than a
+/// side effect of wanting dashboards.
 ///
 /// # No authentication
 ///

@@ -11,21 +11,25 @@
 mod ingest_dedup;
 mod ingest_failures;
 mod publish_and_consume;
+mod retry_dlq;
 mod run_ingester;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use durable_send_tests::{
-    idem_hex, idem_key, recreate_effect_table, start_redpanda_harness, TestResult,
+    idem_hex, idem_key, postgres, recreate_effect_table, redpanda, retry_test_config,
+    start_redpanda_harness, unique_schema, TestResult,
 };
-use kafkaman_core::{Envelope, KafkaMessage, ReceivedIngestFailureKind};
-use kafkaman_rdkafka::{Error as RdkafkaError, RdkafkaConsumer};
+use kafkaman_core::{
+    Envelope, KafkaMessage, OutboxStatus, ReceiveStatus, ReceivedIngestFailureKind,
+};
+use kafkaman_rdkafka::{Error as RdkafkaError, RdkafkaConsumer, RdkafkaPublisher};
 use kafkaman_sqlx::{
-    dispatch_once, enqueue_on_connection, received_ingest_failure_by_source, CacheTable,
-    MessageRouter, ReceivedInsertOutcome,
+    claim_batch, dispatch_once, enqueue_on_connection, received_ingest_failure_by_source,
+    redrive_received, CacheTable, MessageRouter, ReceivedInsertOutcome, Replay,
 };
-use kafkaman_test::{EnvelopeTestExt, Error as HarnessError, RdkafkaConsumerTestExt};
+use kafkaman_test::{EnvelopeTestExt, Error as HarnessError, Harness, RdkafkaConsumerTestExt};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders};

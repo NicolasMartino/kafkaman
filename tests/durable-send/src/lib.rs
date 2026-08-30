@@ -70,12 +70,12 @@ pub async fn start_harness_with_config(config: Config) -> TestResult<(TestPostgr
     Ok((postgres, harness))
 }
 
-/// The digest a legacy string source derives to.
+/// The digest a string idempotency source derives to.
 ///
 /// Stored rows key on the digest, never the source, so an assertion about which
 /// row was written has to derive it the same way production does.
 pub fn idem_key(value: &str) -> IdempotencyKey {
-    IdempotencyIdentity::derive_legacy_string(value)
+    IdempotencyIdentity::derive_from_string(value)
         .expect("test idempotency source is valid")
         .key
 }

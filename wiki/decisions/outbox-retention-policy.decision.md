@@ -1,18 +1,18 @@
 # Outbox Retention Policy
 
-Document Class: Decision
-Status: Accepted
-Date: 2026-08-24
-Category: Operational model
-Scope: Which kafkaman tables are purged, on what window, by what mechanism, and which are never purged.
-Sources:
-- wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
-- review.md
-- crates/kafkaman-sqlx/src/lib.rs
-Related:
-- wiki/decisions/entity-first-propagation-model.decision.md
-- wiki/decisions/typed-idempotency-identity-and-error-row-symmetry.decision.md
-- wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md
+- Document Class: Decision
+- Status: Accepted
+- Date: 2026-08-24
+- Category: Operational model
+- Scope: Which kafkaman tables are purged, on what window, by what mechanism, and which are never purged.
+- Sources:
+  - wiki/proposals/11-restore-retention-and-schema-boundaries.proposal.md
+  - review.md
+  - crates/kafkaman-sqlx/src/lib.rs
+- Related:
+  - wiki/decisions/entity-first-propagation-model.decision.md
+  - wiki/decisions/typed-idempotency-identity-and-error-row-symmetry.decision.md
+  - wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md
 
 ## Decision
 

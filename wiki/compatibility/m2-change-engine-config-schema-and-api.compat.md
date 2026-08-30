@@ -1,12 +1,12 @@
 # M2 Change Engine Config Schema and API Changes
 
-Document Class: Compatibility Note
-Status: Draft
-Date: 2026-06-21
-Category: Schema and API compatibility
-Scope: Compatibility impact from M2 migration-engine maturity and config loading.
-Sources: wiki/plans/m2-change-engine-config.plan.md
-Related: wiki/specs/m2-change-engine-config.spec.md
+- Document Class: Compatibility Note
+- Status: Active
+- Date: 2026-06-21
+- Category: Schema and API compatibility
+- Scope: Compatibility impact from M2 migration-engine maturity and config loading.
+- Sources: wiki/plans/m2-change-engine-config.plan.md
+- Related: wiki/specs/m2-change-engine-config.spec.md
 
 ## Breaking API Changes
 

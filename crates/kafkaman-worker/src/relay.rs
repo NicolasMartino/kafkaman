@@ -209,11 +209,9 @@ async fn relay_once_inner<P: Publisher>(
 /// per-cycle failures are logged and retried, because a database blip must not
 /// take the relay down.
 ///
-/// Unlike [`run_dispatcher`](crate::run_dispatcher) and
-/// [`run_purger`](crate::run_purger), this sleeps after every cycle rather than
-/// continuing immediately on a non-empty batch. That means a backlog drains at
-/// one batch per poll interval. It is left as-is deliberately: changing it is a
-/// throughput change with its own timing consequences, not a tidy-up.
+/// Continues immediately whenever a cycle claimed rows, so a backlog drains at
+/// full speed rather than one batch per poll interval, and sleeps only when
+/// there was no work or a cycle failed.
 pub async fn run<P: Publisher>(
     pool: PgPool,
     publisher: P,
@@ -240,7 +238,7 @@ pub async fn run<P: Publisher>(
             break;
         }
 
-        match relay_once_inner(
+        let claimed = match relay_once_inner(
             &pool,
             &publisher,
             &table,
@@ -252,6 +250,7 @@ pub async fn run<P: Publisher>(
         {
             Ok(stats) => {
                 metrics.relay_stats(&stats);
+                let claimed = stats.claimed;
                 if stats.claimed > 0 {
                     tracing::debug!(
                         claimed = stats.claimed,
@@ -262,6 +261,7 @@ pub async fn run<P: Publisher>(
                         "relay cycle complete"
                     );
                 }
+                claimed
             }
             Err(err) => {
                 metrics.error();
@@ -269,7 +269,12 @@ pub async fn run<P: Publisher>(
                     error = %err,
                     "relay cycle failed; retrying after poll interval"
                 );
+                0
             }
+        };
+
+        if claimed > 0 {
+            continue;
         }
 
         if !sleep_or_shutdown(cfg.poll_interval, &shutdown).await {

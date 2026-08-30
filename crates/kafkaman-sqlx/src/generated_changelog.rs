@@ -154,11 +154,11 @@ pub fn band_of(version: i64) -> i64 {
 
 /// Upgrade changesets for a table kind, for slots `1..=template_version`.
 ///
-/// Empty for all three kinds today: every shipped template is at slot 0. This is
-/// the function a template bump extends — see the note at the top of
-/// `schema_sql.rs`. It exists now, rather than being added with the first
-/// upgrade, so that the slot arithmetic it depends on is exercised and pinned
-/// before anything relies on it.
+/// Empty at V1: every table kind is still on template slot 0, its original
+/// create, because nothing has shipped for an upgrade to repair. This is the
+/// function a template bump extends — see the note at the top of
+/// `schema_sql.rs`. A bump without a matching entry here would move fresh
+/// databases forward while leaving existing databases on the old shape.
 fn upgrades(kind: TableKind, _descriptor: &MessageDescriptor) -> Vec<Box<dyn Changeset>> {
     match kind {
         TableKind::Outbox | TableKind::Received | TableKind::Cache => Vec::new(),

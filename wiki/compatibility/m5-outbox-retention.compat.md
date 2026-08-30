@@ -76,8 +76,11 @@ Index Scan, no sort, 0.47 ms over a 200k-row table.
    changeset exists to fix — that is a real outage window, and because `enqueue`
    runs inside the caller's business transaction it propagates into application
    requests. Apply it during a maintenance window on a large table.
-4. Add a `[retention]` section and spawn `run_purger` to actually reclaim anything.
-   Without both, the index is built and nothing uses it.
+4. Add a `[retention]` section to actually reclaim anything. A service booted
+   through `RuntimeBuilder` starts purgers for its published roles automatically
+   when that section is present. A low-level service that wires loops manually
+   must still spawn `run_purger` itself. Without a configured purger, the index
+   is built and nothing uses it.
 
 `kafkaman.example.toml` documents every knob the crate reads, with an inline
 comment per field. It is now loaded and resolved by a unit test

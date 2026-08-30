@@ -1,22 +1,22 @@
 # Observability and Logging Policy
 
-Document Class: Proposal
-Status: Accepted
-Date: 2026-06-21
-Category: Observability
-Scope: Proposes configurable tracing, logging, metrics, and payload-safety policy for kafkaman, including per-message-type overrides.
-Sources:
-- User design discussion, 2026-06-21
-- wiki/proposals/01-kafkaman-objectives.proposal.md
-- wiki/decisions/configuration-and-environment-model.decision.md
-- wiki/decisions/message-consumption-and-handler-model.decision.md
-- wiki/decisions/retry-backoff-dlq-policy.decision.md
-- wiki/roadmaps/path-to-v1.roadmap.md
-Related:
-- wiki/proposals/03-direct-transport-mode.proposal.md
-- wiki/decisions/message-identity-and-header-namespace.decision.md
-- wiki/decisions/observability-operability-policy.decision.md
-- wiki/specs/m6-observability-operability.spec.md
+- Document Class: Proposal
+- Status: Accepted
+- Date: 2026-06-21
+- Category: Observability
+- Scope: Proposes configurable tracing, logging, metrics, and payload-safety policy for kafkaman, including per-message-type overrides.
+- Sources:
+  - User design discussion, 2026-06-21
+  - wiki/proposals/01-kafkaman-objectives.proposal.md
+  - wiki/decisions/configuration-and-environment-model.decision.md
+  - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
+  - wiki/roadmaps/path-to-v1.roadmap.md
+- Related:
+  - wiki/proposals/03-direct-transport-mode.proposal.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - wiki/decisions/observability-operability-policy.decision.md
+  - wiki/specs/m6-observability-operability.spec.md
 
 ## Resolution
 

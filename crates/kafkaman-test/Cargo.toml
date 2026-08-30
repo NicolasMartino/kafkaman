@@ -11,8 +11,8 @@ redpanda = ["dep:kafkaman-rdkafka"]
 
 [dependencies]
 async-trait.workspace = true
-kafkaman-config = { path = "../kafkaman-config" }
-kafkaman-core = { path = "../kafkaman-core" }
+kafkaman-config = { path = "../kafkaman-config", default-features = false }
+kafkaman-core = { path = "../kafkaman-core", default-features = false }
 kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true, features = ["internal-hooks"] }
 kafkaman-sqlx = { path = "../kafkaman-sqlx", features = ["internal-hooks"] }
 kafkaman-worker = { path = "../kafkaman-worker" }

@@ -1,7 +1,7 @@
 # Example Telemetry Integration Tests Plan
 
 - Document Class: Plan
-- Status: Completed 2026-08-29
+- Status: Completed
 - Date: 2026-08-28
 - Category: Delivery execution
 - Scope: Add an opt-in integration gate that starts the order and product example binaries with OTLP enabled, drives a real two-service flow, shuts the binaries down cleanly, and proves metrics, traces, and logs were exported from those binaries.

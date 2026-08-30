@@ -7,11 +7,20 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use kafkaman_config::Config;
-use kafkaman_core::KafkaMessage;
+use kafkaman_core::{problem, KafkaMessage, ProblemType};
 use serde::{Deserialize, Serialize};
 
-use super::{BuildError, RuntimeBuilder};
+use super::tasks::LoopFuture;
+use super::{
+    BoxLoopError, BuildError, CancellationToken, RuntimeBuilder, RuntimeError, RuntimeTasks,
+    Subsystems,
+};
 
 #[derive(Serialize, Deserialize)]
 struct OrderSnapshot;
@@ -111,6 +120,32 @@ fn a_pool_is_required_and_the_message_explains_why_it_is_not_a_url() {
     assert!(
         rendered.contains("pool sizing"),
         "the message must name what the host keeps: {rendered}"
+    );
+}
+
+#[test]
+fn build_and_runtime_errors_have_problem_types() {
+    assert_eq!(
+        BuildError::MissingConfig.problem_type(),
+        problem::CONFIGURATION
+    );
+    assert_eq!(
+        BuildError::MissingPool.problem_type(),
+        problem::CONFIGURATION
+    );
+    assert_eq!(BuildError::NoRoles.problem_type(), problem::CONFIGURATION);
+
+    assert_eq!(
+        RuntimeError::LoopExited {
+            loop_name: "relay:order_snapshot".to_owned(),
+            message: "completed".to_owned(),
+        }
+        .problem_type(),
+        problem::INFRASTRUCTURE
+    );
+    assert_eq!(
+        RuntimeError::Build(BuildError::MissingConfig).problem_type(),
+        problem::CONFIGURATION
     );
 }
 
@@ -233,9 +268,42 @@ fn a_consuming_runtime_without_a_group_names_the_type_that_needs_one() {
     );
 }
 
+#[test]
+fn a_dispatch_only_runtime_without_a_group_reaches_the_next_missing_input() {
+    let error = build_error(
+        RuntimeBuilder::new()
+            .config(config())
+            .subsystems(Subsystems::DISPATCH)
+            .cache::<ProductSnapshot>(),
+    );
+    assert!(
+        matches!(error, BuildError::MissingPool),
+        "a worker that never ingests should not need a Kafka consumer group: {error:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shape
 // ---------------------------------------------------------------------------
+
+#[test]
+fn subsystem_flags_compose_for_worker_roles() {
+    let selected = Subsystems::RELAY | Subsystems::DISPATCH;
+    assert!(selected.contains(Subsystems::RELAY), "{selected:?}");
+    assert!(selected.contains(Subsystems::DISPATCH), "{selected:?}");
+    assert!(!selected.contains(Subsystems::INGEST), "{selected:?}");
+    assert!(!selected.contains(Subsystems::PURGE), "{selected:?}");
+    assert_eq!(
+        selected.without(Subsystems::DISPATCH),
+        Subsystems::RELAY,
+        "{selected:?}"
+    );
+
+    assert_eq!(Subsystems::pipeline(), Subsystems::PIPELINE);
+    assert!(Subsystems::PIPELINE.contains(Subsystems::QUEUE_METRICS));
+    assert!(!Subsystems::PIPELINE.contains(Subsystems::PURGE));
+    assert!(format!("{selected:?}").contains("relay"));
+}
 
 /// The builder is `Debug` without leaking closures, because a caller debugging a
 /// boot failure wants to see what they declared.
@@ -251,4 +319,269 @@ fn the_builder_debug_shows_the_declared_roles() {
     assert!(rendered.contains("order_snapshot"), "{rendered}");
     assert!(rendered.contains("product_snapshot"), "{rendered}");
     assert!(rendered.contains("localhost:9092"), "{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// Runtime task supervision
+// ---------------------------------------------------------------------------
+
+fn successful_loop(future: impl Future<Output = ()> + Send + 'static) -> LoopFuture {
+    Box::pin(async move {
+        future.await;
+        Ok(())
+    })
+}
+
+fn failing_loop(
+    future: impl Future<Output = ()> + Send + 'static,
+    message: &'static str,
+) -> LoopFuture {
+    Box::pin(async move {
+        future.await;
+        Err(Box::new(std::io::Error::other(message)) as BoxLoopError)
+    })
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn wait_for_flag(flag: &AtomicBool) {
+    let observed = tokio::time::timeout(Duration::from_secs(1), async {
+        while !flag.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(observed.is_ok(), "timed out waiting for task future drop");
+}
+
+#[tokio::test]
+async fn runtime_tasks_report_clean_exit_before_shutdown() {
+    // A relay or dispatcher that returns `Ok(())` while the service is still up
+    // is not healthy; it means the runtime silently stopped doing part of its
+    // job. Clean completion only becomes normal after cancellation is requested.
+    let mut tasks = RuntimeTasks::spawn(
+        CancellationToken::new(),
+        vec![("relay:order_snapshot".to_owned(), successful_loop(async {}))],
+    );
+
+    let err = tasks
+        .wait()
+        .await
+        .expect_err("early clean exit must be a supervision error");
+    match err {
+        RuntimeError::LoopExited { loop_name, message } => {
+            assert_eq!(loop_name, "relay:order_snapshot");
+            assert!(message.contains("completed"), "{message}");
+        }
+        other => panic!("expected LoopExited, got {other:?}"),
+    }
+
+    tasks
+        .shutdown()
+        .await
+        .expect("no remaining tasks should drain");
+}
+
+#[tokio::test]
+async fn runtime_tasks_shutdown_reports_already_completed_clean_loops() {
+    let tasks = RuntimeTasks::spawn(
+        CancellationToken::new(),
+        vec![("relay:order_snapshot".to_owned(), successful_loop(async {}))],
+    );
+    tokio::task::yield_now().await;
+
+    let err = tasks
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .await
+        .expect_err("shutdown should not hide a loop that completed before cancellation");
+    match err {
+        RuntimeError::LoopExited { loop_name, .. } => {
+            assert_eq!(loop_name, "relay:order_snapshot");
+        }
+        other => panic!("expected LoopExited, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn runtime_tasks_allow_clean_exit_after_shutdown() {
+    let shutdown = CancellationToken::new();
+    let observed = shutdown.clone();
+    let mut tasks = RuntimeTasks::spawn(
+        shutdown.clone(),
+        vec![(
+            "dispatcher:product_snapshot".to_owned(),
+            successful_loop(async move {
+                observed.cancelled().await;
+            }),
+        )],
+    );
+
+    shutdown.cancel();
+    tasks
+        .wait()
+        .await
+        .expect("clean completion after shutdown is the normal path");
+    tasks.shutdown().await.expect("drain after wait is empty");
+}
+
+#[tokio::test]
+async fn runtime_tasks_shutdown_waits_for_in_flight_drain() {
+    let shutdown = CancellationToken::new();
+    let observed = shutdown.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let mark_finished = Arc::clone(&finished);
+    let tasks = RuntimeTasks::spawn(
+        shutdown,
+        vec![(
+            "dispatcher:product_snapshot".to_owned(),
+            successful_loop(async move {
+                observed.cancelled().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                mark_finished.store(true, Ordering::SeqCst);
+            }),
+        )],
+    );
+
+    tasks
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .await
+        .expect("a cooperative task should drain before the timeout");
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "shutdown returned before the task finished its current cycle"
+    );
+}
+
+#[tokio::test]
+async fn runtime_tasks_shutdown_times_out_and_aborts_wedged_loops() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mark_dropped = Arc::clone(&dropped);
+    let tasks = RuntimeTasks::spawn(
+        CancellationToken::new(),
+        vec![(
+            "ingester:product_snapshot".to_owned(),
+            successful_loop(async move {
+                let _drop_flag = DropFlag(mark_dropped);
+                std::future::pending::<()>().await;
+            }),
+        )],
+    );
+
+    let err = tasks
+        .shutdown_with_timeout(Duration::from_millis(50))
+        .await
+        .expect_err("a task ignoring shutdown must not hang the runtime");
+    match err {
+        RuntimeError::DrainTimeout { timeout, remaining } => {
+            assert_eq!(timeout, Duration::from_millis(50));
+            assert_eq!(remaining, 1);
+        }
+        other => panic!("expected DrainTimeout, got {other:?}"),
+    }
+
+    wait_for_flag(&dropped).await;
+}
+
+#[tokio::test]
+async fn runtime_tasks_shutdown_reports_loop_errors_during_drain() {
+    let shutdown = CancellationToken::new();
+    let observed = shutdown.clone();
+    let tasks = RuntimeTasks::spawn(
+        shutdown,
+        vec![(
+            "purger:order_snapshot".to_owned(),
+            failing_loop(
+                async move {
+                    observed.cancelled().await;
+                },
+                "database is gone",
+            ),
+        )],
+    );
+
+    let err = tasks
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .await
+        .expect_err("a loop error during drain should be reported");
+    match err {
+        RuntimeError::Loop { loop_name, source } => {
+            assert_eq!(loop_name, "purger:order_snapshot");
+            assert!(source.to_string().contains("database is gone"));
+        }
+        other => panic!("expected Loop, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn runtime_tasks_shutdown_reports_loop_error_before_a_later_timeout() {
+    let shutdown = CancellationToken::new();
+    let observed = shutdown.clone();
+    let tasks = RuntimeTasks::spawn(
+        shutdown,
+        vec![
+            (
+                "dispatcher:product_snapshot".to_owned(),
+                failing_loop(
+                    async move {
+                        observed.cancelled().await;
+                    },
+                    "database is gone",
+                ),
+            ),
+            (
+                "ingester:product_snapshot".to_owned(),
+                successful_loop(async {
+                    std::future::pending::<()>().await;
+                }),
+            ),
+        ],
+    );
+
+    let err = tasks
+        .shutdown_with_timeout(Duration::from_millis(100))
+        .await
+        .expect_err("the first loop error should outrank a later drain timeout");
+    match err {
+        RuntimeError::Loop { loop_name, source } => {
+            assert_eq!(loop_name, "dispatcher:product_snapshot");
+            assert!(source.to_string().contains("database is gone"));
+        }
+        other => panic!("expected Loop, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn runtime_tasks_report_named_panics() {
+    let mut tasks = RuntimeTasks::spawn(
+        CancellationToken::new(),
+        vec![(
+            "dispatcher:product_snapshot".to_owned(),
+            successful_loop(async {
+                panic!("handler panic crossed the loop boundary");
+            }),
+        )],
+    );
+
+    let err = tasks
+        .wait()
+        .await
+        .expect_err("a panicking loop must fail supervision");
+    match err {
+        RuntimeError::Panicked { loop_name, source } => {
+            assert_eq!(loop_name, "dispatcher:product_snapshot");
+            assert!(source.is_panic());
+        }
+        other => panic!("expected Panicked, got {other:?}"),
+    }
+
+    tasks
+        .shutdown()
+        .await
+        .expect("no remaining tasks should drain");
 }

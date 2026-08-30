@@ -50,15 +50,14 @@ pub mod axum {
 
     /// Runtime composition: `serve(listener, router).with_runtime(rt).spawn()`.
     ///
-    /// `serve` is deliberately explicit rather than left to the glob above.
-    /// `kafkaman-axum` exports a `serve` of its own that takes a router and
-    /// nothing else, and an explicit import shadows a glob one, so this is the
-    /// `serve` the facade offers — the composing form, which is the one an
-    /// application assembling a [`crate::Runtime`] wants. Reach for
-    /// [`kafkaman_axum::serve`] directly on the rare occasion the plain form is
-    /// what you meant.
+    /// These names are listed explicitly rather than left to the glob above
+    /// because they come from a different crate: `kafkaman-axum` is HTTP-only
+    /// and knows nothing about the runtime, so supervision is assembled here,
+    /// where both halves are in scope.
     #[cfg(feature = "rdkafka")]
     pub use crate::axum_runtime::{serve, RunningService, Serve};
+    #[cfg(feature = "rdkafka")]
+    pub use crate::runtime::{RuntimeError, RuntimeTasks, DEFAULT_DRAIN_TIMEOUT};
 }
 
 #[cfg(all(feature = "axum", feature = "rdkafka"))]
@@ -68,5 +67,5 @@ mod axum_runtime;
 #[cfg(feature = "rdkafka")]
 pub use runtime::{
     BuildError, CancellationToken, HandlerCtx, Runtime, RuntimeBuilder, RuntimeContext,
-    RuntimeError, RuntimeTasks,
+    RuntimeError, RuntimeTasks, Subsystems, DEFAULT_DRAIN_TIMEOUT,
 };

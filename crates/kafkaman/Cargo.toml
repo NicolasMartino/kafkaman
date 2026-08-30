@@ -57,5 +57,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Test-only, and deliberately not a dependency: the host owns the subscriber, so
+# this crate must never install one. It is here so the span-tier test can read
+# which spans a given `EnvFilter` actually opened.
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

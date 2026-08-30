@@ -70,6 +70,10 @@
 - **`create` never repairs an existing topic.** A topic whose `cleanup.policy` is
   wrong fails boot in every mode except `off`; `create` only fills in a topic
   that is absent.
+- **Amended 2026-08-31: `create` verifies what it just created.** After
+  `CreateTopics` returns, kafkaman observes the topic again and applies the
+  `verify` rules before boot continues, so broker-side create drift fails at the
+  same boundary as any pre-existing mismatch.
 - **`create` refuses to guess a partition count**, failing with
   `TopicPartitionsUndeclared` rather than defaulting.
 - **A cache-origin change across topics is no longer always terminal.** When a

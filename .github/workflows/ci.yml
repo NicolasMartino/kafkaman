@@ -33,84 +33,9 @@ jobs:
       - name: Install librdkafka build deps
         run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # Broken intra-doc links are invisible to fmt and clippy, and the module
-      # split is exactly the kind of change that breaks them.
-      - run: cargo doc --workspace --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
-      # The OpenTelemetry opt-out, which no build can prove. Cargo unifies
-      # features across the graph, so one internal crate depending on
-      # `kafkaman-core` with default features re-links `opentelemetry` while
-      # every `--no-default-features` build still succeeds. `cargo tree -i`
-      # exits non-zero when the package is absent, so absence is the pass.
-      - name: opentelemetry opt-out holds
-        run: |
-          for features in "" "axum" "rdkafka" "axum,rdkafka"; do
-            if cargo tree -p kafkaman -e normal --no-default-features \
-                 --features "$features" -i opentelemetry >/dev/null 2>&1; then
-              echo "::error::opentelemetry linked with --no-default-features --features '$features'"
-              exit 1
-            fi
-          done
-          # No facade-reachable crate may depend on an SDK or exporter at any
-          # feature combination: that choice belongs to the host process. The
-          # list below is every such crate; kafkaman-otel is the deliberate
-          # exception and is asserted separately, further down.
-          for crate in kafkaman kafkaman-core kafkaman-config kafkaman-sqlx \
-                       kafkaman-worker kafkaman-rdkafka kafkaman-axum; do
-            for forbidden in opentelemetry_sdk opentelemetry-otlp opentelemetry-appender-tracing; do
-              if cargo tree -p "$crate" -e normal --all-features -i "$forbidden" >/dev/null 2>&1; then
-                echo "::error::$crate depends on $forbidden"
-                exit 1
-              fi
-            done
-          done
-          # kafkaman-otel is absent from that list on purpose: it is the one
-          # crate under crates/ whose whole job is to hold the exporter. The
-          # list is an allowlist by omission, and what keeps that safe is the
-          # assertion below -- the boundary is that nothing an adopter gets from
-          # `kafkaman` links an SDK, so ask that question directly.
-          if cargo tree -p kafkaman -e normal --all-features -i kafkaman-otel >/dev/null 2>&1; then
-            echo "::error::kafkaman reaches kafkaman-otel; the facade must not re-export it"
-            exit 1
-          fi
-          # And when opentelemetry *is* linked, it must be linked narrowly.
-          # Features are additive and a host can never subtract one, so an axis
-          # a library enables without using is permanent in every adopter's
-          # graph.
-          enabled() {
-            cargo tree -p kafkaman -e features --no-default-features --features "$1" \
-                 -i opentelemetry 2>/dev/null \
-              | sed -n 's/.*opentelemetry feature "\([a-z-]*\)".*/\1/p' | sort -u
-          }
-          for spec in "metrics:trace" "metrics:logs" "traces:metrics" "traces:logs"; do
-            if enabled "${spec%%:*}" | grep -qx "${spec##*:}"; then
-              echo "::error::a '${spec%%:*}' build enables the opentelemetry '${spec##*:}' feature"
-              exit 1
-            fi
-          done
-          # And the positive form, for the axis that can carry one: a metrics
-          # build links the metrics API alone. `traces` cannot be pinned this
-          # way — `trace` pulls opentelemetry's own optional dependencies, whose
-          # list is upstream's to change.
-          actual=$(enabled metrics | paste -sd, -)
-          if [ "$actual" != "metrics" ]; then
-            echo "::error::a metrics build enables opentelemetry [$actual], expected [metrics]"
-            exit 1
-          fi
-      # `metrics` and `traces` are independent switches, and `axum` ships
-      # without `rdkafka`. Five of these seven combinations are compiled
-      # nowhere else, and a `#[cfg]` that assumes its
-      # sibling feature is on is invisible under `--all-features`.
-      - name: feature matrix
-        run: |
-          for features in "" "metrics" "traces" "metrics,traces" \
-                          "axum" "axum,rdkafka" "axum,rdkafka,metrics,traces"; do
-            echo "==> --no-default-features --features '$features'"
-            cargo check -p kafkaman --all-targets --no-default-features --features "$features"
-          done
+      - uses: taiki-e/install-action@just
+      - run: just lint
+      - run: just features
 
   test:
     name: tests
@@ -121,9 +46,10 @@ jobs:
       - name: Install librdkafka build deps
         run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
       # Integration tests start PostgreSQL and Redpanda through testcontainers,
       # which uses the Docker daemon preinstalled on GitHub's Ubuntu runners.
-      - run: cargo test --workspace --all-features
+      - run: just test all
 
   coverage:
     name: coverage floor
@@ -134,5 +60,6 @@ jobs:
       - name: Install librdkafka build deps
         run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --all-features --fail-under-lines 80
+      - run: just test coverage

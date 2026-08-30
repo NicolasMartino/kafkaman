@@ -70,12 +70,10 @@ async fn replay_received_redrives_failed_rows_without_replaying_processed_rows()
 
     // Give the processed rows a failure history too, so the redrive below is
     // proven to skip them on status rather than on absence of failure metadata.
-    // The legacy `message` key is deliberate: it exercises the compatibility
-    // alias that keeps pre-problem-detail rows readable.
     sqlx::query(&format!(
         "UPDATE {table_name}
          SET attempts = 3,
-             errors = jsonb_build_array(jsonb_build_object('message', 'old', 'occurred_at', now())),
+             errors = jsonb_build_array(jsonb_build_object('detail', 'old', 'occurred_at', now())),
              last_failed_at = now(),
              last_failure_kind = 'Handler',
              processed_at = now()

@@ -459,11 +459,18 @@ if wants 6; then
             -d '{"name":"during-outage","price_cents":100,"on_hand":5}'
         pass "the write was still accepted — the outbox is what makes that safe"
 
+        # Backlog is `Pending` plus `Publishing`, not "everything that is not
+        # `Published`". `Superseded` is terminal — a row a newer snapshot of the
+        # same entity overtook before the relay reached it — so it is drained
+        # work, not pending work, and counting it makes this scenario fail
+        # against any stack that has already served traffic. It also inflates the
+        # during-outage count, which would let the first assertion below pass
+        # without the outage having backed anything up at all.
         deadline=$((SECONDS + 60))
         pending=0
         while (( SECONDS < deadline )); do
             pending=$(api "$PRODUCT_URL/internal/kafkaman/outbox" \
-                      | jq -r '[.[] | select(.status != "Published") | .count] | add // 0')
+                      | jq -r '[.[] | select(.status == "Pending" or .status == "Publishing") | .count] | add // 0')
             (( pending > 0 )) && break
             sleep 0.5
         done
@@ -477,7 +484,7 @@ if wants 6; then
         deadline=$((SECONDS + 120))
         while (( SECONDS < deadline )); do
             pending=$(api "$PRODUCT_URL/internal/kafkaman/outbox" \
-                      | jq -r '[.[] | select(.status != "Published") | .count] | add // 0')
+                      | jq -r '[.[] | select(.status == "Pending" or .status == "Publishing") | .count] | add // 0')
             (( pending == 0 )) && break
             sleep 1
         done

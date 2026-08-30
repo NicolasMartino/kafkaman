@@ -103,7 +103,7 @@ two offsets.
 
 | Removed / changed | Replacement | Reason |
 | --- | --- | --- |
-| `Replay::outbox` now always returns `Err(Error::UnsafeOutboxReplay)` | `Replay::received`, or state-sourced republish | Row-sourced replay emits stale state at a fresh, higher offset; every consumer cache then treats it as newest. Decision point 9; the README already promised this. |
+| `Replay::outbox::<T>()` now always returns `Err(Error::UnsafeOutboxReplay)` | `Replay::received`, or state-sourced republish | Row-sourced replay emits stale state at a fresh, higher offset; every consumer cache then treats it as newest. Decision point 9; the README already promised this. |
 | `Envelope::with_idempotency_key` (panicking) | `Envelope::with_idempotency_identity` (infallible), `try_with_idempotency_key` (fallible), or `kafkaman_test::EnvelopeTestExt` in tests | A library builder must not abort the caller's process on bad input. All 72 call sites were tests. |
 | `RelayConfig::validate() -> Result<(), String>` | `Result<(), kafkaman_core::Error>` | Stringly-typed error in a `thiserror` crate. |
 | `kafkaman_worker::Error::InvalidConfig(String)` | `Error::Core(kafkaman_core::Error)`, `Error::InvalidDispatcherConfig` | Same. |

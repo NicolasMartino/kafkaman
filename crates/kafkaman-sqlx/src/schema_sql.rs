@@ -22,11 +22,17 @@ use crate::{CacheTable, OutboxTable, ReceivedTable, ResolvedConfig, Result};
 // is already in `changelog_history`, the checksum still matches, and the
 // migration engine reports success while the two databases diverge forever.
 //
-// The evidence that this happens is in this very file. `create_outbox_table_sql`
-// already declares `idempotency_key`, `idempotency_source`, and `entity_key` —
-// the exact columns `AddIdempotencyKey`, `AddIdempotencySource`, and
-// `AddOutboxEntityKey` exist to add to databases created before them. Those
-// alters are the repair for three in-place template edits.
+// Before V1 this file carried nine `ALTER`-shaped changesets that were repairs
+// for exactly that mistake, made while nothing was deployed: the templates had
+// been edited in place, and the alters brought already-created tables back up to
+// the edited shape. They were deleted at the V1 tag, because the databases they
+// repaired never existed outside development. Every table kind is therefore on
+// slot 0, and V1's schema history is one create per table.
+//
+// That deletion is also why the rule above starts applying *now* rather than
+// having always applied. From the first tagged release the templates are shipped
+// and frozen; the next change to any of them is an upgrade changeset, not an
+// edit.
 //
 // The template version is the intra-band slot of a generated changeset (see
 // `generated_changelog`), so a bump always sorts after that table's create and
@@ -135,7 +141,7 @@ pub fn create_received_table_sql(table: &ReceivedTable) -> String {
             message_id UUID PRIMARY KEY,
             idempotency_key TEXT NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{{64}}$'),
             idempotency_source JSONB,
-            status TEXT NOT NULL DEFAULT {pending} CHECK (status IN ({statuses})),
+            status TEXT NOT NULL DEFAULT {pending},
             attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
             next_attempt_at TIMESTAMPTZ,
             errors JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -156,13 +162,19 @@ pub fn create_received_table_sql(table: &ReceivedTable) -> String {
             tracestate TEXT,
             occurred_at TIMESTAMPTZ NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            processed_at TIMESTAMPTZ
+            processed_at TIMESTAMPTZ,
+            CONSTRAINT {status_constraint} CHECK (status IN ({statuses}))
         )",
         name = table.qualified_name(),
         pending = ReceiveStatus::Pending.sql_literal(),
+        status_constraint = received_status_constraint_name(table).quoted(),
         statuses = ReceiveStatus::sql_literal_list(),
         failure_kinds = received_failure_kind_sql_literal_list(),
     )
+}
+
+fn received_status_constraint_name(table: &ReceivedTable) -> SqlIdentifier {
+    table.index_name("_status_check")
 }
 
 pub fn create_received_idempotency_index_sql(table: &ReceivedTable) -> String {
@@ -214,160 +226,6 @@ pub fn create_received_failed_index_sql(table: &ReceivedTable) -> String {
     )
 }
 
-/// The two columns that record *why* a received row last failed.
-///
-/// Written on every failed dispatch and read by the DLQ views, which order by
-/// the timestamp and filter on the kind. Nullable because a row that has never
-/// failed has neither, which is most rows.
-///
-/// The CHECK rides on the `ADD COLUMN`, so it lands exactly when the column
-/// does. On a table that already has the column the whole statement is skipped —
-/// including the constraint — which is the same trade every `IF NOT EXISTS`
-/// changeset here makes: converge on the shape, never rewrite what is already
-/// there.
-pub fn add_received_failure_metadata_sql(table: &ReceivedTable) -> [String; 2] {
-    let name = table.qualified_name();
-    [
-        format!("ALTER TABLE {name} ADD COLUMN IF NOT EXISTS last_failed_at TIMESTAMPTZ"),
-        format!(
-            "ALTER TABLE {name} ADD COLUMN IF NOT EXISTS last_failure_kind TEXT \
-             CHECK (last_failure_kind IN ({}))",
-            received_failure_kind_sql_literal_list(),
-        ),
-    ]
-}
-
-/// Recover both failure columns for rows that were dead-lettered before the
-/// columns existed.
-///
-/// # Why `ADD COLUMN` alone is not the migration
-///
-/// The DLQ views read the columns; the operator's view reads `errors`. A failed
-/// row left with NULLs is therefore visible *and* unreachable: `/dlq` renders
-/// the last audit entry's `type`, and a redrive filtered by that exact kind
-/// tests `last_failure_kind`, matches nothing, and reports success having moved
-/// no rows. The `occurred_after` filter misses them the same way, and because
-/// `ORDER BY last_failed_at` sorts NULLs last, a paged DLQ view drops precisely
-/// these rows off the end while the count beside it still counts them. Every one
-/// of those failures is silent.
-///
-/// # Why the data is there to recover
-///
-/// Every recorded failure appends an RFC 9457 problem detail to `errors` with
-/// both its `type` URI and its `occurred_at`. The columns were only ever a
-/// queryable projection of the newest entry, so the backfill reads the same
-/// place the projection came from.
-///
-/// That timestamp is RFC 9557 — RFC 3339 with a `[UTC]` annotation PostgreSQL
-/// cannot cast, which is why the DLQ queries do not read the JSON. A migration
-/// is the one place stripping the annotation is the right trade: it happens once
-/// rather than per query.
-///
-/// # Why the cast runs inside a subtransaction
-///
-/// A shape test is not a parser. `2026-99-99T10:00:00Z` matches any regex that
-/// describes an RFC 3339 date and still raises `datetime_field_overflow`, and so
-/// does `2026-02-30` — no pattern can rule out a day the calendar does not have.
-/// A raise inside a set-based `UPDATE` aborts the whole statement, which aborts
-/// the migration transaction, which turns one malformed audit row written years
-/// ago into a process that will not boot. That is not a trade worth making for a
-/// column that is a convenience projection.
-///
-/// So the timestamp pass is a `DO` block: one set-based `UPDATE` for the case
-/// that costs nothing, and — only if that raises — a second pass one row at a
-/// time, each in its own subtransaction, where an unparseable entry costs its
-/// own row and nothing else. The shape test survives as a *value* filter rather
-/// than a safety one: it keeps `infinity`, `now` and the rest of PostgreSQL's
-/// special inputs, all of which cast happily, from being mistaken for a recorded
-/// failure time.
-///
-/// The kind pass cannot raise — it is string equality against a generated `CASE`
-/// — so it stays a plain statement, and a row whose timestamp is unreadable
-/// still recovers the kind beside it.
-///
-/// A `type` outside the current vocabulary leaves the kind NULL rather than
-/// guessing, and must: the CHECK its sibling statement installs would reject
-/// anything invented here.
-pub fn backfill_received_failure_metadata_sql(table: &ReceivedTable) -> [String; 2] {
-    const LAST: &str = "errors -> (jsonb_array_length(errors) - 1)";
-    let name = table.qualified_name();
-    let failed = ReceiveStatus::Failed.sql_literal();
-    let occurred_at = format!("split_part({LAST} ->> 'occurred_at', '[', 1)");
-    // Both spellings of every kind: the RFC 9457 `type` URI written today, and
-    // the bare discriminant rows carried before the problem-detail format. The
-    // pair mirrors `ReceivedFailureKind::from_problem_type`, and generating it
-    // from `ALL` is what stops the migration and the enum from drifting apart.
-    let kinds = ReceivedFailureKind::ALL
-        .into_iter()
-        .map(|kind| {
-            let discriminant = sql_string_literal(kind.discriminant());
-            format!(
-                "WHEN {problem_type} THEN {discriminant} WHEN {discriminant} THEN {discriminant}",
-                problem_type = sql_string_literal(kind.problem_type()),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    // Written once and shared by both passes of the timestamp statement, so the
-    // row-at-a-time fallback can never select a different set than the
-    // set-based attempt it is standing in for.
-    let unrecovered_timestamps = format!(
-        "status = {failed}
-           AND last_failed_at IS NULL
-           AND jsonb_typeof(errors) = 'array'
-           AND jsonb_array_length(errors) > 0
-           AND {occurred_at} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ]'"
-    );
-
-    [
-        format!(
-            "UPDATE {name} SET last_failure_kind = CASE
-                COALESCE({LAST} ->> 'type', {LAST} ->> 'kind') {kinds}
-             END
-             WHERE status = {failed}
-               AND last_failure_kind IS NULL
-               AND jsonb_typeof(errors) = 'array'
-               AND jsonb_array_length(errors) > 0"
-        ),
-        format!(
-            "DO $kafkaman_backfill$
-             DECLARE
-                 dead_letter record;
-             BEGIN
-                 BEGIN
-                     UPDATE {name}
-                        SET last_failed_at = {occurred_at}::timestamptz
-                      WHERE {unrecovered_timestamps};
-                     RETURN;
-                 EXCEPTION WHEN invalid_datetime_format OR datetime_field_overflow THEN
-                     -- At least one stored timestamp is date-shaped and not a
-                     -- date. Fall through and pay for it a row at a time.
-                     NULL;
-                 END;
-
-                 FOR dead_letter IN
-                     SELECT message_id, {occurred_at} AS recovered_at
-                       FROM {name}
-                      WHERE {unrecovered_timestamps}
-                 LOOP
-                     BEGIN
-                         UPDATE {name}
-                            SET last_failed_at = dead_letter.recovered_at::timestamptz
-                          WHERE message_id = dead_letter.message_id;
-                     EXCEPTION WHEN invalid_datetime_format OR datetime_field_overflow THEN
-                         -- This row's audit trail cannot say when it failed.
-                         -- Leaving it NULL is the honest answer; aborting the
-                         -- changelog is not.
-                         NULL;
-                     END;
-                 END LOOP;
-             END
-             $kafkaman_backfill$"
-        ),
-    ]
-}
-
 pub fn create_cache_table_sql(table: &CacheTable) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {name} (
@@ -380,56 +238,6 @@ pub fn create_cache_table_sql(table: &CacheTable) -> String {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )",
         name = table.qualified_name(),
-    )
-}
-
-pub fn add_idempotency_key_sql(table: &OutboxTable) -> String {
-    format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS idempotency_key TEXT",
-        table.qualified_name()
-    )
-}
-
-pub fn add_idempotency_source_sql(table: &OutboxTable) -> String {
-    format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS idempotency_source JSONB",
-        table.qualified_name()
-    )
-}
-
-/// The two W3C trace-context columns, on an outbox table.
-///
-/// Nullable and unindexed: absent context is the normal case, and nothing
-/// queries by trace id — the value is read alongside the row it belongs to, and
-/// a backend does the searching.
-pub fn add_outbox_trace_context_sql(table: &OutboxTable) -> [String; 2] {
-    add_trace_context_sql(&table.qualified_name())
-}
-
-/// The same pair on a received table, so a dispatch can descend from the ingest
-/// that stored the row.
-pub fn add_received_trace_context_sql(table: &ReceivedTable) -> [String; 2] {
-    add_trace_context_sql(&table.qualified_name())
-}
-
-fn add_trace_context_sql(qualified_name: &str) -> [String; 2] {
-    [
-        format!("ALTER TABLE {qualified_name} ADD COLUMN IF NOT EXISTS traceparent TEXT"),
-        format!("ALTER TABLE {qualified_name} ADD COLUMN IF NOT EXISTS tracestate TEXT"),
-    ]
-}
-
-pub fn add_outbox_entity_key_sql(table: &OutboxTable) -> String {
-    format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS entity_key TEXT",
-        table.qualified_name()
-    )
-}
-
-pub fn add_received_entity_key_sql(table: &ReceivedTable) -> String {
-    format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS entity_key TEXT",
-        table.qualified_name()
     )
 }
 

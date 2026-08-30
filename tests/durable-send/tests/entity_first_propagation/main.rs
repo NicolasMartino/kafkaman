@@ -4,7 +4,6 @@
 mod cache_apply;
 mod dispatch_ordering;
 mod entity_key_resolution;
-mod migration;
 mod retry_and_redrive;
 
 use durable_send_tests::{
@@ -13,9 +12,9 @@ use durable_send_tests::{
 };
 use kafkaman_core::{KafkaMessage, ReceiveStatus};
 use kafkaman_sqlx::{
-    changelog, dispatch_once, migrate, migrate_dry_run, AddReceivedEntityKey, CacheTable,
-    Changeset, CreateCacheTable, CreateReceivedTable, HandlerFlow, InitSchema, MessageRouter,
-    MigrationAction, MigrationContext, ReceivedTable, Replay,
+    changelog, dispatch_once, migrate, migrate_dry_run, CacheTable, Changeset, CreateReceivedTable,
+    HandlerFlow, InitSchema, MessageRouter, MigrationAction, MigrationContext, ReceivedTable,
+    Replay,
 };
 use kafkaman_test::{EnvelopeTestExt, Harness};
 use sqlx::Row;
@@ -26,23 +25,6 @@ use tokio::sync::Notify;
 
 fn product(product_id: &str, name: &str) -> kafkaman_core::Envelope<ProductSnapshot> {
     ProductSnapshot::envelope(product_id, name)
-}
-
-async fn received_entity_key_columns(
-    pool: &sqlx::PgPool,
-    cfg: &kafkaman_sqlx::ResolvedConfig,
-) -> TestResult<i64> {
-    let count = sqlx::query_scalar(
-        "SELECT count(*)
-         FROM information_schema.columns
-         WHERE table_schema = $1
-           AND table_name = 'received_product_snapshot'
-           AND column_name = 'entity_key'",
-    )
-    .bind(cfg.schema.as_str())
-    .fetch_one(pool)
-    .await?;
-    Ok(count)
 }
 
 async fn assert_cache_state(

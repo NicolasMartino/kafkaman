@@ -127,32 +127,19 @@ pub struct ObservabilityPolicyOverride {
 }
 
 impl ObservabilityPolicyOverride {
-    pub fn apply_to(self, mut base: ObservabilityPolicy) -> ObservabilityPolicy {
-        if let Some(value) = self.level {
-            base.level = value;
+    pub fn apply_to(self, base: ObservabilityPolicy) -> ObservabilityPolicy {
+        // Keep this exhaustive so adding a policy field forces the merge point
+        // to decide whether per-message overrides can set it.
+        ObservabilityPolicy {
+            level: self.level.unwrap_or(base.level),
+            lifecycle: self.lifecycle.unwrap_or(base.lifecycle),
+            payload: self.payload.unwrap_or(base.payload),
+            headers: self.headers.unwrap_or(base.headers),
+            kafka_trace_handoff: self.kafka_trace_handoff.unwrap_or(base.kafka_trace_handoff),
+            sample_success: self.sample_success.unwrap_or(base.sample_success),
+            stuck_after: self.stuck_after.unwrap_or(base.stuck_after),
+            max_queue_age: self.max_queue_age.unwrap_or(base.max_queue_age),
         }
-        if let Some(value) = self.lifecycle {
-            base.lifecycle = value;
-        }
-        if let Some(value) = self.payload {
-            base.payload = value;
-        }
-        if let Some(value) = self.headers {
-            base.headers = value;
-        }
-        if let Some(value) = self.kafka_trace_handoff {
-            base.kafka_trace_handoff = value;
-        }
-        if let Some(value) = self.sample_success {
-            base.sample_success = value;
-        }
-        if let Some(value) = self.stuck_after {
-            base.stuck_after = value;
-        }
-        if let Some(value) = self.max_queue_age {
-            base.max_queue_age = value;
-        }
-        base
     }
 }
 

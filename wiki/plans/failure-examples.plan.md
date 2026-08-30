@@ -1,7 +1,7 @@
 # Failure Examples Plan
 
 - Document Class: Plan
-- Status: Completed 2026-08-29.
+- Status: Completed
 - Date: 2026-08-29
 - Category: Examples and runtime execution
 - Scope: Records the panic boundary, the fault switch, the six-scenario walkthrough, the Kibana failure panel, and the two library bugs that only a deliberate failure could surface.

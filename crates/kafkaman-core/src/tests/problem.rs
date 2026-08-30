@@ -85,6 +85,30 @@ fn the_declared_list_covers_every_constant_in_this_module() {
     }
 }
 
+#[test]
+fn coarsening_mentions_every_declared_problem_constant() {
+    let problem_source = include_str!("../problem.rs");
+    let coarsening_source = include_str!("../failure_kind.rs");
+    let declared_names: Vec<&str> = problem_source
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let raw = line.strip_prefix("pub const ")?;
+            let (name, _) = raw.split_once(": &str")?;
+            Some(name)
+        })
+        .collect();
+
+    for name in declared_names {
+        let needle = format!("problem::{name}");
+        assert!(
+            coarsening_source.contains(&needle),
+            "{needle} is declared but not explicitly coarsened; do not let it \
+             fall through the unknown-URI fallback by accident"
+        );
+    }
+}
+
 /// Every classification a `kafkaman-core` type can produce is in the set.
 ///
 /// This is the check the declared list exists for. A typo'd URI compiles, ships,

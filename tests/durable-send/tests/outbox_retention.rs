@@ -2,11 +2,12 @@
 //! must never touch. See the outbox retention decision.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use durable_send_tests::{start_harness, ProductSnapshot, TestResult};
-use kafkaman_core::{KafkaMessage, OutboxStatus, PurgeConfig};
+use kafkaman_core::{KafkaMessage, OutboxStatus, PurgeConfig, ReceivedIngestFailureKind};
 use kafkaman_sqlx::{
-    migrate, purge_outbox_once, AddOutboxRetentionIndex, Changeset, CreateOutboxTable, InitSchema,
-    MigrationContext, OutboxTable, ResolvedConfig,
+    insert_received_ingest_failure, purge_outbox_once, received_ingest_failure_by_source,
+    CacheTable, OutboxTable, ReceivedIngestFailure,
 };
+use kafkaman_test::EnvelopeTestExt;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -168,6 +169,109 @@ async fn retention_reclaims_failed_rows_only_on_opt_in() -> TestResult {
 }
 
 #[tokio::test]
+async fn retention_reclaims_only_outbox_rows_and_leaves_other_storage_domains() -> TestResult {
+    // M7's storage-growth policy is as much about what retention must not touch
+    // as what it reclaims. Received rows are the dedupe ledger, cache rows are
+    // state, and quarantine rows are the only diagnosis for a record skipped
+    // before a received row existed.
+    let (_postgres, harness) = start_harness().await?;
+    let outbox = harness.outbox_table::<ProductSnapshot>().await?;
+    let received = harness.received_table::<ProductSnapshot>().await?;
+    let cache = CacheTable::for_message::<ProductSnapshot>(&harness.config())?;
+    let pool = harness.pool();
+
+    seed_row(pool, &outbox, OutboxStatus::Published, 30).await?;
+
+    let received_envelope = ProductSnapshot::envelope("retention-received", "still deduped")
+        .with_idempotency_key("idem-retention-received");
+    assert!(
+        harness
+            .insert_received(&received_envelope, 0, 501, Some(b"retention-received"),)
+            .await?
+    );
+    sqlx::query(&format!(
+        "UPDATE {} SET created_at = created_at - interval '30 days'",
+        received.qualified_name()
+    ))
+    .execute(pool)
+    .await?;
+
+    let quarantine = ReceivedIngestFailure {
+        source_topic: "products".to_owned(),
+        source_partition: 0,
+        source_offset: 502,
+        key: Some(b"retention-quarantine".to_vec()),
+        headers: serde_json::json!({ "bad": ["header"] }),
+        payload: Some(b"not-json".to_vec()),
+        message_type: ProductSnapshot::MESSAGE_TYPE.to_owned(),
+        expected_topic: ProductSnapshot::TOPIC.to_owned(),
+        kind: ReceivedIngestFailureKind::InvalidPayload,
+        error: "payload was not json".to_owned(),
+    };
+    let mut tx = pool.begin().await?;
+    assert!(insert_received_ingest_failure(&mut tx, &harness.config(), &quarantine).await?);
+    tx.commit().await?;
+
+    sqlx::query(&format!(
+        "INSERT INTO {} (
+             entity_key, payload, applied_topic, applied_partition, applied_offset, updated_at
+         ) VALUES ($1, $2, $3, 0, 503, now() - interval '30 days')",
+        cache.qualified_name()
+    ))
+    .bind("retention-cache")
+    .bind(serde_json::json!({
+        "product_id": "retention-cache",
+        "name": "still state"
+    }))
+    .bind(ProductSnapshot::TOPIC)
+    .execute(pool)
+    .await?;
+
+    let stats = purge_outbox_once(pool, &outbox, &config(WEEK, 100, false)).await?;
+    assert_eq!(
+        stats.deleted, 1,
+        "the old published outbox row is reclaimed"
+    );
+    assert!(
+        surviving(pool, &outbox).await?.is_empty(),
+        "the only outbox row should be gone"
+    );
+
+    let received_row = harness
+        .received_row_by_idempotency_key::<ProductSnapshot>("idem-retention-received")
+        .await?;
+    assert_eq!(
+        received_row.status,
+        kafkaman_core::ReceiveStatus::Pending,
+        "received rows are retained because they are the dedupe ledger"
+    );
+
+    let quarantined = received_ingest_failure_by_source(
+        pool,
+        &harness.config(),
+        "products",
+        0,
+        quarantine.source_offset,
+    )
+    .await?;
+    assert!(
+        quarantined.is_some(),
+        "quarantine rows are retained because they are the only skip diagnosis"
+    );
+
+    let cached: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {} WHERE entity_key = $1",
+        cache.qualified_name()
+    ))
+    .bind("retention-cache")
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(cached, 1, "cache rows are state, not retention history");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn retention_rejects_a_config_that_would_delete_live_rows() -> TestResult {
     let (_postgres, harness) = start_harness().await?;
     let table = harness.outbox_table::<ProductSnapshot>().await?;
@@ -181,58 +285,6 @@ async fn retention_rejects_a_config_that_would_delete_live_rows() -> TestResult 
     assert!(err.to_string().contains("older_than"), "{err}");
 
     Ok(())
-}
-
-#[tokio::test]
-async fn add_outbox_retention_index_upgrades_a_legacy_table() -> TestResult {
-    let (_postgres, harness) = start_harness().await?;
-    // Migrate first: `OutboxTable::new` only builds a name, it creates nothing.
-    harness.outbox_table::<ProductSnapshot>().await?;
-    let cfg = harness.config();
-    let pool = harness.pool();
-    let descriptor = ProductSnapshot::descriptor()?;
-
-    // Reproduce a table created before retention existed by dropping the index the
-    // current DDL adds. Looked up rather than named: the generated name is bounded
-    // and hashed for long table names, so hardcoding it would be wrong for exactly
-    // the tables that need it most.
-    let index: String = sqlx::query_scalar(
-        "SELECT indexname FROM pg_indexes
-          WHERE schemaname = $1 AND indexname LIKE '%_retention'",
-    )
-    .bind(cfg.schema.as_str())
-    .fetch_one(pool)
-    .await?;
-    sqlx::query(&format!("DROP INDEX {}.\"{index}\"", cfg.schema.quoted()))
-        .execute(pool)
-        .await?;
-    assert_eq!(retention_indexes(pool, &cfg).await?, 0);
-
-    let changesets: Vec<Box<dyn Changeset>> = vec![
-        Box::new(InitSchema),
-        Box::new(CreateOutboxTable::new(2, descriptor.clone())),
-        Box::new(AddOutboxRetentionIndex::new(3, descriptor.clone())),
-    ];
-    migrate(pool, &cfg, &MigrationContext::default(), &changesets).await?;
-    assert_eq!(retention_indexes(pool, &cfg).await?, 1);
-
-    // Convergence, not just application: re-running a changelog is the property the
-    // whole migration engine rests on.
-    migrate(pool, &cfg, &MigrationContext::default(), &changesets).await?;
-    assert_eq!(retention_indexes(pool, &cfg).await?, 1);
-
-    Ok(())
-}
-
-async fn retention_indexes(pool: &PgPool, cfg: &ResolvedConfig) -> TestResult<i64> {
-    let count = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_indexes
-          WHERE schemaname = $1 AND indexname LIKE '%_retention'",
-    )
-    .bind(cfg.schema.as_str())
-    .fetch_one(pool)
-    .await?;
-    Ok(count)
 }
 
 #[tokio::test]

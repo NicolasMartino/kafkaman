@@ -130,13 +130,16 @@
      asserting. Inter-table order is arbitrary and must not be relied on; only
      intra-table slot order carries meaning, and that invariant is asserted.
 
-   The four existing alter changesets — `AddOutboxEntityKey`,
-   `AddIdempotencyKey`, `AddIdempotencySource`, and `AddReceivedEntityKey` —
-   are *not* generated. They exist to catch up databases created before their
-   columns were added to the templates in place, which is precisely the practice
-   `template_version` ends. Generated schema starts from the current template at
-   slot 0 and only ever gains slots going forward; the manual alters remain
-   available for hand-written changelogs.
+   The alter changesets that used to sit beside these — `AddOutboxEntityKey`,
+   `AddIdempotencyKey`, `AddIdempotencySource`, `AddReceivedEntityKey` and five
+   more — were *not* generated. They existed to catch up databases created
+   before their columns were added to the templates in place, which is precisely
+   the practice `template_version` ends. **Removed at the V1 tag** (see
+   [v1-legacy-removal](../compatibility/v1-legacy-removal.compat.md)): no such
+   database was ever created outside development, so the catch-up had nothing to
+   catch up. Generated schema starts from the current template at slot 0 and only
+   ever gains slots going forward, which is now the *only* way a kafkaman table
+   changes shape.
 
 7. **The builder wraps task management, not the runtime.** It owns the boring
    assembly now repeated in the examples: cancellation token propagation,

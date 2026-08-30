@@ -26,13 +26,15 @@
 //!     .spawn()?;
 //!
 //! println!("listening on {}", service.addr());
-//! service.wait().await?;
-//! service.shutdown().await?;
+//! let first = service.wait().await;
+//! let drained = service.shutdown().await;
+//! first.and(drained)?;
 //! # Ok(())
 //! # }
 //! ```
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 // Leading `::` is load-bearing. This module is mounted as `axum_runtime` but
 // the crate root also declares `pub mod axum`, and a bare `use axum::` is
@@ -176,10 +178,183 @@ impl RunningService {
         self.tasks.shutdown().await
     }
 
+    /// Cancel everything and drain with an explicit bound.
+    pub async fn shutdown_with_timeout(self, drain_timeout: Duration) -> Result<(), RuntimeError> {
+        self.tasks.shutdown_with_timeout(drain_timeout).await
+    }
+
     /// [`wait`](Self::wait) then [`shutdown`](Self::shutdown).
+    ///
+    /// Instrumented at `info` on purpose. This is the message-path half of the
+    /// `kafkaman::internal` tier — the span every supervised loop's work hangs
+    /// under — so a default `info` filter has to open it or the waterfall starts
+    /// with a gap where the service lifetime should be. The poll half of the
+    /// tier (`health`, `ready`) stays at `debug` for the opposite reason.
+    #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
     pub async fn run(mut self) -> Result<(), RuntimeError> {
         let first = self.wait().await;
         let drained = self.shutdown().await;
         first.and(drained)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use ::axum::routing::get;
+    use ::axum::Router;
+    use kafkaman_core::{problem, ProblemType};
+    use tokio::net::TcpStream;
+
+    use super::*;
+    use crate::runtime::BoxLoopError;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn listener() -> std::io::Result<TcpListener> {
+        TcpListener::bind("127.0.0.1:0").await
+    }
+
+    fn router() -> Router {
+        Router::new().route("/health", get(|| async { "ok" }))
+    }
+
+    #[test]
+    fn facade_axum_exports_the_canonical_runtime_supervision_names() {
+        let error = crate::axum::RuntimeError::Build(crate::BuildError::MissingConfig);
+        assert_eq!(error.problem_type(), problem::CONFIGURATION);
+        assert_eq!(
+            crate::axum::DEFAULT_DRAIN_TIMEOUT,
+            crate::DEFAULT_DRAIN_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn running_service_wait_allows_http_exit_after_external_shutdown() -> TestResult {
+        let shutdown = CancellationToken::new();
+        let mut service = serve(listener().await?, router())
+            .with_shutdown(shutdown.clone())
+            .spawn()?;
+        let addr = service.addr();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        drop(stream);
+                        break Ok::<(), std::io::Error>(());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        })
+        .await??;
+
+        shutdown.cancel();
+
+        service.wait().await?;
+        service.shutdown().await?;
+        Ok(())
+    }
+
+    /// The message-path half of the `kafkaman::internal` span tier is visible
+    /// under a plain `info` filter.
+    ///
+    /// The other half — that the poll functions an orchestrator probes forever
+    /// stay *out* of the default filter — is pinned by
+    /// `the_internal_span_tier_is_split_by_level_and_reachable_by_target` in
+    /// `kafkaman-axum`. Both halves are needed: without this one the split test
+    /// passes just as well against a tier reverted to `debug` wholesale, and the
+    /// waterfall would start with a gap where the service lifetime should be.
+    #[tokio::test]
+    async fn running_service_run_is_visible_under_the_default_filter() -> TestResult {
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        use tracing_subscriber::layer::{Context, SubscriberExt as _};
+        use tracing_subscriber::Layer as _;
+
+        #[derive(Clone, Default)]
+        struct RecordedSpans(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordedSpans {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::Id,
+                _ctx: Context<'_, S>,
+            ) {
+                // Poisoning is recovered rather than propagated: this layer runs
+                // on whatever thread opened a span, and a panic elsewhere in the
+                // test should surface as that panic, not as a second one here.
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(attrs.metadata().name().to_owned());
+            }
+        }
+
+        // Cancelled before the service starts, so the HTTP loop stops before
+        // accepting anything and the drain has nothing to wait for. The span is
+        // what is under test, not the serving.
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let service = serve(listener().await?, router())
+            .with_shutdown(shutdown)
+            .spawn()?;
+
+        let recorded = RecordedSpans::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(
+                    recorded
+                        .clone()
+                        .with_filter(tracing_subscriber::EnvFilter::new("info")),
+                ),
+            );
+            let _ = service.run().await;
+        }
+
+        let opened = recorded
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(
+            opened.contains(&"run".to_owned()),
+            "the supervision span must open under the default filter; opened: {opened:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_service_shutdown_with_timeout_delegates_to_runtime_tasks() {
+        let shutdown = CancellationToken::new();
+        let mut tasks = RuntimeTasks::empty(shutdown.clone());
+        tasks.push(
+            "wedged",
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                Ok::<(), BoxLoopError>(())
+            }),
+        );
+
+        let service = RunningService {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown,
+            tasks,
+        };
+        let result = service
+            .shutdown_with_timeout(Duration::from_millis(50))
+            .await;
+
+        assert!(
+            matches!(result, Err(RuntimeError::DrainTimeout { remaining: 1, .. })),
+            "got {result:?}"
+        );
     }
 }

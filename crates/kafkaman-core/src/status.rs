@@ -24,7 +24,6 @@ sql_enum! {
     /// while `Failed` is terminal and only a redrive moves it.
     pub enum ReceiveStatus {
         Pending,
-        Processing,
         Processed,
         Retryable,
         Failed,

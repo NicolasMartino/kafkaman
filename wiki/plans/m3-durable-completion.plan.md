@@ -1,30 +1,30 @@
 # M3 Durable Completion Implementation Plan
 
-Document Class: Plan
-Status: Completed
-Date: 2026-06-22
-Category: Delivery execution
-Scope: Sequenced completion of M3 after the first durable-receive slice and its
+- Document Class: Plan
+- Status: Completed
+- Date: 2026-06-22
+- Category: Delivery execution
+- Scope: Sequenced completion of M3 after the first durable-receive slice and its
   review fixes. Hardens the `dispatch_once` seam against the deep-durability test
   catalog, then builds the operational surface (replay, injected clock), the
   Kafka ingest engine and dispatcher loop, the decision-gated handler surface,
   and finally chaos/model coverage and spec promotion. Test designs lead;
   implementation follows each gate.
-Sources:
-- wiki/plans/m3-durable-receive.plan.md
-- wiki/reviews/m3-durable-receive-implementation-review.reference.md
-- wiki/proposals/05-deep-durability-testing.proposal.md
-- wiki/decisions/message-consumption-and-handler-model.decision.md
-- wiki/decisions/message-identity-and-header-namespace.decision.md
-- wiki/decisions/retry-backoff-dlq-policy.decision.md
-- crates/kafkaman-sqlx/src/lib.rs
-- crates/kafkaman-worker/src/lib.rs
-- crates/kafkaman-rdkafka/src/lib.rs
-Related:
-- wiki/specs/m1-durable-send.spec.md
-- wiki/specs/m2-change-engine-config.spec.md
-- wiki/specs/m3-durable-receive.spec.md
-- wiki/roadmaps/path-to-v1.roadmap.md
+- Sources:
+  - wiki/plans/m3-durable-receive.plan.md
+  - wiki/reviews/m3-durable-receive-implementation-review.reference.md
+  - wiki/proposals/05-deep-durability-testing.proposal.md
+  - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
+  - crates/kafkaman-sqlx/src/lib.rs
+  - crates/kafkaman-worker/src/lib.rs
+  - crates/kafkaman-rdkafka/src/lib.rs
+- Related:
+  - wiki/specs/m1-durable-send.spec.md
+  - wiki/specs/m2-change-engine-config.spec.md
+  - wiki/specs/m3-durable-receive.spec.md
+  - wiki/roadmaps/path-to-v1.roadmap.md
 
 ## Deliverable
 

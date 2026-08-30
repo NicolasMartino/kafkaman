@@ -71,7 +71,7 @@ fn a_replay_without_a_row_cap_refuses_to_build() {
 #[test]
 fn outbox_replay_is_rejected_before_it_can_build_sql() {
     assert!(matches!(
-        Replay::outbox::<OrderCreated>(3),
+        Replay::outbox::<OrderCreated>(),
         Err(Error::UnsafeOutboxReplay { .. })
     ));
 }

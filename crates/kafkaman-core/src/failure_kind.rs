@@ -190,8 +190,8 @@ impl ProblemType for ReceivedIngestFailureKind {
 /// - `Bookkeeping` — kafkaman's own claim, savepoint, or commit. A library fault
 ///   or the database under it.
 ///
-/// Not built with [`discriminant_enum!`](crate::enum_macros), whose contract is
-/// that the variant name *is* the persisted string. Here it is not: the stored
+/// Not built with the local `discriminant_enum!` macro, whose contract is that
+/// the variant name *is* the persisted string. Here it is not: the stored
 /// and exported spelling is lowercase, because it was already exported as the
 /// `kafkaman.failure.stage` span attribute before it was ever persisted, and a
 /// trace and a row must not disagree about a stage's name.

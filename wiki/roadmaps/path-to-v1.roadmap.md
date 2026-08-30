@@ -1,10 +1,10 @@
 # Path to V1
 
 - Document Class: Roadmap
-- Status: Draft
+- Status: Completed
 - Date: 2026-06-20
 - Category: Delivery plan
-- Scope: The milestone sequence from the current design baseline to a V1 kafkaman, the decisions each milestone realizes, and the exit criteria. Provisional — the M1 PoC will teach us things that reshape later milestones; this is a framing, not a contract.
+- Scope: The milestone sequence from the original design baseline to a V1 kafkaman, the decisions each milestone realizes, and the validated exit criteria. The M1-M7 implementation milestones are complete; release tagging remains a release-management action.
 - Sources:
   - wiki/proposals/01-kafkaman-objectives.proposal.md
   - wiki/decisions/messaging-scope-and-receive-model.decision.md
@@ -67,6 +67,12 @@ and promoted to
 M7 hardening is the remaining V1 milestone; the two-service example remains an
 active parallel wiring proof.
 
+**Updated 2026-08-31 (M7 closeout):** M7 hardening is completed and recorded in
+[m7-v1-hardening.plan.md](../plans/m7-v1-hardening.plan.md). The accepted V1
+envelope is promoted to
+[v1-acceptance.spec.md](../specs/v1-acceptance.spec.md). The roadmap is ready
+for a V1 release tag and archival after release management completes.
+
 ## Milestones
 
 ### M1 — Durable send (the PoC)
@@ -102,17 +108,33 @@ upgrade, `changelog!`, dry-run, and bounded send-side `Replay`.
   chaos/model checks stay in the deep-durability hardening backlog.
 - **Goal:** the receive half of the core promise.
 - **Delivers:** the ingest + dispatch schedulers, per-type received tables, dedup-
-  as-log with the bounded `errors` array, the `MessageRouter` Tower stack +
-  `FromMessage` extractors + `#[derive(KafkaMessage)]`, receive-tx relocation,
-  offset-after-durable-write. **The `kafkaman-test` toolkit matures here**
-  (`dispatch_once()`, `oneshot` handler tests, the `#[kafkaman::test]` macro, the
-  capturing sender, the injectable `Clock`) — just-in-time for the code that needs
+  as-log with the bounded `errors` array, the `MessageRouter` closure registry,
+  receive-tx relocation, offset-after-durable-write. **The `kafkaman-test` toolkit
+  matures here** (`dispatch_once()`, `Harness` with `relay_once`/`insert_received`/
+  `assert_status`, the capturing publisher) — just-in-time for the code that needs
   it, per dogfooding-first.
-- **Realizes:** message-consumption-and-handler-model, consumer-test-tooling,
-  library-test-strategy.
+
+  **Corrected 2026-08-31.** This entry previously listed the `MessageRouter`
+  *Tower stack*, `FromMessage` extractors, `#[derive(KafkaMessage)]`, `oneshot`
+  handler tests, the `#[kafkaman::test]` macro, and an injectable `Clock` as M3
+  deliverables, and the exit criterion below asserted that handler stacks are
+  `oneshot`-testable. None of those six shipped, in M3 or since. The M3 spec has
+  always been accurate about this — it records the Tower, `FromMessage`, and
+  extractor ergonomics as deferred — and `#[derive(KafkaMessage)]` is still an
+  open `Proposed` proposal (16). The roadmap was the one document claiming them
+  as delivered, which matters because it is the document a reader opens first.
+  What V1 ships is the minimal closure-based handler surface and the smaller
+  explicit `Harness`; see the 2026-08-31 ratification notes on
+  [consumer-test-tooling](../decisions/consumer-test-tooling.decision.md) and
+  [library-test-strategy](../decisions/library-test-strategy.decision.md) for the
+  full shipped-versus-specified accounting.
+- **Realizes:** message-consumption-and-handler-model, and the principle layer of
+  consumer-test-tooling and library-test-strategy — both ratified 2026-08-31 with
+  their unbuilt ergonomics recorded as deferred.
 - **Execution Plan:** [m3-durable-receive.plan.md](../plans/m3-durable-receive.plan.md)
 - **Exit:** effective-once under random redelivery; a slow/failing handler never
-  stalls the partition; handler stacks are `oneshot`-testable.
+  stalls the partition; handlers are testable one dispatch step at a time through
+  `dispatch_once`.
 
 ### M4 — Reliability (retry / backoff / DLQ)
 - **Status:** Completed. Validated behavior is promoted to
@@ -212,24 +234,34 @@ convergence exit criterion.
   received DLQ, and detect expired outbox claims or overdue received rows.
 
 ### M7 — V1 hardening
-- **Status:** Active.
+- **Status:** Completed 2026-08-31.
 - **Goal:** ship-quality.
-- **Delivers:** remaining storage-growth policy outside outbox retention,
-  graceful-shutdown ordering, worker-role topology polish, the full
-  `testcontainers` full-loop suite, and docs/examples.
+- **Delivers:** storage-growth policy outside outbox retention,
+  graceful-shutdown ordering, worker-role topology polish, the
+  `testcontainers` full-loop acceptance suite, and docs/examples closeout.
+- **Execution Plan:** [m7-v1-hardening.plan.md](../plans/m7-v1-hardening.plan.md).
 
   **Corrected 2026-08-25:** this entry previously listed "ratifying OQ5" as an
   M7 deliverable, contradicting the status section above, which has recorded OQ5
   as already ratified since this roadmap was written. OQ5 is ratified; its one
   amendment is noted above. Nothing about it remains for M7.
-- **Exit:** the V1 acceptance bar — durable send + durable receive + reliability +
-  observability, documented, with the full test pyramid green.
+- **Exit:** completed. The V1 acceptance bar is recorded in
+  [v1-acceptance.spec.md](../specs/v1-acceptance.spec.md): durable send plus
+  durable receive plus reliability plus observability, documented, with the
+  fast and full-loop test evidence green.
 
 ## Cross-Cutting Track: `kafkaman-test`
 
 Not a single milestone — **seeded in M1, matured in M3, completed in M7** (the
-`testcontainers` full-loop feature). Dogfooding-first makes the toolkit lead the
-code that uses it, so it threads every milestone rather than trailing at the end.
+full-loop coverage). Dogfooding-first makes the toolkit lead the code that uses
+it, so it threads every milestone rather than trailing at the end.
+
+**Corrected 2026-08-31.** "The `testcontainers` full-loop *feature*" named a
+Cargo feature on `kafkaman-test` that does not exist; the crate's only optional
+feature is `redpanda`, and `testcontainers` is a dependency of the internal
+suites under `tests/` rather than of the shipped toolkit. The intent the feature
+was meant to serve — never force Docker on an adopter — holds by that different
+arrangement, since the container requirement is not exported at all.
 
 ## Working Method: Outside-In TDD
 
@@ -264,6 +296,6 @@ every later milestone does the same with the seam it adds.
 
 ## What Closes This Roadmap
 
-A tagged V1 that meets the M7 acceptance bar, at which point the settled envelope +
-schemas + the `migrate()`/runtime/consume contracts are promoted to `*.spec.md`
-pages and this roadmap is archived.
+The M7 acceptance bar is met and the settled envelope, schemas, and
+`migrate()`/runtime/consume contracts are promoted to specs. The remaining
+closeout action is a V1 release tag, after which this roadmap can be archived.

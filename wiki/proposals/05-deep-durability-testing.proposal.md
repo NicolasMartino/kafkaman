@@ -1,21 +1,21 @@
 # Deep Durability Testing
 
-Document Class: Proposal
-Status: Proposed
-Date: 2026-06-21
-Category: Test strategy
-Scope: Catalog adversarial concurrency, crash, ingest, send, and durability test designs for kafkaman's durable-execution paths, plus the repeatable technique used to discover them.
-Sources:
-- wiki/plans/m3-durable-receive.plan.md
-- wiki/reviews/m3-durable-receive-implementation-review.reference.md
-- tests/durable-send/tests/durable_receive.rs
-- crates/kafkaman-sqlx/src/lib.rs
-Related:
-- wiki/specs/m1-durable-send.spec.md
-- wiki/specs/m2-change-engine-config.spec.md
-- wiki/decisions/message-identity-and-header-namespace.decision.md
-- wiki/decisions/retry-backoff-dlq-policy.decision.md
-- wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md
+- Document Class: Proposal
+- Status: Proposed
+- Date: 2026-06-21
+- Category: Test strategy
+- Scope: Catalog adversarial concurrency, crash, ingest, send, and durability test designs for kafkaman's durable-execution paths, plus the repeatable technique used to discover them.
+- Sources:
+  - wiki/plans/m3-durable-receive.plan.md
+  - wiki/reviews/m3-durable-receive-implementation-review.reference.md
+  - tests/durable-send/tests/durable_receive.rs
+  - crates/kafkaman-sqlx/src/lib.rs
+- Related:
+  - wiki/specs/m1-durable-send.spec.md
+  - wiki/specs/m2-change-engine-config.spec.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
+  - wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md
 
 ## Context
 
@@ -399,17 +399,18 @@ transaction. Treat this class as a landed regression target.
   active resolved config.
 - Future target: M4 retry/backoff/DLQ runtime config.
 
-#### K4. `Processing` and `Failed` are reserved but never written in M3
+#### K4. Legacy status states are introduced deliberately
 
 - Mechanism: exercise success, handler failure, crash, missing handler,
   malformed payload, and replay paths; then inspect all received rows.
-- Invariant: M3 dispatch writes only `Pending`, `Retryable`, and `Processed`.
-  `Processing` and `Failed` may remain enum/DDL-allowed reserved states, but no
-  M3 path should silently start committing them.
-- Current evidence: `ReceiveStatus::ALL` includes `Processing` and `Failed`, but
-  current `kafkaman-sqlx` code has no writes using those variants.
-- Why it matters: M4 DLQ/terminal-state work should introduce `Failed`
-  deliberately, with a focused migration/test update.
+- Invariant: dispatch writes only the states the documented retry model uses.
+  `Failed` became the deliberate terminal DLQ state in M4. The unwritten legacy
+  `Processing` state was removed before V1, with a received-table template bump
+  that normalizes any old row back to `Pending` before tightening the CHECK
+  constraint.
+- Why it matters: a status must never become durable just because it is listed
+  in an enum or accepted by DDL; every persisted state needs a writer, reader,
+  and migration story.
 
 #### K5. Received `message_version` is a dead field in M3
 
@@ -499,7 +500,7 @@ transaction. Treat this class as a landed regression target.
 - Mechanism: Worker A claims outbox row, lease expires, Worker B reclaims and
   publishes, then Worker A attempts `mark_published` or `mark_failed`.
 - Invariant: stale token update is a no-op; newer claim outcome wins.
-- Status: should remain a send-side regression gate even as receive work grows.
+- Gate status: should remain a send-side regression gate even as receive work grows.
 
 #### N3. Broker acknowledgement ambiguity
 

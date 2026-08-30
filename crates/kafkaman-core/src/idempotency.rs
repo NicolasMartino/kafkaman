@@ -10,7 +10,11 @@ use crate::{Error, Result};
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IdempotencyKey([u8; 32]);
 
-pub const LEGACY_STRING_IDEMPOTENCY_NAMESPACE: &str = "kafkaman:legacy-string:v1";
+/// Namespace for identities derived from a single opaque string.
+///
+/// Separate from any caller-chosen namespace so a bare string and a structured
+/// source that happen to serialize alike cannot collide on one digest.
+pub const STRING_SOURCE_IDEMPOTENCY_NAMESPACE: &str = "kafkaman:string-source:v1";
 
 impl IdempotencyKey {
     pub const HEX_LEN: usize = 64;
@@ -129,7 +133,7 @@ impl IdempotencyIdentity {
             });
         }
         let source = IdempotencySource::new(source)?;
-        let canonical_source = serde_json::to_vec(source.value())
+        let canonical_source = canonical_json_bytes(source.value())
             .map_err(|err| Error::InvalidIdempotencySource(err.to_string()))?;
 
         let mut hasher = Sha256::new();
@@ -157,14 +161,22 @@ impl IdempotencyIdentity {
         Self { key, source: None }
     }
 
-    pub fn derive_legacy_string(value: impl AsRef<str>) -> Result<Self> {
+    /// Derive an identity from a single opaque string, under
+    /// [`STRING_SOURCE_IDEMPOTENCY_NAMESPACE`].
+    ///
+    /// For a caller whose business identity genuinely *is* one already-unique
+    /// string. Prefer [`derive`](Self::derive) whenever the identity has parts —
+    /// it puts the namespace at the call site, where a reader can see which
+    /// business concept the digest is scoped to, instead of folding everything
+    /// into one shared namespace.
+    pub fn derive_from_string(value: impl AsRef<str>) -> Result<Self> {
         let value = value.as_ref();
         if value.trim().is_empty() {
             return Err(Error::InvalidIdempotencySource(
-                "legacy string source must not be empty or whitespace".to_owned(),
+                "string idempotency source must not be empty or whitespace".to_owned(),
             ));
         }
-        Self::derive(LEGACY_STRING_IDEMPOTENCY_NAMESPACE, value)
+        Self::derive(STRING_SOURCE_IDEMPOTENCY_NAMESPACE, value)
     }
 }
 
@@ -180,19 +192,19 @@ impl IntoIdempotencyIdentity for IdempotencyIdentity {
 
 impl IntoIdempotencyIdentity for &str {
     fn into_idempotency_identity(self) -> Result<IdempotencyIdentity> {
-        IdempotencyIdentity::derive_legacy_string(self)
+        IdempotencyIdentity::derive_from_string(self)
     }
 }
 
 impl IntoIdempotencyIdentity for String {
     fn into_idempotency_identity(self) -> Result<IdempotencyIdentity> {
-        IdempotencyIdentity::derive_legacy_string(self)
+        IdempotencyIdentity::derive_from_string(self)
     }
 }
 
 impl IntoIdempotencyIdentity for &String {
     fn into_idempotency_identity(self) -> Result<IdempotencyIdentity> {
-        IdempotencyIdentity::derive_legacy_string(self)
+        IdempotencyIdentity::derive_from_string(self)
     }
 }
 
@@ -210,4 +222,52 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn canonical_json_bytes(
+    value: &serde_json::Value,
+) -> std::result::Result<Vec<u8>, serde_json::Error> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(
+    value: &serde_json::Value,
+    output: &mut Vec<u8>,
+) -> std::result::Result<(), serde_json::Error> {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(true) => output.extend_from_slice(b"true"),
+        serde_json::Value::Bool(false) => output.extend_from_slice(b"false"),
+        serde_json::Value::Number(number) => {
+            output.extend_from_slice(number.to_string().as_bytes())
+        }
+        serde_json::Value::String(value) => serde_json::to_writer(&mut *output, value)?,
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(entries) => {
+            output.push(b'{');
+            let mut entries = entries.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.push(b':');
+                write_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
 }

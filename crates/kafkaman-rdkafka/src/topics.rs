@@ -5,6 +5,7 @@
 //! observation and executes the action, which is why the interesting branches
 //! are tested there rather than here.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use kafkaman_core::{
@@ -211,20 +212,19 @@ pub async fn converge_topics(
     let mut drifts = Vec::new();
     // Descriptors are per message type, but two types can share a topic, so the
     // same topic is only reconciled once.
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen = BTreeSet::new();
 
     for descriptor in descriptors {
         let topic = descriptor.topic.as_str();
-        if seen.contains(&topic) {
+        if !seen.insert(topic) {
             continue;
         }
-        seen.push(topic);
 
         let observed = admin.observe(topic).await?;
         let outcome = reconcile(topic, &descriptor.topic_spec, observed.as_ref(), mode)
             .map_err(Error::Core)?;
 
-        if let TopicAction::Create {
+        let drift = if let TopicAction::Create {
             partitions,
             replication_factor,
         } = outcome.action
@@ -243,9 +243,20 @@ pub async fn converge_topics(
                     &descriptor.topic_spec,
                 )
                 .await?;
-        }
+            let observed = admin.observe(topic).await?;
+            reconcile(
+                topic,
+                &descriptor.topic_spec,
+                observed.as_ref(),
+                TopicMode::Verify,
+            )
+            .map_err(Error::Core)?
+            .drift
+        } else {
+            outcome.drift
+        };
 
-        if let Some(drift) = outcome.drift {
+        if let Some(drift) = drift {
             tracing::warn!(%drift, "entity topic partition count differs from the declared one");
             drifts.push(drift);
         }

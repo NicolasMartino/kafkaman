@@ -7,8 +7,8 @@
 //! `main.rs` — where `kafkaman_otel::init` is called, where the signal is
 //! handled, and where `Telemetry::shutdown()` is sequenced after the drain.
 //!
-//! Run it through `just examples telemetry-test`, which builds both binaries and
-//! points `EXAMPLE_ORDER_BIN` / `EXAMPLE_PRODUCT_BIN` at them.
+//! Run it through `just examples telemetry-test` or `just test all`; both build
+//! the binaries and point `EXAMPLE_ORDER_BIN` / `EXAMPLE_PRODUCT_BIN` at them.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::time::{Duration, Instant};

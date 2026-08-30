@@ -9,6 +9,10 @@ repository.workspace = true
 name = "product"
 path = "src/main.rs"
 
+[[bin]]
+name = "product-worker"
+path = "src/bin/worker.rs"
+
 [lib]
 name = "example_product"
 path = "src/lib.rs"

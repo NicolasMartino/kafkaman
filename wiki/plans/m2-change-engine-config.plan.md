@@ -257,7 +257,7 @@ Replaces the hand-rolled `vec![Box::new(InitSchema), Box::new(CreateOutboxTable:
 let changelog = changelog![
     InitSchema,                                          // V1
     CreateOutboxTable::new(2, OrderCreated::descriptor()?),
-    Replay::outbox::<OrderCreated>(3).since(/* ... */),
+    Replay::received::<OrderCreated>(3)?.max_rows(10),
 ];
 ```
 
@@ -525,10 +525,9 @@ layers add white-box tests where the Harness is built from the thing under test.
 
 6. **`MigrationContext` + operational `Replay`.** Thread `MigrationContext` through
    `migrate()`; context-targeting skip is evaluated by the runner, not `cfg`.
-   Send-side outbox replay: one bounded `max_rows` `UPDATE` flipping
-   `Published → Pending` (single statement, not a paced loop); idempotent re-run;
-   crash rolls back and re-attempts. Harness gates for `max_rows` bound, context
-   skip, idempotent re-flip, re-publish, dry-run estimate.
+   The original send-side outbox replay design was later removed as unsafe for
+   entity snapshots; current replay is received-side DLQ redrive with a bounded
+   `max_rows` update, context skip, idempotent re-run, and dry-run estimate.
 
 **Closeout:**
 

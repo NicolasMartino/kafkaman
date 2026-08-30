@@ -187,7 +187,9 @@ The new `kafkaman-axum` crate provides:
   request extensions, adds it to the request span, and returns it in the response
   header.
 - `admin_router(AdminState)`, read-only: health/readiness, outbox summary,
-  received summary, stuck rows on both sides, and the DLQ summary.
+  received summary, stuck rows on both sides, the DLQ summary, and — after the
+  M7 hardening amendment — ingest quarantine summaries at `GET
+  /ingest-failures`.
 - `redrive_router(AdminState)`, carrying the one destructive route — bounded
   received-DLQ redrive. Separate from `admin_router` deliberately: a deployment
   that mounts the read-only router for dashboards must not acquire a

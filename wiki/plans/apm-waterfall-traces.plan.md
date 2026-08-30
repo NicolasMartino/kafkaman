@@ -1,7 +1,7 @@
 # APM Waterfall Traces Plan
 
 - Document Class: Plan
-- Status: Active. The APM waterfall, parented-handoff, and review-fix slices landed 2026-08-29; see Residual Work.
+- Status: Active
 - Date: 2026-08-29
 - Category: Observability execution
 - Scope: Tactical plan for turning the exported OpenTelemetry signals into debuggable APM waterfalls across HTTP, SQL, outbox relay, Kafka ingest, and dispatch, including the explicit parented Kafka handoff used by the examples.

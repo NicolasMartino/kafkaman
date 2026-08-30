@@ -47,6 +47,7 @@ is reference.
 
 - [How a service is assembled](#how-a-service-is-assembled) — what boot actually
   declares, and the escape hatch under it
+  - [Worker-role topology](#worker-role-topology)
 - [Running them](#running-them) — `just examples all`, and each narrower arm
 - [What builds what](#what-builds-what) — which container creates which table
   and topic
@@ -106,6 +107,48 @@ escape hatch would prove nothing, so `Services::start_with` is parameterised ove
 the boot mode and `tests/distributed-cache` runs against both. If the low-level
 path stops producing an equivalent runtime, a test says so.
 
+### Worker-role topology
+
+The builder also supports a no-HTTP worker binary. Roles still declare schema,
+topics, and handlers; `subsystems` says which loops this process owns:
+
+```rust
+let runtime = RuntimeBuilder::new()
+    .config(config)
+    .pool(pool)
+    .brokers(&brokers)
+    .consumer_group(&consumer_group)
+    .subsystems(Subsystems::PIPELINE)
+    .publish::<ProductSnapshot>()
+    .handle::<OrderSnapshot, _>(|order, mut cx| {
+        Box::pin(async move { derive_availability(&order, &mut cx).await })
+    })
+    .build()
+    .await?;
+
+runtime.run(shutdown).await?;
+```
+
+`Subsystems::PIPELINE` starts relay, ingest, dispatch, and queue metrics; it does
+not start purging. Add `| Subsystems::PURGE` only in a process that is meant to
+delete terminal outbox rows and whose config has `[retention]`.
+
+The shipped proof is `product-worker`, which runs the product pipeline without
+binding an HTTP listener:
+
+```bash
+cd examples/product
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/product_service \
+KAFKA_BROKERS=127.0.0.1:19092 \
+KAFKA_CONSUMER_GROUP=product-service \
+cargo run --bin product-worker
+```
+
+Partial selections are valid and intentionally operational: relay-only drains
+outbox rows, ingest-only fills received rows, and dispatch-only drains already
+ingested rows. That can create backlog in the omitted half of the pipeline, so
+the split belongs in deployment topology rather than in request-path code.
+
 ## Running them
 
 Everything runs from one compose file, in a few shapes.
@@ -135,10 +178,10 @@ Kibana look broken. Set `VOLUME_PRODUCTS` to change the count.
 just examples faults
 ```
 
-Six asserted failure scenarios — retries, the dead-letter queue, redrive, a
-panicking handler, a poison record, a broker outage. See
-[When it goes wrong](#when-it-goes-wrong). `just examples all` runs the first two
-of them, so the telemetry is not uniformly green.
+Seven asserted failure scenarios — retries, the dead-letter queue, redrive, a
+panicking handler, a poison record, a broker outage, and database-classified
+handler failures. See [When it goes wrong](#when-it-goes-wrong). `just examples
+all` runs the first two of them, so the telemetry is not uniformly green.
 
 **Without the backend**, when you want propagation and not a gigabyte of heap:
 
@@ -731,13 +774,16 @@ any telemetry backend at all:
 curl -s localhost:3002/internal/kafkaman/dlq      | jq   # depth, attempts, error history
 curl -s localhost:3002/internal/kafkaman/received | jq   # depth by status
 curl -s localhost:3002/internal/kafkaman/outbox   | jq   # the send side
+curl -s localhost:3002/internal/kafkaman/ingest-failures | jq   # poison/quarantine buckets
 curl -s localhost:3002/internal/kafkaman/stuck    | jq   # overdue on either side
 ```
 
 > **These routes have no authentication.** `/dlq` omits message bodies and
-> headers by construction, but it does return `entity_key` and each failure's
-> `detail` — a business key and free text your handler wrote. Panic details can
-> also carry assertion dumps or `Debug` output the handler never meant to expose.
+> headers by construction, and `/ingest-failures` is summary-only: no quarantined
+> payloads, headers, or error strings are returned. `/dlq` still returns
+> `entity_key` and each failure's `detail` — a business key and free text your
+> handler wrote. Panic details can also carry assertion dumps or `Debug` output
+> the handler never meant to expose.
 > That is acceptable *here* and nowhere else: a disposable local stack, on a
 > private compose network, with ports published to loopback. kafkaman ships reads
 > and the destructive redrive as two separate routers precisely so a real
@@ -778,6 +824,7 @@ curl -s localhost:3001/products/$PRODUCT
 | Config file, declared roles, admission rules | `order/tests/service.rs` | Postgres |
 | Config file, declared roles, derived availability | `product/tests/derive_availability.rs` | Postgres |
 | The whole loop, HTTP only, on both boot paths | `tests/distributed-cache` | Postgres + Redpanda |
+| Broker-backed durable windows | `tests/durable-send/tests/redpanda_full_loop` | Postgres + Redpanda |
 | Boot files name no kafkaman internals | `tests/distributed-cache/tests/boot_surface.rs` | nothing |
 | The compose stack itself | `smoke.sh` | a running stack |
 
@@ -804,3 +851,10 @@ exercised rather than merely documented — the example config in this repo
 rotted once already because nothing read it. `just examples` runs it; point it
 somewhere else with `ORDER_URL` and `PRODUCT_URL`, and drive extra traffic past
 the assertions with `VOLUME_PRODUCTS`.
+
+The library's heaviest V1 durable-path gate lives outside the example tree:
+`tests/durable-send` has an opt-in `redpanda_full_loop` suite that brings up
+Postgres and Redpanda through testcontainers and proves the broker-backed
+crash, dedupe, retry, DLQ, redrive, poison, and consume-then-produce windows.
+Keep that separate from `smoke.sh`: smoke proves the local compose packaging;
+the Redpanda suite proves the library invariants.

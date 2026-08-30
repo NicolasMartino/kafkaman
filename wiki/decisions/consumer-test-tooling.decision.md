@@ -1,7 +1,7 @@
 # Consumer Test Tooling (`kafkaman-test`)
 
 - Document Class: Decision
-- Status: Draft
+- Status: Accepted
 - Date: 2026-06-20
 - Category: Quality and testing
 - Scope: The test tooling kafkaman *ships to library consumers* so they can test their handlers, sends, and business logic — the `kafkaman-test` crate, its `Harness`, the determinism contract, and the `#[kafkaman::test]` macro. How kafkaman tests *itself* is a separate concern (see the library test-strategy decision).
@@ -14,6 +14,55 @@
   - wiki/decisions/library-test-strategy.decision.md
   - wiki/decisions/message-consumption-and-handler-model.decision.md
   - wiki/proposals/01-kafkaman-objectives.proposal.md
+
+## Ratification, 2026-08-31: accepted as direction, with the ergonomics layer deferred
+
+The V1 roadmap held this decision at `Draft` behind a revisit gate that ratifies
+only what a milestone validates. `kafkaman-test` was seeded in M1, matured in M3,
+and completed in M7, so the gate has passed and the status moves to `Accepted`.
+
+But ratifying the text as written would put an API in the design record that no
+adopter can call. What V1 ships is the **principle** layer of this decision, not
+its **ergonomics** layer. Verified against the crate at the V1 boundary:
+
+Shipped — points 1, 2, 7's transport stance, and 8. A dedicated `kafkaman-test`
+dev-dependency crate rather than a `testing` feature on the production crates;
+the two-audience boundary that lets a consumer test handlers and enqueues
+against Postgres alone; no production transport trait and no in-memory broker
+fake; and the standing principle that every macro must have an explicit path.
+`Harness` provides `connect`/`connect_with_config`/`connect_redpanda`,
+`enqueue`, `relay_once`, `insert_received`, `outbox_row`, `assert_status`,
+`published_on`, and the `CapturingPublisher` that point 4 calls the capturing
+sender.
+
+Not built, and deferred rather than rejected:
+
+1. **Point 3's `tower::ServiceExt::oneshot` handler tests.** Neither
+   `kafkaman-test` nor `kafkaman-sqlx` depends on `tower`, and `MessageRouter`
+   is a registry rather than a `Service`. Handlers are exercised through
+   `dispatch_once` / `dispatch_once_with_hooks` against Postgres instead.
+   `wiki/specs/m3-durable-receive.spec.md` already records the Tower,
+   `FromMessage`, and extractor ergonomics as deferred; this is the same gap
+   seen from the toolkit side.
+2. **Point 4's injectable `Clock`, `tick()`, `ingest(TestMessage)`, the
+   `TestMessage` builders, the ephemeral-schema setup, and the
+   `assert_processed` / `assert_failed_with` / `errors_len` / `attempts`
+   assertion family.** The shipped surface is the smaller explicit one listed
+   above. Retry eligibility is computed from the *database* clock
+   (`now() + interval`), so an application-side `Clock` would not have governed
+   it; time-dependent tests set `next_attempt_at` directly.
+3. **Point 5's determinism contract, partially.** Schedulers are still stepped
+   explicitly rather than auto-started, which is the half that matters. The
+   `sleep`-free promise does not hold across the whole suite: the full-loop and
+   telemetry tiers poll for convergence with real sleeps.
+4. **Point 6's `#[kafkaman::test]` macro and its `kafkaman-test-macros` crate.**
+   Point 8 is what makes this harmless — the explicit `Harness` path that point 6
+   names as the fallback is complete, and is simply the only path.
+5. **Point 7's optional `testcontainers` feature on `kafkaman-test`.** The
+   feature is `redpanda`, which gates `kafkaman-rdkafka`; `testcontainers`
+   itself is a dependency of the internal suites in `tests/`, so the container
+   requirement is not exported to adopters at all. The intent of the point — never
+   force Docker on a consumer — holds by a different mechanism than it specifies.
 
 ## Decision
 

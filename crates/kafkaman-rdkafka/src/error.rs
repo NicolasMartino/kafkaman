@@ -86,7 +86,15 @@ impl Error {
             Error::Serde(_) => Some(ReceivedIngestFailureKind::InvalidPayload),
             Error::InvalidHeader { .. } => Some(ReceivedIngestFailureKind::InvalidHeader),
             Error::UnexpectedTopic { .. } => Some(ReceivedIngestFailureKind::UnexpectedTopic),
-            _ => None,
+            Error::Kafka(_)
+            | Error::Sqlx(_)
+            | Error::Database(_)
+            | Error::Delivery(_)
+            | Error::Core(_)
+            | Error::TopicAdmin { .. }
+            | Error::ConsecutiveSkipLimitExceeded { .. } => None,
+            #[cfg(feature = "internal-hooks")]
+            Error::Observer(_) => None,
         }
     }
 }

@@ -45,6 +45,11 @@ runtime.run(shutdown).await?;        // start the loops, supervise, drain
 kafkaman derives the changelog and its version numbers, the tables, topic
 convergence, the loops, and the shutdown wiring from them.
 
+Worker-role binaries can keep the same role declaration and narrow only the
+running topology with `.subsystems(...)`. `Subsystems::PIPELINE` starts relay,
+ingest, dispatch, and queue metrics while leaving purge explicit; the default
+remains all configured loops for compatibility.
+
 What stays with the host is deliberate and enumerated: the Tokio runtime, the
 pool, business schema, signal handling, process exit, telemetry installation,
 config discovery, database creation, and the *authority* over topic creation.
@@ -98,7 +103,8 @@ Docker is tight on memory.
 
 ## Current Status
 
-This repository is pre-v1. The active milestone is M5: entity-cache propagation.
-The M1-M4 durable send, receive, retry, and DLQ machinery remains in the codebase
-as the reliability substrate for entity cache propagation, not as a separate
-generic messaging product.
+This repository is pre-v1, with the V1 acceptance envelope now documented.
+M1-M7 have delivered and validated the durable send, durable receive,
+retry/DLQ, entity-cache propagation, runtime composition, observability, and
+ship-quality hardening surface. The remaining step is release management, not an
+open M7 implementation phase.

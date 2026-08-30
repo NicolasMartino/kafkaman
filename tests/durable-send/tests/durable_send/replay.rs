@@ -10,7 +10,7 @@ async fn outbox_replay_is_rejected_as_unsafe_for_entity_snapshots() -> TestResul
     // in the log the record genuinely is newest. The corruption is silent and
     // permanent, so the constructor must refuse rather than warn.
     let err =
-        Replay::outbox::<OrderCreated>(3).expect_err("row-sourced outbox replay must be rejected");
+        Replay::outbox::<OrderCreated>().expect_err("row-sourced outbox replay must be rejected");
 
     assert!(
         matches!(

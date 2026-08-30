@@ -1,28 +1,28 @@
 # M3 Durable Receive
 
-Document Class: Spec
-Status: Active
-Date: 2026-06-22
-Category: Durable receive
-Scope: Validated M3 behavior for Kafka ingest, received-message storage, dispatch, retry replay, and atomic consume-then-produce.
-Sources:
-- wiki/plans/m3-durable-completion.plan.md
-- wiki/plans/m3-durable-receive.plan.md
-- wiki/decisions/message-consumption-and-handler-model.decision.md
-- wiki/decisions/receive-handler-surface-scope.decision.md
-- wiki/decisions/kafka-ingest-identity-and-ordering.decision.md
-- wiki/decisions/ingest-poison-quarantine-policy.decision.md
-- wiki/decisions/missing-handler-dispatch-policy.decision.md
-- wiki/decisions/dispatch-infrastructure-error-classification.decision.md
-- wiki/decisions/dispatch-stats-semantics.decision.md
-- wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
-- wiki/proposals/05-deep-durability-testing.proposal.md
-- tests/durable-send/tests/durable_receive.rs
-- tests/durable-send/tests/redpanda_full_loop.rs
-Related:
-- wiki/specs/m1-durable-send.spec.md
-- wiki/specs/m2-change-engine-config.spec.md
-- wiki/roadmaps/path-to-v1.roadmap.md
+- Document Class: Spec
+- Status: Active
+- Date: 2026-06-22
+- Category: Durable receive
+- Scope: Validated M3 behavior for Kafka ingest, received-message storage, dispatch, retry replay, and atomic consume-then-produce.
+- Sources:
+  - wiki/plans/m3-durable-completion.plan.md
+  - wiki/plans/m3-durable-receive.plan.md
+  - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/receive-handler-surface-scope.decision.md
+  - wiki/decisions/kafka-ingest-identity-and-ordering.decision.md
+  - wiki/decisions/ingest-poison-quarantine-policy.decision.md
+  - wiki/decisions/missing-handler-dispatch-policy.decision.md
+  - wiki/decisions/dispatch-infrastructure-error-classification.decision.md
+  - wiki/decisions/dispatch-stats-semantics.decision.md
+  - wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
+  - wiki/proposals/05-deep-durability-testing.proposal.md
+  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/redpanda_full_loop.rs
+- Related:
+  - wiki/specs/m1-durable-send.spec.md
+  - wiki/specs/m2-change-engine-config.spec.md
+  - wiki/roadmaps/path-to-v1.roadmap.md
 
 ## Validated Behavior
 

@@ -1,7 +1,7 @@
 # Runtime Composition and Topology
 
 - Document Class: Decision
-- Status: Draft
+- Status: Accepted
 - Date: 2026-06-20
 - Category: Runtime and integration
 - Scope: How kafkaman's background subsystems are run and shut down, how a host wires them next to (or without) Axum, and the send-side request UX. The receive/consumption runtime (handler dispatch, kafkaman-owned receive tx) is deferred to a separate decision.
@@ -59,6 +59,47 @@ ordinary sqlx transaction.
 Consequently the `axum-sqlx-tx` version-compatibility surface listed under
 *Consequences* does not exist either, because the dependency does not.
 
+## Amendment, 2026-08-31: subsystem selection and default topology
+
+Point 3 below is corrected by M7. Subsystem selection exists, but the default is
+not the smallest non-destructive set. `RuntimeBuilder::new()` defaults to
+`Subsystems::all()` so existing builder adopters keep the same behavior they had
+before M7; purging still starts only when `[retention]` is configured. The
+copyable no-purge worker shape is `Subsystems::PIPELINE`, which selects relay,
+ingest, dispatch, and queue metrics while leaving `PURGE` out.
+
+This preserves the decision's main boundary: topology is explicit host-owned
+deployment shape, worker role means the host's own binary without HTTP, and
+kafkaman still ships no standalone daemon.
+
+## Ratification, 2026-08-31: accepted, with point 5 recorded as not built
+
+The V1 roadmap held this decision at `Draft` behind a two-stage gate: the
+send-side half was eligible at M1 exit, the receive half only once the
+consumption decision landed. That decision is `Accepted`, M7 delivered the
+graceful-shutdown ordering the last "Revisit When" bullet asked this decision to
+reconcile with, and the two amendments above already record how the packaging and
+the default topology changed. The gate has passed and the status moves to
+`Accepted`.
+
+Points 1, 2, 3, 4, and 6 shipped: subsystems are spawnable units assembled by
+`RuntimeBuilder::into_tasks()`, every loop honors the shared `CancellationToken`,
+topology is a host choice with no standalone daemon, request-path concerns stay
+Axum-native, and `kafkaman_sqlx::enqueue(&mut tx, evt)` remains the
+framework-agnostic core.
+
+**Point 5 did not ship at all, and its absence is not cosmetic.** There is no
+`axum-sqlx-tx` dependency anywhere in the workspace, no `Sender` extractor, and
+no quarantined `send_non_transactional`. The ambient auto-committing transaction
+this point builds its whole send-side UX on does not exist; what exists is point
+6's explicit form, which is what the examples use — `kafkaman::sqlx::enqueue`
+against a transaction the handler opens and commits itself. The atomicity
+guarantee is intact, because it was always a property of sharing the
+transaction rather than of who commits it; what is missing is the ergonomic
+layer that would have made the sharing implicit, and with it the named,
+observable escape hatch that made the non-transactional path expensive to reach
+for. A host that wants to dual-write today simply does not pass the transaction.
+
 ## Decision
 
 1. **Schedulers are spawnable units, not a process.** The host builds a
@@ -78,12 +119,13 @@ Consequently the `axum-sqlx-tx` version-compatibility surface listed under
 
 3. **Topology is a host choice — there is no standalone daemon.** The same crate
    runs **embedded** (alongside Axum) or in a **worker role** (no HTTP) by
-   selecting subsystems on the builder, e.g.
-   `.subsystems(Subsystem::Relay | Subsystem::Consumers)`. **Subsystem selection
-   is explicit and the default is the smallest non-destructive set** — the relay
-   and consumers, and **never `Purge`** (it deletes rows) nor any future
-   destructive subsystem. A host opts into `Purge`/retention enforcement
-   deliberately; a library must not start a row-deleting loop by default. A
+   selecting subsystems on the builder. **Subsystem selection is explicit.** The
+   original draft made the default the smallest non-destructive set; the
+   2026-08-31 amendment above supersedes that detail with
+   `RuntimeBuilder::new()` defaulting to `Subsystems::all()` for compatibility,
+   while `Subsystems::PIPELINE` is the no-purge worker preset. A host opts into
+   `Purge`/retention enforcement deliberately; retention still starts only when
+   `[retention]` is configured and `PURGE` is selected. A
    generic standalone `kafkaman` binary is *not viable in Rust* — handlers are
    user Rust compiled into the host, so dispatch requires the host crate. **"Worker
    role" therefore means *the host's own binary booted without HTTP*, not a
@@ -187,8 +229,13 @@ Consequently the `axum-sqlx-tx` version-compatibility surface listed under
 ## Revisit When
 
 - A second transport or a non-Postgres transaction story appears (re-examine the
-  `axum-sqlx-tx` coupling and the generic/opinionated split).
+  generic/opinionated split; the `axum-sqlx-tx` coupling this bullet was written
+  against was never built — see the 2026-08-31 ratification).
 - A host needs per-subsystem **process** isolation beyond what `into_tasks()`
   (per-subsystem task isolation) provides.
-- The receive/consumption decision lands and adds subsystems or shutdown ordering
-  constraints this draft should reconcile with.
+- An opinionated send-side extractor is revisited — the point 5 UX is deferred,
+  not rejected, and would reopen the ambient-transaction question.
+- ~~The receive/consumption decision lands and adds subsystems or shutdown
+  ordering constraints this draft should reconcile with.~~ Fired: that decision
+  is `Accepted` and M7 settled the shutdown ordering; reconciled by the
+  2026-08-31 amendment and ratification above.

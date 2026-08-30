@@ -33,7 +33,7 @@ fn receive_status_sql_helpers_stay_aligned_with_enum() {
     }
     assert_eq!(
         ReceiveStatus::sql_literal_list(),
-        "'Pending', 'Processing', 'Processed', 'Retryable', 'Failed'"
+        "'Pending', 'Processed', 'Retryable', 'Failed'"
     );
 }
 

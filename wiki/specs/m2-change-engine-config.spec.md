@@ -1,12 +1,12 @@
 # M2 Change Engine + Config
 
-Document Class: Spec
-Status: Active
-Date: 2026-06-21
-Category: Change engine and configuration
-Scope: Validated M2 behavior for config loading, migration reports, checksums/audit, changelog macro, dry-run, and guarded send-side replay.
-Sources: wiki/plans/m2-change-engine-config.plan.md
-Related: wiki/specs/m1-durable-send.spec.md, wiki/compatibility/m2-change-engine-config-schema-and-api.compat.md, wiki/roadmaps/path-to-v1.roadmap.md
+- Document Class: Spec
+- Status: Active
+- Date: 2026-06-21
+- Category: Change engine and configuration
+- Scope: Validated M2 behavior for config loading, migration reports, checksums/audit, changelog macro, dry-run, and guarded send-side replay.
+- Sources: wiki/plans/m2-change-engine-config.plan.md
+- Related: wiki/specs/m1-durable-send.spec.md, wiki/compatibility/m2-change-engine-config-schema-and-api.compat.md, wiki/roadmaps/path-to-v1.roadmap.md
 
 ## Validated Behavior
 
@@ -14,12 +14,12 @@ Related: wiki/specs/m1-durable-send.spec.md, wiki/compatibility/m2-change-engine
 - `ResolvedConfig::from_config` validates required boot keys before opening or migrating a database when used through `Harness::connect_with_config` and the Axum example boot path. The Axum example discovers and resolves config before it opens a pool or touches the business schema.
 - `retry` config parsing is validated for defaults, per-message overrides, merge behavior, unknown fields, unregistered message overrides, bad DLQ variants, non-finite or too-small multipliers, invalid numeric limits, and duration overflow. When a `[retry]` section is present, `ResolvedConfig::from_config` enforces this validation on the boot path, so an invalid policy is rejected before any database work. Runtime retry/DLQ processing is not implemented in M2.
 - `migrate()` now takes a `MigrationContext` and returns a `MigrationReport`. Each newly applied changeset records `version`, `name`, `checksum`, `applied_by`, and `applied_at` in `changelog_history`.
-- Existing M1-shaped `changelog_history` tables are upgraded with nullable `checksum` and `applied_by` columns. Existing NULL checksums are skipped by checksum verification, and missing `applied_by` values are backfilled as `unknown`.
+- ~~Existing M1-shaped `changelog_history` tables are upgraded with nullable `checksum` and `applied_by` columns. Existing NULL checksums are skipped by checksum verification, and missing `applied_by` values are backfilled as `unknown`.~~ Removed at V1: both columns are `NOT NULL` in the create, the two `ADD COLUMN IF NOT EXISTS` repairs and the `applied_by` backfill are gone, and checksum verification no longer has a skip branch — every applied changeset is verified. There was no M1-shaped table to upgrade, because M1 never shipped. See [v1-legacy-removal](../compatibility/v1-legacy-removal.compat.md).
 - Changeset checksums are SHA-256 (hex) digests of the source-declared material, stored as `sha256:<64 hex chars>`. They are stable over source-declared parameters and exclude runtime config-derived values such as schema names. A changed declared parameter after application returns `ChecksumMismatch`.
 - `changelog!` builds `Vec<Box<dyn Changeset>>` and rejects duplicate or disordered versions at construction (panicking with the ordering error). `try_changelog!` is the fallible sibling that returns the structured ordering error instead of panicking.
 - `migrate_dry_run()` takes the schema advisory lock non-blocking (`pg_try_advisory_lock`) and returns `MigrationLockBusy` if a real migration holds it. It runs the entire preview inside one transaction that is always rolled back, so it bootstraps history shape and inspects rows without persisting any changes (no changelog rows, no `applied_by` backfill on legacy rows). It reports pending changes as `WouldApply` and checksum drift as a finding rather than applying or erroring.
-- `Replay::outbox::<T>` is an operational changeset for the send-side outbox. It requires a positive `max_rows` cap, can target `MigrationContext` labels, dry-runs with an approximate row estimate, and applies one bounded `Published -> Pending` SQL statement that also resets `attempts` to `0` and clears `last_error`, so requeued rows start a fresh delivery budget.
-- Re-running an already committed replay is a no-op through changelog history. A follow-up relay pass republishes the requeued rows.
+- `Replay::outbox::<T>()` is retained only as a deliberate tombstone and always returns `Err(Error::UnsafeOutboxReplay)`. The original M2 send-side replay shape was removed because row-sourced outbox replay republishes stale state at a fresh Kafka offset.
+- Re-running an already committed received replay is a no-op through changelog history. Runtime redrive uses `Replay::received_descriptor(Replay::RUNTIME_VERSION, ...)` and does not write changelog history.
 
 ## Evidence
 

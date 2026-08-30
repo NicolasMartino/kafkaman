@@ -74,8 +74,9 @@ space; it is not required for M3 acceptance.
    partition / offset, partition **key**, **payload** + type/version, headers,
    `correlation_id` / `causation_id`, `status` (the receive **state machine** —
    `Pending → Processed` on success, `Pending/Retryable → Retryable` on a
-   retryable failure; `Processing` and `Failed` remain reserved future states;
-   see point 6), `attempts` (monotonic int), **`errors`** (see point 3),
+   retryable failure, and `Pending/Retryable → Failed` on terminal exhaustion;
+   the unwritten legacy `Processing` state was removed before V1), `attempts`
+   (monotonic int), **`errors`** (see point 3),
    `next_attempt_at` (the re-drive gate), and timestamps (`received_at`,
    `processed_at`).
 

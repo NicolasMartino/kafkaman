@@ -17,9 +17,9 @@ use kafkaman_core::{
     ClaimedOutboxRow, Envelope, KafkaMessage, MarkOutcome, OutboxStatus, PublishAck, SqlIdentifier,
 };
 use kafkaman_sqlx::{
-    changelog, claim_batch, enqueue, mark_publish_failed, mark_published, migrate, migrate_dry_run,
-    outbox_status_summary, outbox_stuck_rows, AddIdempotencyKey, Changeset, CreateOutboxTable,
-    InitSchema, MigrationAction, MigrationContext, OutboxTable, Replay,
+    changelog, claim_batch, enqueue, mark_publish_failed, mark_published, migrate,
+    outbox_status_summary, outbox_stuck_rows, Changeset, CreateOutboxTable, InitSchema,
+    MigrationAction, MigrationContext, OutboxTable, Replay,
 };
 use kafkaman_test::{EnvelopeTestExt, Harness};
 use kafkaman_worker::{BoxError, Publisher};
@@ -61,23 +61,6 @@ impl KafkaMessage for InvoiceCreated {
     fn entity_key(&self) -> String {
         self.invoice_id.clone()
     }
-}
-
-async fn idempotency_key_columns(
-    pool: &sqlx::PgPool,
-    cfg: &kafkaman_sqlx::ResolvedConfig,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*)
-         FROM information_schema.columns
-         WHERE table_schema = $1
-           AND table_name = 'outbox_order_created'
-           AND column_name = 'idempotency_key'",
-    )
-    .bind(cfg.schema.as_str())
-    .fetch_one(pool)
-    .await?;
-    Ok(count)
 }
 
 async fn status_count(

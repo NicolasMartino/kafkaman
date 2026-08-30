@@ -1,11 +1,11 @@
 # M3 Durable Receive Review-Fix API Compatibility
 
-Document Class: Compatibility Note
-Status: Active
-Date: 2026-06-22
-Category: Receive API and operational data compatibility
-Scope: Records public API and persisted JSON changes made while resolving the M3 durable-completion review findings.
-Sources: wiki/plans/m3-durable-completion.plan.md; wiki/reviews/m3-durable-completion-implementation-review.reference.md
+- Document Class: Compatibility Note
+- Status: Active
+- Date: 2026-06-22
+- Category: Receive API and operational data compatibility
+- Scope: Records public API and persisted JSON changes made while resolving the M3 durable-completion review findings.
+- Sources: wiki/plans/m3-durable-completion.plan.md; wiki/reviews/m3-durable-completion-implementation-review.reference.md
 
 ## Summary
 

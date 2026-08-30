@@ -47,7 +47,7 @@ pub use error::Error;
 pub use failure_kind::{FailureStage, ReceivedFailureKind, ReceivedIngestFailureKind};
 pub use idempotency::{
     IdempotencyIdentity, IdempotencyKey, IdempotencySource, IntoIdempotencyIdentity,
-    LEGACY_STRING_IDEMPOTENCY_NAMESPACE,
+    STRING_SOURCE_IDEMPOTENCY_NAMESPACE,
 };
 pub use identifier::SqlIdentifier;
 pub use lifecycle::{LifecycleEmission, LifecycleSampler};

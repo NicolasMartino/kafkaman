@@ -10,7 +10,7 @@
   - raw/design/2026-08-12-entity-first-propagation-discussion.md
   - raw/design/2026-08-13-offset-as-convergence-ordinal-discussion.md
   - wiki/decisions/messaging-scope-and-receive-model.decision.md
-  - workout2 `wiki/decisions/architecture-baseline.decision.md` (prior art, local only)
+  - workout2 architecture-baseline prior art (local only; not present in this wiki)
 - Related:
   - wiki/proposals/07-tombstone-and-deletion-semantics.proposal.md
   - wiki/proposals/10-cache-bootstrap-and-readiness.proposal.md

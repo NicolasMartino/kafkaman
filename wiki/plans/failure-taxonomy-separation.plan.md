@@ -1,7 +1,7 @@
 # Failure Taxonomy Separation Plan
 
 - Document Class: Plan
-- Status: Completed 2026-08-30.
+- Status: Completed
 - Date: 2026-08-30
 - Category: Error classification and operability
 - Scope: Executes the decision to derive a failure's persisted class from the error alone and to record the frame it surfaced in as its own field.

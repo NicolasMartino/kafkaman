@@ -128,12 +128,18 @@ dashboard cannot hand out a re-enqueue endpoint by accident.
 inspection and redrive routes read `last_failed_at` and `last_failure_kind` and
 order by the first. A received table created before those columns existed does
 not degrade on these routes — it raises, on the path an operator reaches for
-during an incident. `AddReceivedFailureMetadata` is therefore a required
-changeset for such a table rather than an optional one, unlike every other
-additive changeset kafkaman ships. `AddReceivedFailedIndex` beside it is a
-performance change and genuinely optional, with the usual caveat that a changeset
-builds its index inside a transaction and blocks writes while it does. See the
-compatibility note.
+during an incident.
+
+**Amended 2026-08-31.** This paragraph named `AddReceivedFailureMetadata` as a
+*required* upgrade changeset and `AddReceivedFailedIndex` as an optional one
+beside it. Both were removed at the V1 tag along with the other seven, because
+the tables they upgraded were only ever created by a pre-release kafkaman — the
+columns and the index are in the received create template. The reasoning above
+is why they were required rather than optional, and it is preserved because it
+is the rule any future template bump touching these columns has to satisfy:
+a changeset that adds a column the DLQ routes *read* must also fill it, or every
+pre-existing dead letter becomes visible and unfilterable at once. See
+[v1-legacy-removal](../compatibility/v1-legacy-removal.compat.md).
 
 ## Revisit Triggers
 

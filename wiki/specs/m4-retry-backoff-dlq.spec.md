@@ -1,23 +1,23 @@
 # M4 Retry / Backoff / DLQ
 
-Document Class: Spec
-Status: Active
-Date: 2026-06-22
-Category: Reliability
-Scope: Validated M4 behavior for receive-side retry scheduling, jittered
+- Document Class: Spec
+- Status: Active
+- Date: 2026-06-22
+- Category: Reliability
+- Scope: Validated M4 behavior for receive-side retry scheduling, jittered
   exponential backoff, terminal table-backed DLQ state, the DLQ inspect surface,
   and guarded redrive of terminal failures.
-Sources:
-- wiki/plans/m4-retry-backoff-dlq.plan.md
-- wiki/decisions/retry-backoff-dlq-policy.decision.md
-- wiki/compatibility/m4-retry-backoff-runtime-api.compat.md
-- wiki/compatibility/m5-code-audit-remediation.compat.md
-- crates/kafkaman-config/src/lib.rs
-- crates/kafkaman-sqlx/src/lib.rs
-- tests/durable-send/tests/durable_receive.rs
-Related:
-- wiki/specs/m3-durable-receive.spec.md
-- wiki/roadmaps/path-to-v1.roadmap.md
+- Sources:
+  - wiki/plans/m4-retry-backoff-dlq.plan.md
+  - wiki/decisions/retry-backoff-dlq-policy.decision.md
+  - wiki/compatibility/m4-retry-backoff-runtime-api.compat.md
+  - wiki/compatibility/m5-code-audit-remediation.compat.md
+  - crates/kafkaman-config/src/lib.rs
+  - crates/kafkaman-sqlx/src/lib.rs
+  - tests/durable-send/tests/durable_receive.rs
+- Related:
+  - wiki/specs/m3-durable-receive.spec.md
+  - wiki/roadmaps/path-to-v1.roadmap.md
 
 ## Validated Behavior
 
@@ -102,9 +102,12 @@ Recorded verification commands:
 
 ## Limitations
 
-Retry/backoff/DLQ is entirely Postgres-side. Broker behavior cannot change retry
-outcomes, so M4 adds no new Redpanda full-loop coverage; the M3 ingest/dispatch
-full-loop gates remain the broker-level proof.
+Retry/backoff/DLQ is implemented in Postgres-side receive dispatch. Broker
+behavior cannot change the retry policy outcome, but M7 adds broker-backed
+evidence that the full path works when the input starts as a real Kafka record:
+`redpanda_input_exhausts_dlq_and_redrives_to_success` ingests from Redpanda,
+exhausts the retry budget, parks the row in the table-backed DLQ, redrives it
+with history and source offset preserved, and then processes successfully.
 
 Backoff jitter is tested for bounds, not for fleet-level distribution under a
 real outage.

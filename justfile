@@ -9,11 +9,19 @@ default:
 test arg="all":
     #!/usr/bin/env bash
     set -euo pipefail
+    with_example_bins() {
+      cargo build -p example-order -p example-product
+      local target
+      target=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+      EXAMPLE_ORDER_BIN="$target/debug/order" \
+      EXAMPLE_PRODUCT_BIN="$target/debug/product" \
+        "$@"
+    }
     case "{{ arg }}" in
-      all)         cargo test --workspace --all-features ;;
+      all)         with_example_bins cargo test --workspace --all-features ;;
       unit)        cargo test --workspace --lib ;;
-      integration) cargo test --workspace --all-features --test '*' ;;
-      coverage|cov) cargo llvm-cov --workspace --all-features --fail-under-lines 80 ;;
+      integration) with_example_bins cargo test --workspace --all-features --test '*' ;;
+      coverage|cov) with_example_bins cargo llvm-cov --workspace --all-features --fail-under-lines 80 ;;
       *) echo "usage: just test [all|unit|integration|coverage]" >&2; exit 1 ;;
     esac
 

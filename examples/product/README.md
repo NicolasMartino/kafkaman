@@ -30,31 +30,26 @@ ingest. Caching only fulfilled orders would break convergence — an order going
 forever — and it is not expressible anyway: kafkaman upserts every consumed
 message into the cache, with no ingest-time hook.
 
-## The exclusion that is not obvious
+## Reading its own cache is safe here
 
-`dispatch_once` runs the handler **before** it upserts the message into the
-cache, so a handler sees its own entity's row exactly one version stale. The
-availability query therefore excludes the order it is processing and adds the
-incoming quantity back explicitly:
+The availability query includes the order currently being dispatched, with no
+exclusion and no add-back, because `dispatch_once` applies the cache upsert
+*before* it calls the handler registered with `handle`. The incoming snapshot is
+already the cache's current row for its entity, so the query sees the new status
+rather than the previous one.
 
-```sql
-SELECT COALESCE(SUM((payload->>'quantity')::bigint), 0)::bigint
-  FROM <order cache>
- WHERE deleted = false
-   AND payload->>'product_id' = $1
-   AND payload->>'status'     = 'Fulfilled'
-   AND entity_key            <> $2   -- this order's row is one version behind
-```
-
-Without the exclusion a `Placed` → `Fulfilled` transition counts the order at
-both its old and its new status. A single-order test passes either way; the case
-that separates them is in `tests/derive_availability.rs`.
+The ordering is deliberate. An earlier version ran the handler before the
+upsert, which forced the query to exclude the current `entity_key` and add the
+incoming order back by hand; forgetting either half double-counted transitions.
+The current post-upsert handler order is recorded in
+`wiki/decisions/dispatch-handler-ordering.decision.md`.
 
 ## Endpoints
 
 | Method | Path | |
 |---|---|---|
 | `POST` | `/products` | Create. Enqueues `ProductSnapshot` in the same transaction. |
+| `GET` | `/products` | List the owner's products. |
 | `GET` | `/products/{product_id}` | The owner's view, including the private `on_hand`. |
 | `POST` | `/products/{product_id}/discontinue` | Soft state, not a tombstone: the entity keeps flowing with a terminal status. |
 
@@ -71,3 +66,24 @@ telling consumers something they can act on.
 | `KAFKA_BROKERS` | — | required |
 | `BIND_ADDR` | `0.0.0.0:3002` | |
 | `KAFKA_CONSUMER_GROUP` | `product-service` | |
+
+## Worker binary
+
+`cargo run --bin product-worker` runs the same product role as a no-HTTP worker:
+it declares `publish::<ProductSnapshot>()` and `handle::<OrderSnapshot>()`, then
+selects `Subsystems::PIPELINE` so only relay, ingest, dispatch, and queue
+metrics run. It does not read `BIND_ADDR`, bind a listener, mount `/faults`, or
+serve operator routes.
+
+Run it from this directory so `Config::discover()` finds `kafkaman.toml`:
+
+```bash
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/product_service \
+KAFKA_BROKERS=127.0.0.1:19092 \
+KAFKA_CONSUMER_GROUP=product-service \
+cargo run --bin product-worker
+```
+
+Telemetry is installed by the same `kafkaman-otel` helper as the HTTP binary.
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` or a signal-specific OTLP endpoint to export
+it; leave them unset for a local worker with no provider.

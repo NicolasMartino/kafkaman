@@ -1,18 +1,18 @@
 # Dispatch Infrastructure Error Classification
 
-Document Class: Decision
-Status: Accepted
-Date: 2026-06-22
-Category: Durable receive
-Scope: How dispatch classifies infrastructure failures that happen after a handler returns `Ok`.
-Sources:
-- wiki/plans/m3-durable-completion.plan.md
-- wiki/proposals/05-deep-durability-testing.proposal.md
-- crates/kafkaman-sqlx/src/lib.rs
-- tests/durable-send/tests/durable_receive.rs
-Related:
-- wiki/decisions/missing-handler-dispatch-policy.decision.md
-- wiki/decisions/dispatch-stats-semantics.decision.md
+- Document Class: Decision
+- Status: Accepted
+- Date: 2026-06-22
+- Category: Durable receive
+- Scope: How dispatch classifies infrastructure failures that happen after a handler returns `Ok`.
+- Sources:
+  - wiki/plans/m3-durable-completion.plan.md
+  - wiki/proposals/05-deep-durability-testing.proposal.md
+  - crates/kafkaman-sqlx/src/lib.rs
+  - tests/durable-send/tests/durable_receive.rs
+- Related:
+  - wiki/decisions/missing-handler-dispatch-policy.decision.md
+  - wiki/decisions/dispatch-stats-semantics.decision.md
 
 ## Decision
 

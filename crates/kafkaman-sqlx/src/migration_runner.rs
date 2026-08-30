@@ -101,9 +101,9 @@ pub async fn migrate_dry_run(
     assert_changelog_order(changesets)?;
 
     // The whole preview runs inside one transaction that is always rolled back,
-    // so the lock belongs in it too. Bootstrap DDL (`CREATE SCHEMA/TABLE`, the
-    // `applied_by` backfill) and the per-changeset reads therefore leave no
-    // trace: a dry-run never mutates `changelog_history`, even legacy rows.
+    // so the lock belongs in it too. Bootstrap DDL (`CREATE SCHEMA/TABLE`) and
+    // the per-changeset reads therefore leave no trace: a dry-run never mutates
+    // `changelog_history`.
     let mut tx = pool.begin().await?;
 
     // A dry-run is a non-mutating preview, so it takes the lock without
@@ -150,12 +150,13 @@ async fn dry_run_in_tx(
             // where `run_migrations` must stop at the first.
             report.push(MigrationStepReport::new(
                 changeset,
-                match history.checksum {
-                    Some(stored) if stored != checksum => MigrationAction::ChecksumMismatch {
-                        stored,
+                if history.checksum == checksum {
+                    MigrationAction::SkippedAlreadyApplied
+                } else {
+                    MigrationAction::ChecksumMismatch {
+                        stored: history.checksum,
                         current: checksum,
-                    },
-                    _ => MigrationAction::SkippedAlreadyApplied,
+                    }
                 },
             ));
             continue;
@@ -199,17 +200,15 @@ async fn run_migrations(
         // row lands with the DDL it records.
         let mut tx = conn.begin().await?;
         if let Some(history) = history_row(cfg, &mut tx, changeset.version()).await? {
-            if let Some(stored) = history.checksum {
-                if stored != checksum {
-                    // Stop rather than report: a changeset edited after it was
-                    // applied means the source and the database disagree about
-                    // what version N *is*, so every later version is suspect.
-                    return Err(Error::ChecksumMismatch {
-                        version: changeset.version(),
-                        stored,
-                        current: checksum,
-                    });
-                }
+            if history.checksum != checksum {
+                // Stop rather than report: a changeset edited after it was
+                // applied means the source and the database disagree about
+                // what version N *is*, so every later version is suspect.
+                return Err(Error::ChecksumMismatch {
+                    version: changeset.version(),
+                    stored: history.checksum,
+                    current: checksum,
+                });
             }
             tx.commit().await?;
             report.push(MigrationStepReport::new(
@@ -256,20 +255,18 @@ async fn bootstrap_history(conn: &mut PgConnection, cfg: &ResolvedConfig) -> Res
 
     let history = history_table_name(cfg)?;
     let statements = [
+        // `checksum` and `applied_by` are `NOT NULL`: every row this crate writes
+        // supplies both, and V1 is the first release, so there is no history
+        // table that predates either column.
         format!(
             "CREATE TABLE IF NOT EXISTS {history} (
                 version BIGINT PRIMARY KEY,
                 name TEXT NOT NULL,
-                checksum TEXT,
-                applied_by TEXT,
+                checksum TEXT NOT NULL,
+                applied_by TEXT NOT NULL,
                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )"
         ),
-        // Columns added after the first release, for history tables that predate
-        // them. `IF NOT EXISTS` makes both no-ops on a fresh table.
-        format!("ALTER TABLE {history} ADD COLUMN IF NOT EXISTS checksum TEXT"),
-        format!("ALTER TABLE {history} ADD COLUMN IF NOT EXISTS applied_by TEXT"),
-        format!("UPDATE {history} SET applied_by = 'unknown' WHERE applied_by IS NULL"),
         create_received_ingest_failures_table_sql(cfg)?,
     ];
 
@@ -282,7 +279,7 @@ async fn bootstrap_history(conn: &mut PgConnection, cfg: &ResolvedConfig) -> Res
 
 #[derive(Clone, Debug)]
 struct HistoryRow {
-    checksum: Option<String>,
+    checksum: String,
 }
 
 #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
@@ -299,11 +296,10 @@ async fn history_row(
         .await?;
 
     match row {
-        // Decode `checksum` as an explicit nullable column: a legacy NULL becomes
-        // `None`, while a genuine decode error surfaces instead of being silently
-        // swallowed by `.ok()`.
+        // Decoded with `try_get` rather than `.ok()` so a genuine decode error
+        // surfaces instead of being read as "no checksum recorded".
         Some(row) => Ok(Some(HistoryRow {
-            checksum: row.try_get::<Option<String>, _>("checksum")?,
+            checksum: row.try_get::<String, _>("checksum")?,
         })),
         None => Ok(None),
     }

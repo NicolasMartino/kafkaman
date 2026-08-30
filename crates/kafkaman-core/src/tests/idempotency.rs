@@ -29,12 +29,10 @@ fn idempotency_identity_is_deterministic_and_retains_source() {
 
 #[test]
 fn idempotency_digest_is_pinned_to_canonical_key_order() {
-    // `IdempotencyIdentity::derive` hashes `serde_json::to_vec(Value)`, which
-    // is key-sorted only while serde_json's `preserve_order` feature is OFF.
-    // If any crate in the dependency graph turns that feature on, `Value`
-    // becomes insertion-ordered, every derived key silently changes, and
-    // dedupe stops matching rows already stored — with no compile error and
-    // no runtime error. Pinning the digest turns that into a build failure.
+    // The derived digest is a durable dedupe key. Canonical JSON ordering is
+    // explicit here rather than inherited from serde_json's map type, so an
+    // adopter enabling serde_json's `preserve_order` feature cannot renumber
+    // stored idempotency keys through Cargo feature unification.
     const PINNED: &str = "f0de9a117fcad54e5c8f444426129868ddb43d45517230f7fb2be43356b160e3";
 
     let identity =
@@ -47,6 +45,22 @@ fn idempotency_digest_is_pinned_to_canonical_key_order() {
         IdempotencyIdentity::derive("kafkaman:test:v1", serde_json::json!({"b": 2, "a": 1}))
             .unwrap();
     assert_eq!(reversed.key.to_hex(), PINNED);
+}
+
+#[test]
+fn nested_object_key_order_is_canonicalized() {
+    let first = IdempotencyIdentity::derive(
+        "kafkaman:test:nested:v1",
+        serde_json::json!({"outer": {"a": 1, "b": 2}, "list": [{"x": 1, "y": 2}]}),
+    )
+    .unwrap();
+    let reversed = IdempotencyIdentity::derive(
+        "kafkaman:test:nested:v1",
+        serde_json::json!({"list": [{"y": 2, "x": 1}], "outer": {"b": 2, "a": 1}}),
+    )
+    .unwrap();
+
+    assert_eq!(first.key, reversed.key);
 }
 
 #[test]
@@ -72,10 +86,10 @@ fn idempotency_namespace_must_not_be_blank() {
 }
 
 #[test]
-fn legacy_string_derivation_rejects_a_blank_source() {
-    assert!(IdempotencyIdentity::derive_legacy_string("").is_err());
-    assert!(IdempotencyIdentity::derive_legacy_string("  \t ").is_err());
-    assert!(IdempotencyIdentity::derive_legacy_string("idem-1").is_ok());
+fn string_source_derivation_rejects_a_blank_source() {
+    assert!(IdempotencyIdentity::derive_from_string("").is_err());
+    assert!(IdempotencyIdentity::derive_from_string("  \t ").is_err());
+    assert!(IdempotencyIdentity::derive_from_string("idem-1").is_ok());
 }
 
 #[test]

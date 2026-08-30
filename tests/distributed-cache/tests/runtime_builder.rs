@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use distributed_cache_tests::{service_config, Cluster, TestResult};
 use kafkaman::sqlx::ResolvedConfig;
-use kafkaman::{BuildError, CancellationToken, KafkaMessage, RuntimeBuilder};
+use kafkaman::{BuildError, CancellationToken, KafkaMessage, RuntimeBuilder, Subsystems};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -64,6 +64,8 @@ async fn the_builder_converges_topics_migrates_and_starts_nothing_until_told() -
     let pool = the_generated_changelog_creates_every_table_the_roles_imply(&cluster).await?;
     building_twice_is_idempotent(&cluster).await?;
     build_starts_no_loops(&cluster).await?;
+    subsystem_selection_starts_only_selected_loops(&cluster).await?;
+    empty_subsystem_selection_starts_no_loops(&cluster).await?;
     a_pre_cancelled_runtime_drains_without_working(&cluster).await?;
     the_router_is_a_plain_message_router(&cluster).await?;
 
@@ -138,8 +140,8 @@ async fn convergence_runs_before_the_migration(cluster: &Cluster) -> TestResult 
     Ok(())
 }
 
-/// The four changesets the hand-written changelog declared, without anyone
-/// having numbered them.
+/// The generated changesets implied by the roles, without anyone having
+/// numbered them by hand.
 async fn the_generated_changelog_creates_every_table_the_roles_imply(
     cluster: &Cluster,
 ) -> TestResult<PgPool> {
@@ -171,6 +173,9 @@ async fn the_generated_changelog_creates_every_table_the_roles_imply(
     }
 
     // Every generated changeset is recorded, plus `InitSchema` at version 1.
+    // Four: `InitSchema`, and one create apiece for the order outbox, the
+    // product received table, and the product cache. One per table, because V1
+    // ships no upgrade changesets — see the V1 legacy-removal compat note.
     let versions: Vec<i64> = sqlx::query_scalar(&format!(
         "SELECT version FROM {schema}.changelog_history ORDER BY version"
     ))
@@ -237,6 +242,46 @@ async fn build_starts_no_loops(cluster: &Cluster) -> TestResult {
          consumed one, plus the queue-depth sampler that covers both — and no \
          purger, because these roles declare no `[retention]`"
     );
+    tasks.shutdown().await?;
+    Ok(())
+}
+
+/// Worker-role binaries can keep the declarative role surface while naming the
+/// loops this process owns. Here the service still publishes orders and caches
+/// products, but it starts only the relay and dispatcher: no Kafka consumer, no
+/// purger, and no queue sampler.
+async fn subsystem_selection_starts_only_selected_loops(cluster: &Cluster) -> TestResult {
+    let url = cluster.create_database("builder_subsystems").await?;
+    let pool = open_pool(&url).await?;
+
+    let runtime = order_roles(pool, cluster.brokers(), service_config("order")?)
+        .subsystems(Subsystems::RELAY | Subsystems::DISPATCH)
+        .build()
+        .await?;
+
+    let tasks = runtime.into_tasks()?;
+    assert_eq!(
+        tasks.len(),
+        2,
+        "only the selected relay and dispatcher loops should start"
+    );
+    tasks.shutdown().await?;
+    Ok(())
+}
+
+/// An empty selector is useful for migration-only probes: roles still converge
+/// topics and schema, but the resulting runtime owns no background work.
+async fn empty_subsystem_selection_starts_no_loops(cluster: &Cluster) -> TestResult {
+    let url = cluster.create_database("builder_empty_subsystems").await?;
+    let pool = open_pool(&url).await?;
+
+    let runtime = order_roles(pool, cluster.brokers(), service_config("order")?)
+        .subsystems(Subsystems::empty())
+        .build()
+        .await?;
+
+    let tasks = runtime.into_tasks()?;
+    assert_eq!(tasks.len(), 0, "no selected subsystem should mean no loops");
     tasks.shutdown().await?;
     Ok(())
 }

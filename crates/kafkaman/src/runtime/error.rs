@@ -1,6 +1,9 @@
 //! What can go wrong assembling a runtime.
 
 use std::net::AddrParseError;
+use std::time::Duration;
+
+use kafkaman_core::{problem, ProblemType};
 
 /// A failure while building or running a [`Runtime`](super::Runtime).
 ///
@@ -96,14 +99,59 @@ pub enum BuildError {
 pub enum RuntimeError {
     #[error("the `{loop_name}` loop failed: {source}")]
     Loop {
-        loop_name: &'static str,
+        loop_name: String,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[error("a kafkaman loop panicked: {0}")]
-    Panicked(#[source] tokio::task::JoinError),
+    #[error("the `{loop_name}` loop exited before shutdown: {message}")]
+    LoopExited { loop_name: String, message: String },
+
+    #[error("the `{loop_name}` loop panicked: {source}")]
+    Panicked {
+        loop_name: String,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+
+    #[error(
+        "runtime loops did not finish within {timeout:?} of shutdown; \
+         {remaining} loop(s) were still running"
+    )]
+    DrainTimeout { timeout: Duration, remaining: usize },
 
     #[error("the runtime could not start its loops: {0}")]
     Build(#[source] super::BuildError),
+}
+
+impl ProblemType for BuildError {
+    fn problem_type(&self) -> &'static str {
+        match self {
+            Self::MissingConfig
+            | Self::MissingPool
+            | Self::MissingBrokers
+            | Self::MissingConsumerGroup { .. }
+            | Self::NoRoles
+            | Self::Retention(_)
+            | Self::Listener(_)
+            | Self::Address(_) => problem::CONFIGURATION,
+            Self::Roles(source) | Self::Config(source) | Self::Migrate(source) => {
+                source.problem_type()
+            }
+            Self::Topics(source) | Self::Transport { source, .. } => source.problem_type(),
+            Self::Table { source, .. } => source.problem_type(),
+        }
+    }
+}
+
+impl ProblemType for RuntimeError {
+    fn problem_type(&self) -> &'static str {
+        match self {
+            Self::Loop { .. }
+            | Self::LoopExited { .. }
+            | Self::Panicked { .. }
+            | Self::DrainTimeout { .. } => problem::INFRASTRUCTURE,
+            Self::Build(source) => source.problem_type(),
+        }
+    }
 }

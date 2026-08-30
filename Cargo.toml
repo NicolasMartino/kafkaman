@@ -114,3 +114,17 @@ dbg_macro = "deny"
 await_holding_lock = "deny"
 inefficient_to_string = "warn"
 redundant_clone = "warn"
+
+# Debug info dominates `target/` on macOS. The default `unpacked` split leaves one
+# object file per codegen unit beside every binary, and this workspace's ~60 test
+# binaries multiply that: `deps/` had grown to 48G holding 354k object files.
+# `packed` consolidates them, and dependencies drop debug info entirely — that is
+# where the bulk sat. Workspace crates keep line tables, so panics and backtraces
+# still resolve to a file and line. Measured on `cargo build --tests -p
+# durable-send-tests`: 1.9G -> 1.4G, object files halved, no build-time cost.
+[profile.dev]
+split-debuginfo = "packed"
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0

@@ -24,7 +24,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use kafkaman_core::{OutboxStatus, ReceiveStatus, SqlIdentifier};
+use kafkaman_core::{OutboxStatus, ReceiveStatus, ReceivedIngestFailureKind, SqlIdentifier};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::resolved_config::ResolvedConfig;
 use crate::retry_backoff::duration_to_time;
+use crate::schema_sql::received_ingest_failures_table_name;
 use crate::{Error, OutboxTable, ReceivedTable, Result};
 
 /// Which of the durable tables a configuration *could* name this service
@@ -279,6 +280,23 @@ pub struct ReceivedStatusSummary {
     pub over_max_queue_age: bool,
 }
 
+/// One quarantine bucket for Kafka records that never became received rows.
+///
+/// Quarantine rows are deliberately not purged by kafkaman yet: they are the
+/// only durable diagnosis for records the ingester skipped before a received row
+/// existed. This summary is the read side of that policy. It reports growth and
+/// failure class without returning the quarantined payload or headers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReceivedIngestFailureSummary {
+    pub message_type: String,
+    pub expected_topic: String,
+    pub failure_kind: ReceivedIngestFailureKind,
+    pub count: i64,
+    #[serde(with = "kafkaman_core::rfc9557")]
+    pub oldest_created_at: OffsetDateTime,
+    pub oldest_age_ms: u64,
+}
+
 /// An outbox row whose publish claim expired without the claimant marking it
 /// either published or failed — the signature of a worker that died mid-publish.
 ///
@@ -411,6 +429,49 @@ pub async fn received_status_summary(
                     oldest_age_ms,
                     max_queue_age,
                 ),
+            })
+        })
+        .collect()
+}
+
+/// Per-kind counts and oldest-row age for the schema-wide ingest quarantine.
+///
+/// Unlike received-table DLQs, this is not per message table. Some quarantined
+/// records failed specifically because no per-type row could be trusted. The
+/// schema-wide table is therefore the authority, and the summary groups only by
+/// the stable fields it stores: configured message type, expected topic, and
+/// ingest failure kind.
+#[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+pub async fn received_ingest_failure_summary(
+    pool: &PgPool,
+    cfg: &ResolvedConfig,
+    now: OffsetDateTime,
+) -> Result<Vec<ReceivedIngestFailureSummary>> {
+    let table = received_ingest_failures_table_name(cfg)?;
+    let sql = format!(
+        "SELECT message_type,
+                expected_topic,
+                failure_kind,
+                count(*) AS row_count,
+                min(created_at) AS oldest_created_at
+         FROM {table}
+         GROUP BY message_type, expected_topic, failure_kind
+         ORDER BY oldest_created_at, message_type, expected_topic, failure_kind"
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            let failure_kind: String = row.try_get("failure_kind")?;
+            let failure_kind = ReceivedIngestFailureKind::from_discriminant(&failure_kind)
+                .ok_or_else(|| Error::InvalidIngestFailureKind(failure_kind.clone()))?;
+            let oldest_created_at: OffsetDateTime = row.try_get("oldest_created_at")?;
+            Ok(ReceivedIngestFailureSummary {
+                message_type: row.try_get("message_type")?,
+                expected_topic: row.try_get("expected_topic")?,
+                failure_kind,
+                count: row.try_get("row_count")?,
+                oldest_created_at,
+                oldest_age_ms: age_ms_since(now, oldest_created_at),
             })
         })
         .collect()

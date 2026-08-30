@@ -1,7 +1,7 @@
 # Topic Convergence
 
 - Document Class: Plan
-- Status: Complete
+- Status: Completed
 - Date: 2026-08-24
 - Category: Delivery execution
 - Scope: Executes the accepted topic-convergence decision: `TopicSpec` on the
@@ -9,7 +9,7 @@
   and an `examples/provision` binary that builds the demo environment in Rust.
 - Sources:
   - wiki/decisions/topic-convergence-and-rebuild.decision.md
-  - wiki/proposals/13-topic-convergence-and-environment-provisioning.proposal.md
+  - wiki/proposals/23-topic-convergence-and-environment-provisioning.proposal.md
   - crates/kafkaman-sqlx/src/lib.rs
 - Related:
   - wiki/plans/entity-first-propagation.plan.md

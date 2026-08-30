@@ -60,8 +60,8 @@ pub const PRODUCT_SERVICE: &str = "kafkaman-example-product";
 ///
 /// `CARGO_BIN_EXE_*` is only defined for integration tests of the package that
 /// declares the binary, so it is unavailable from here and there is no
-/// conditional to write. `just examples telemetry-test` builds both and sets
-/// these.
+/// conditional to write. `just examples telemetry-test` and `just test all`
+/// build both and set these.
 const ORDER_BIN: &str = "EXAMPLE_ORDER_BIN";
 const PRODUCT_BIN: &str = "EXAMPLE_PRODUCT_BIN";
 
@@ -97,8 +97,8 @@ fn binary_path(variable: &str) -> TestResult<PathBuf> {
     let raw = std::env::var(variable).map_err(|_| -> BoxError {
         format!(
             "{variable} must point at a built example binary. \
-             Run this through `just examples telemetry-test`, which builds both \
-             binaries and sets it."
+             Run this through `just examples telemetry-test` or `just test all`, \
+             which build both binaries and set it."
         )
         .into()
     })?;

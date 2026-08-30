@@ -16,18 +16,23 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use kafkaman_axum::{
     admin_router, redrive_router, AdminState, CorrelationLayer, CORRELATION_ID_HEADER,
 };
-use kafkaman_sqlx::{OutboxTable, ReceivedTable};
+use kafkaman_core::ReceivedIngestFailureKind;
+use kafkaman_sqlx::{
+    insert_received_ingest_failure, OutboxTable, ReceivedIngestFailure, ReceivedTable,
+};
 use kafkaman_test::Harness;
 use observability_tests::{
-    postgres_for_suite, ProductSnapshot, RegionalProduct, TestResult, SUITE,
+    postgres_for_suite, ProductSnapshot, RegionalProduct, TestResult, TracePipeline, SUITE,
 };
 
 #[tokio::test]
 async fn every_admin_route_answers_over_http() -> TestResult {
+    let pipeline = TracePipeline::install();
     let postgres = postgres_for_suite(SUITE).await?;
     let harness = Harness::connect(postgres.url()).await?;
     // Registers the type's tables, which is what gives the summaries something
@@ -38,6 +43,21 @@ async fn every_admin_route_answers_over_http() -> TestResult {
     let envelope =
         ProductSnapshot::envelope("admin-http", "a product").try_with_idempotency_key("admin")?;
     harness.enqueue(&envelope).await?;
+    let failure = ReceivedIngestFailure {
+        source_topic: "products".to_owned(),
+        source_partition: 0,
+        source_offset: 808,
+        key: Some(b"admin-http".to_vec()),
+        headers: serde_json::json!({ "bad": ["header"] }),
+        payload: Some(b"not-json".to_vec()),
+        message_type: "product_snapshot".to_owned(),
+        expected_topic: "products".to_owned(),
+        kind: ReceivedIngestFailureKind::InvalidPayload,
+        error: "payload was not json".to_owned(),
+    };
+    let mut tx = harness.pool().begin().await?;
+    insert_received_ingest_failure(&mut tx, &harness.config(), &failure).await?;
+    tx.commit().await?;
 
     let server = serve(&harness, Mounted::Everything).await?;
     let base = &server.base;
@@ -92,6 +112,26 @@ async fn every_admin_route_answers_over_http() -> TestResult {
         "the receive side answers even with nothing received"
     );
 
+    let ingest_failures: serde_json::Value = client
+        .get(format!("{base}/ingest-failures"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let ingest_failure = ingest_failures
+        .as_array()
+        .expect("ingest failure summary is a list")
+        .iter()
+        .find(|bucket| bucket["failure_kind"] == "InvalidPayload")
+        .expect("the seeded quarantine row should be summarized");
+    assert_eq!(ingest_failure["message_type"], "product_snapshot");
+    assert_eq!(ingest_failure["expected_topic"], "products");
+    assert_eq!(ingest_failure["count"], 1);
+    assert!(
+        ingest_failure.get("payload").is_none() && ingest_failure.get("headers").is_none(),
+        "the admin summary must not expose the quarantined payload or headers: {ingest_failure}"
+    );
+
     let stuck: serde_json::Value = client
         .get(format!("{base}/stuck"))
         .send()
@@ -111,6 +151,7 @@ async fn every_admin_route_answers_over_http() -> TestResult {
         .json()
         .await?;
     assert!(dlq.is_array() || dlq.is_object(), "the DLQ view answers");
+    wait_for_dlq_db_spans(&pipeline).await;
 
     // The destructive one. Nothing is dead-lettered, so the honest answer is
     // zero rows redriven — which is also the assertion that the route resolves
@@ -191,6 +232,29 @@ async fn every_admin_route_answers_over_http() -> TestResult {
     );
 
     Ok(())
+}
+
+async fn wait_for_dlq_db_spans(pipeline: &TracePipeline) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let spans = pipeline.finished();
+        let has_count = spans
+            .iter()
+            .any(|span| span.name == "db.query count received failed rows");
+        let has_rows = spans
+            .iter()
+            .any(|span| span.name == "db.query select received failed rows");
+        if has_count && has_rows {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "DLQ route did not emit both DB spans; recorded {:?}",
+                spans.iter().map(|span| &span.name).collect::<Vec<_>>()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// The read-only router does not carry the destructive route.

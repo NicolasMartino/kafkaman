@@ -1,18 +1,18 @@
 # Kafka Ingest Identity And Ordering
 
-Document Class: Decision
-Status: Accepted
-Date: 2026-06-22
-Category: Durable receive
-Scope: Identity fields and ordering guarantee for the first Kafka ingest path.
-Sources:
-- wiki/plans/m3-durable-completion.plan.md
-- wiki/decisions/message-identity-and-header-namespace.decision.md
-- crates/kafkaman-rdkafka/src/lib.rs
-- tests/durable-send/tests/redpanda_full_loop.rs
-Related:
-- wiki/decisions/message-consumption-and-handler-model.decision.md
-- wiki/decisions/message-identity-and-header-namespace.decision.md
+- Document Class: Decision
+- Status: Accepted
+- Date: 2026-06-22
+- Category: Durable receive
+- Scope: Identity fields and ordering guarantee for the first Kafka ingest path.
+- Sources:
+  - wiki/plans/m3-durable-completion.plan.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
+  - crates/kafkaman-rdkafka/src/lib.rs
+  - tests/durable-send/tests/redpanda_full_loop.rs
+- Related:
+  - wiki/decisions/message-consumption-and-handler-model.decision.md
+  - wiki/decisions/message-identity-and-header-namespace.decision.md
 
 ## Decision
 

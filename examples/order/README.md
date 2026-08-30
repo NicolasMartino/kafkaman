@@ -9,10 +9,9 @@ See [`../README.md`](../README.md) for how to run both services together.
 
 | File | Why |
 |---|---|
-| `src/lib.rs` | `dispatch_router()` — a handler that does nothing at all. kafkaman writes the cache row; convergence needs no application code. |
+| `src/lib.rs` | The domain model and HTTP state. Product convergence needs no handler because the service declares `cache::<ProductSnapshot>()`. |
 | `src/http.rs` | `create_order` — the admission decision and the order row are taken against one snapshot of the cache, inside one transaction. |
-| `src/changelog.rs` | Outbox, received *and* cache tables. Omitting the cache table is the mistake that migrates and boots cleanly and fails only at dispatch. |
-| `src/service.rs` | The three loops a service actually has to spawn. |
+| `src/service.rs` | The role declaration. The builder derives the changelog, tables, topic checks, relay, ingester, dispatcher, queue metrics, and shutdown wiring. |
 | `kafkaman.toml` | Read by `Config::discover()`, and asserted by `tests/service.rs`. |
 
 ## Endpoints
@@ -20,6 +19,7 @@ See [`../README.md`](../README.md) for how to run both services together.
 | Method | Path | |
 |---|---|---|
 | `POST` | `/orders` | Accept an order, if the cached product allows it. Enqueues `OrderSnapshot` in the same transaction. |
+| `GET` | `/orders` | List the owner's orders. |
 | `GET` | `/orders/{order_id}` | |
 | `POST` | `/orders/{order_id}/fulfil` | |
 | `POST` | `/orders/{order_id}/cancel` | Legal from `Placed` *and* from `Fulfilled`. |

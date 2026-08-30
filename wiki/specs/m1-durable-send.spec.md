@@ -25,8 +25,10 @@
   `KafkaMessage`, `Envelope`, send-side outbox status/row types, `PublishAck`,
   `PublishedRecord`, and relay config/stats.
 - `kafkaman-sqlx` implements the M1 subset of `migrate()`: schema creation,
-  `changelog_history`, ordered object-safe changesets, `InitSchema`,
-  `CreateOutboxTable`, and the additive `AddIdempotencyKey` upgrade changeset.
+  `changelog_history`, ordered object-safe changesets, `InitSchema`, and
+  `CreateOutboxTable`. The additive `AddIdempotencyKey` upgrade changeset this
+  line also named was removed at V1 (see
+  [v1-legacy-removal](../compatibility/v1-legacy-removal.compat.md)).
   `migrate()` is concurrency-safe: it holds a per-schema Postgres advisory lock
   for the run so simultaneous application/replica boots cannot race the
   changelog primary key.
@@ -87,9 +89,14 @@
 - The ack-before-mark duplicate window is represented by manually publishing a
   claimed row, expiring its lease, then confirming `relay_once` republishes and
   marks the row `Published`.
+- **M7 amendment, 2026-08-31:** the ack-before-mark duplicate window is also
+  proven through a real Redpanda broker hop. The
+  `ack_before_mark_republish_is_deduplicated_after_real_broker_hop` gate
+  publishes a claimed row, expires its lease, republishes through the relay,
+  ingests both broker records, and proves receive-side identity absorbs the
+  duplicate before dispatch side effects repeat.
 - A caller-set `idempotency_key` is persisted on the outbox row and forwarded as
-  a Kafka header; the `AddIdempotencyKey` changeset upgrades a pre-existing
-  table that lacked the column.
+  a Kafka header; the column is in the outbox create template.
 - `enqueue` rejects reserved `kafkaman-` headers.
 - Concurrent dynamic message registration on one Harness is safe (no caller
   observes a registered type before its table exists).
