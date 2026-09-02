@@ -1,9 +1,14 @@
 [package]
 name = "kafkaman-test"
 version = "0.1.0"
+description = "Test support for kafkaman: a self-migrating harness, a capturing publisher, and the panicking conveniences a library API should not have"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -11,11 +16,11 @@ redpanda = ["dep:kafkaman-rdkafka"]
 
 [dependencies]
 async-trait.workspace = true
-kafkaman-config = { path = "../kafkaman-config", default-features = false }
-kafkaman-core = { path = "../kafkaman-core", default-features = false }
-kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true, features = ["internal-hooks"] }
-kafkaman-sqlx = { path = "../kafkaman-sqlx", features = ["internal-hooks"] }
-kafkaman-worker = { path = "../kafkaman-worker" }
+kafkaman-config = { path = "../kafkaman-config", version = "0.1.0", default-features = false }
+kafkaman-core = { path = "../kafkaman-core", version = "0.1.0", default-features = false }
+kafkaman-rdkafka = { path = "../kafkaman-rdkafka", version = "0.1.0", optional = true, features = ["internal-hooks"] }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", version = "0.1.0", features = ["internal-hooks"] }
+kafkaman-worker = { path = "../kafkaman-worker", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

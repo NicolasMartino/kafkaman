@@ -150,11 +150,94 @@ features:
       cargo check -p kafkaman --all-targets --no-default-features --features "$features"
     done
 
+# Build at the declared MSRV.
+#
+# `rust-version` is a promise to adopters, and an unverified promise is a guess.
+# The pinned toolchain is used rather than `stable` precisely because `stable`
+# would accept code the MSRV does not: a stabilisation that lands between the two
+# compiles here and breaks for anyone holding us to the declared floor.
+#
+# `--locked`, because resolving a *newer* dependency than `Cargo.lock` pins can
+# raise the effective MSRV without anything in this repository changing.
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    echo "==> MSRV gate: Rust ${version}"
+    rustup toolchain install "${version}" --profile minimal >/dev/null 2>&1 || true
+    cargo "+${version}" check --workspace --all-features --locked
+
+# Security advisories against Cargo.lock.
+#
+# Findings are triaged in `.cargo/audit.toml`, which requires a reason and a
+# revisit condition per ignore. `cargo audit` reads the *lockfile*, which records
+# packages no feature combination here builds, so an ignore is often a statement
+# that a crate is unreachable rather than that a risk is accepted — the config
+# says which.
+audit:
+    cargo audit
+
+# Cargo.lock is current, and no manifest edit has silently outdated it.
+#
+# Its own recipe rather than `--locked` on every build: forcing that locally
+# turns an ordinary dependency bump into a confusing failure, while a dedicated
+# gate answers the question the release actually depends on.
+lockfile:
+    cargo metadata --locked --format-version 1 > /dev/null
+    @echo "Cargo.lock is up to date"
+
 # Format, lint, and run the full test suite. Mirrors .github/workflows/ci.yml.
+#
+# Ordered cheapest-first so the fastest gate is the one that fails. `msrv` and
+# `audit` are in here because CI runs them: a `check` that passes locally and
+# then fails on the runner is worse than a slower `check`. Both want the
+# network — `msrv` may install a toolchain on first run, `audit` refreshes the
+# advisory database — which is the price of the local gate meaning what its
+# name says. `just test coverage` is deliberately not here; it is the same
+# tests again under instrumentation, and CI is the right place to pay for that.
 check:
     just lint
+    just lockfile
     just features
+    just msrv
+    just audit
     just test all
+
+# Everything `check` runs, plus the gates CI keeps separate because they are slow
+# or need a toolchain download. Run before tagging.
+check-release:
+    just check
+    just msrv
+    just audit
+    just publish-order
+
+# The order the crates must be published in, and a package check for each.
+#
+# `cargo publish` resolves path dependencies from crates.io, so a crate cannot be
+# published before everything it depends on. The order below is the dependency
+# topology; publishing out of it fails with "no matching package named ...",
+# which reads like a missing crate rather than a sequencing mistake.
+#
+# `--no-verify` because the compile is already covered by `just check`; this
+# recipe is about metadata and ordering. Nothing here contacts crates.io to
+# write — it is a rehearsal.
+publish-order:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "publish in this order:"
+    for crate in kafkaman-core kafkaman-config kafkaman-sqlx kafkaman-worker \
+                 kafkaman-axum kafkaman-rdkafka kafkaman-otel kafkaman kafkaman-test; do
+      echo "  - $crate"
+    done
+    echo ""
+    # Only the leaves can be packaged before anything is published; the rest
+    # would need their dependencies to exist on crates.io first. Checking the
+    # leaves still catches the metadata errors that block a release.
+    for crate in kafkaman-core kafkaman-otel; do
+      echo "==> cargo package -p $crate"
+      cargo package -p "$crate" --no-verify --allow-dirty >/dev/null
+    done
+    echo "leaf crates package cleanly; the rest publish in the order above"
 
 # Normal successful tests rely on Testcontainers' Drop cleanup. This fallback is
 # intentionally label-scoped so it cannot remove unrelated Postgres or Redpanda

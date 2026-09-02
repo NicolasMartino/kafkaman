@@ -9,7 +9,7 @@
   - wiki/plans/m3-durable-completion.plan.md
   - wiki/decisions/message-identity-and-header-namespace.decision.md
   - crates/kafkaman-rdkafka/src/lib.rs
-  - tests/durable-send/tests/redpanda_full_loop.rs
+  - tests/durable-send/tests/redpanda_full_loop/
 - Related:
   - wiki/decisions/message-consumption-and-handler-model.decision.md
   - wiki/decisions/message-identity-and-header-namespace.decision.md

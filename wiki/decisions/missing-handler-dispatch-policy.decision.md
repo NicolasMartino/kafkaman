@@ -9,7 +9,7 @@
   - wiki/plans/m3-durable-completion.plan.md
   - wiki/proposals/05-deep-durability-testing.proposal.md
   - crates/kafkaman-sqlx/src/lib.rs
-  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/durable_receive/
 - Related:
   - wiki/decisions/dispatch-handler-ordering.decision.md
   - wiki/decisions/runtime-builder-and-axum-composition.decision.md

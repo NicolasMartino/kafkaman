@@ -1,9 +1,14 @@
 [package]
 name = "kafkaman-otel"
 version = "0.1.0"
+description = "Opt-in OpenTelemetry OTLP pipeline for applications that host kafkaman"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # No `tls` feature, deliberately — see the crate docs' Transport section.
 #

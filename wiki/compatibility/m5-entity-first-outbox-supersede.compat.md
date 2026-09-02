@@ -11,7 +11,7 @@
   - wiki/decisions/entity-first-propagation-model.decision.md
   - crates/kafkaman-core/src/lib.rs
   - crates/kafkaman-sqlx/src/lib.rs
-  - tests/durable-send/tests/entity_first_outbox_supersede.rs
+  - tests/durable-send/tests/entity_first_outbox_supersede/
 - Related:
   - wiki/compatibility/m5-entity-first-cache-api.compat.md
 

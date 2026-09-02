@@ -1,9 +1,14 @@
 [package]
 name = "kafkaman-sqlx"
 version = "0.1.0"
+description = "PostgreSQL persistence for kafkaman: migrations, outbox, received tables, dispatch, and entity caches"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = ["traces"]
@@ -15,8 +20,8 @@ internal-hooks = []
 traces = ["kafkaman-core/traces"]
 
 [dependencies]
-kafkaman-config = { path = "../kafkaman-config" }
-kafkaman-core = { path = "../kafkaman-core", default-features = false }
+kafkaman-config = { path = "../kafkaman-config", version = "0.1.0" }
+kafkaman-core = { path = "../kafkaman-core", version = "0.1.0", default-features = false }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

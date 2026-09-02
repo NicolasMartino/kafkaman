@@ -8,7 +8,7 @@
 - Sources:
   - wiki/plans/m3-durable-receive.plan.md
   - wiki/reviews/m3-durable-receive-implementation-review.reference.md
-  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/durable_receive/
   - crates/kafkaman-sqlx/src/lib.rs
 - Related:
   - wiki/specs/m1-durable-send.spec.md
@@ -682,7 +682,7 @@ transaction. Treat this class as a landed regression target.
 ## Next Steps
 
 - Convert priority items 1-4 into concrete tests under
-  `tests/durable-send/tests/durable_receive.rs` or a receive-focused test crate.
+  `tests/durable-send/tests/durable_receive/` or a receive-focused test crate.
 - Fix P1 as a small test-hygiene change whenever the receive tests are next
   edited.
 - Add a small test-only pause-point mechanism only where manual SQL simulation

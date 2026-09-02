@@ -1,9 +1,12 @@
-# Runs what `just check` runs locally — lint, the feature matrix, the full test
-# suite — plus one job it does not: the coverage floor. That one re-runs the
-# whole suite under instrumentation, which is too slow to sit in a gate meant to
-# be run before every push; `just test coverage` is the local equivalent when it
-# is the job that went red. Everything else is the same command, so a green
-# `just check` predicts everything but that.
+# Runs what `just check` runs locally — lint, the lockfile gate, the feature
+# matrix, the full test suite — plus three jobs it does not: the coverage floor,
+# the MSRV build, and the advisory scan. Those are split out because each is slow
+# or needs its own toolchain, and `just check` is meant to be run before every
+# push. `just check-release` is the local equivalent of the whole thing.
+#
+# So a green `just check` predicts every job below except `coverage`, `msrv`, and
+# `audit` — and those three have local recipes (`just test coverage`, `just msrv`,
+# `just audit`) for when one of them is what went red.
 #
 # The absence of this workflow is how a `clippy -D warnings` failure and a
 # semantically broken test reached the branch.
@@ -27,7 +30,10 @@ jobs:
   # rather than after the container-backed suite has finished.
   lint:
     name: fmt + clippy
-    runs-on: ubuntu-latest
+    # Pinned rather than `ubuntu-latest`: the floating label moves without a
+    # commit here, so a green build can turn red on a runner image change that
+    # nothing in this repository can be bisected against.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install librdkafka build deps
@@ -35,11 +41,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@just
       - run: just lint
+      # Before the feature matrix: a stale lockfile changes which versions every
+      # later job resolves, so a failure here explains failures there.
+      - run: just lockfile
       - run: just features
 
   test:
     name: tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -51,9 +60,42 @@ jobs:
       # which uses the Docker daemon preinstalled on GitHub's Ubuntu runners.
       - run: just test all
 
+  # The declared `rust-version` is a compatibility promise to adopters, and an
+  # unverified promise is a guess. This is the only job that builds with anything
+  # other than stable.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install librdkafka build deps
+        run: sudo apt-get update && sudo apt-get install -y libsasl2-dev
+      # Its own cache key: this job builds with a different compiler than every
+      # other one, so sharing a cache with them would thrash both.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - uses: taiki-e/install-action@just
+      - run: just msrv
+
+  # Advisories are checked against Cargo.lock, which lists packages no feature
+  # combination here builds — so triage lives in `.cargo/audit.toml`, where each
+  # ignore carries a reason and a revisit condition.
+  audit:
+    name: advisories
+    runs-on: ubuntu-24.04
+    # Deliberately not `needs: lint`: an advisory is worth knowing about even on
+    # a branch that does not compile, and this job needs neither Docker nor a
+    # full build.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
   coverage:
     name: coverage floor
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: lint
     steps:
       - uses: actions/checkout@v4

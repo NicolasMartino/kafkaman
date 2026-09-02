@@ -23,9 +23,18 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+# Verified rather than asserted: `just msrv` and the CI job of the same name
+# build the workspace with exactly this toolchain. A `rust-version` nothing
+# compiles against is a compatibility claim made to adopters on no evidence.
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nicolasmartino/kafkaman"
+homepage = "https://github.com/nicolasmartino/kafkaman"
+# Inherited by every crate so `cargo publish` has the metadata it requires
+# without nine near-identical copies. `description` is per-crate, because it is
+# the one field that genuinely differs and the one a search result shows.
+keywords = ["kafka", "outbox", "postgres", "cache", "cqrs"]
+categories = ["asynchronous", "database", "network-programming"]
 
 [workspace.dependencies]
 async-trait = "0.1"

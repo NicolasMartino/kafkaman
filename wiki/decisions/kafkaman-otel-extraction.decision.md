@@ -81,7 +81,9 @@
 
 This decision contradicts `telemetry-pipeline-ownership.decision.md` item 6 as
 written — "Exporter dependencies live in exactly two places: `apps/` and
-`tests/`." That decision is amended rather than superseded; the amendment is
+`tests/`." (That item now reads `examples/`, which is what `apps/` was renamed
+to on 2026-08-24; the quotation above is left as it stood when this was
+written.) That decision is amended rather than superseded; the amendment is
 recorded in its own *Amendments* section, following the precedent set by its
 2026-08-25 `tracing-opentelemetry` entry. The substance of item 1 is untouched.
 

@@ -1,9 +1,14 @@
 [package]
 name = "kafkaman-worker"
 version = "0.1.0"
+description = "kafkaman run loops: outbox relay, receive dispatcher, outbox purger, and queue-depth sampler"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = ["metrics", "traces"]
@@ -19,8 +24,8 @@ traces = ["kafkaman-core/traces", "kafkaman-sqlx/traces"]
 
 [dependencies]
 async-trait.workspace = true
-kafkaman-core = { path = "../kafkaman-core", default-features = false }
-kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
+kafkaman-core = { path = "../kafkaman-core", version = "0.1.0", default-features = false }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", version = "0.1.0", default-features = false }
 # Metrics only: this crate records counters and histograms and never touches
 # the trace API — `traces` here delegates to `kafkaman-core`, which owns the
 # span work. See the workspace manifest for why the axis is named per crate.

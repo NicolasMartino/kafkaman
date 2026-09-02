@@ -59,8 +59,13 @@
    and is unchanged.
 
 6. **Exporter dependencies live in exactly two places.**
-   `apps/` and `tests/`. This is checkable mechanically and should be checked.
+   `examples/` and `tests/`. This is checkable mechanically and should be
+   checked.
    *Amended 2026-08-27 — see below: a third place, `crates/kafkaman-otel`.*
+   *Renamed 2026-09-03 — this said `apps/`, which was the directory's name until
+   the two-service example replaced `apps/axum-outbox` on 2026-08-24. The rule
+   is unchanged; only the place's name was stale, and code comments quoting it
+   had inherited the stale name.*
 
 ## Amendments
 
@@ -91,8 +96,9 @@ one flag to reach for.
 
 ### 2026-08-27 — a third place for exporters: `crates/kafkaman-otel`
 
-Decision 6 says exporter dependencies live in exactly two places, `apps/` and
-`tests/`. A third is added, and it is recorded here rather than taken quietly.
+Decision 6 says exporter dependencies live in exactly two places, `examples/`
+and `tests/`. A third is added, and it is recorded here rather than taken
+quietly.
 
 The pipeline the example services install was found duplicated byte-for-byte
 across both of them, which is the condition

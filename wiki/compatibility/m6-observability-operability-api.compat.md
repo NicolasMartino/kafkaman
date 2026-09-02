@@ -19,7 +19,8 @@
   - crates/kafkaman/src/lib.rs
   - crates/kafkaman-core/src/lifecycle.rs
   - crates/kafkaman-core/src/status.rs
-  - apps/axum-outbox/src/main.rs
+  - examples/order/src/main.rs
+  - examples/product/src/main.rs
   - kafkaman.example.toml
   - examples/order/kafkaman.toml
   - examples/product/kafkaman.toml
@@ -109,7 +110,7 @@ and exists only so the two macros expand in a crate that does not depend on
 - summary/stuck row structs for outbox and received inspection.
 
 `kafkaman-axum` is a new crate. The facade crate re-exports it behind the new
-`kafkaman/axum` feature. Its public surface is:
+`kafkaman/axum` feature. Its public surface **as shipped in M6** was:
 
 - `CorrelationLayer`, `CorrelationService`, `CorrelationId`,
   `CORRELATION_ID_HEADER`, `MAX_CORRELATION_ID_LEN`
@@ -118,6 +119,23 @@ and exists only so the two macros expand in a crate that does not depend on
   `RedriveResponse`, `MAX_REDRIVE_ROWS`
 - `serve`, `RuntimeServer`, `RuntimeTask`, `RuntimeError`,
   `DEFAULT_DRAIN_TIMEOUT`.
+
+**Corrected 2026-09-03.** Two items in that list were wrong or are now stale, and
+this page is Active, so a reader would otherwise take them as current:
+
+- `MAX_CORRELATION_ID_LEN` was never public. It was a private `const` when M6
+  shipped and is `pub(crate)` today; the 128-byte bound it names is still
+  enforced, but it was never something a caller could name. The list was wrong
+  when written.
+- `serve`, `RuntimeServer`, `RuntimeTask`, `RuntimeError`, and
+  `DEFAULT_DRAIN_TIMEOUT` were removed from this crate by the V1 legacy removal
+  — see [v1-legacy-removal](v1-legacy-removal.compat.md). Supervision now lives
+  behind the facade: `kafkaman::axum::serve(..)` and
+  `kafkaman::{RuntimeError, RuntimeTasks, DEFAULT_DRAIN_TIMEOUT}`.
+  `kafkaman-axum` is HTTP-only.
+
+The current surface is the crate root's re-export list in
+`crates/kafkaman-axum/src/lib.rs`, which is deliberately short enough to read.
 
 ## Breaking Changes
 
@@ -274,7 +292,7 @@ contract is below, and `tests/observability/otlp_wire` builds all three provider
 and asserts their export on the wire, which makes it a working reference for the
 port.
 
-Exporter dependencies remain confined to `apps/` and `tests/`; on this branch
+Exporter dependencies remain confined to `examples/` and `tests/`; on this branch
 that means `tests/` alone. No `crates/` manifest carries an SDK or an exporter.
 
 ## Metric Provider Ordering Contract

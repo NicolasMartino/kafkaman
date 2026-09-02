@@ -15,9 +15,9 @@
   - crates/kafkaman-worker/src/lib.rs
   - crates/kafkaman-rdkafka/src/lib.rs
   - crates/kafkaman-axum/src/lib.rs
-  - tests/durable-send/tests/durable_send.rs
-  - tests/durable-send/tests/durable_receive.rs
-  - tests/durable-send/tests/redpanda_full_loop.rs
+  - tests/durable-send/tests/durable_send/
+  - tests/durable-send/tests/durable_receive/
+  - tests/durable-send/tests/redpanda_full_loop/
 - Related:
   - wiki/specs/entity-first-propagation.spec.md
   - wiki/specs/m4-retry-backoff-dlq.spec.md

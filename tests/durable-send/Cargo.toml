@@ -1,7 +1,10 @@
 [package]
 name = "durable-send-tests"
 version = "0.1.0"
+# Workspace-internal: an example or an integration-test package, never shipped.
+publish = false
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

@@ -14,7 +14,7 @@
   - wiki/compatibility/m5-code-audit-remediation.compat.md
   - crates/kafkaman-config/src/lib.rs
   - crates/kafkaman-sqlx/src/lib.rs
-  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/durable_receive/
 - Related:
   - wiki/specs/m3-durable-receive.spec.md
   - wiki/roadmaps/path-to-v1.roadmap.md

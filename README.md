@@ -101,6 +101,28 @@ messaging semantic conventions prescribe for batch-shaped consumers. `just
 examples demo` is the same walkthrough without the telemetry backend, for when
 Docker is tight on memory.
 
+## Verifying It
+
+`just check` is the gate to run before pushing: formatting, `clippy -D warnings`,
+the dependency-graph assertions in `just opt-out`, `cargo doc -D warnings`, the
+lockfile check, the feature matrix, and the full test suite. It mirrors CI except
+for three jobs that are too slow or need their own toolchain:
+
+| Recipe | Answers |
+| --- | --- |
+| `just msrv` | Does the workspace still build on the `rust-version` it advertises? |
+| `just audit` | Any security advisory against `Cargo.lock`? Triage lives in `.cargo/audit.toml`, where every ignore carries a reason and a revisit condition. |
+| `just test coverage` | Is the line-coverage floor still met? |
+
+`just check-release` runs all of it, plus `just publish-order`, which records the
+order the crates must be published in — publishing out of it fails with "no
+matching package named ...", which reads like a missing crate rather than a
+sequencing mistake.
+
+The container-backed suites start Postgres and Redpanda through testcontainers,
+so they need a running Docker daemon. `just clean-containers` removes any left
+behind by an interrupted run, scoped by label so it cannot touch unrelated ones.
+
 ## Current Status
 
 This repository is pre-v1, with the V1 acceptance envelope now documented.

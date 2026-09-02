@@ -440,7 +440,7 @@ impl RdkafkaConsumer {
             ))
             .await?;
 
-        // Before the commit: a tripped breaker must leave the offset
+        // Before the Kafka offset commit: a tripped breaker must leave the offset
         // uncommitted, so the operator's fix is not raced by the loop moving on.
         self.count_skip(at)?;
         self.commit_record(message)?;

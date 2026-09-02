@@ -1,6 +1,6 @@
 # AGENTS.md - Project Schema
 
-This is kafkaman: We imagined the following, in a service oriented architecture each service would communicate with another using kafka instead of rest because of its reliabilty and monitoring story. In order to clarify when a message is consumed/sent it would first be saved in a  postgres database then a scheduler would attempt to run the code in the app to consume the message or send it and handle retries. So we plan to make a library to handle kafka that would plug in our modern rust projects.
+This is kafkaman: We imagined the following, in a service oriented architecture each service would communicate with another using kafka instead of rest because of its reliability and monitoring story. In order to clarify when a message is consumed/sent it would first be saved in a postgres database then a scheduler would attempt to run the code in the app to consume the message or send it and handle retries. So we plan to make a library to handle kafka that would plug in our modern rust projects.
 
 ## Agent Role
 
@@ -83,6 +83,22 @@ Periodically or on request:
 | Document type | Filename suffix | Folder |
 | --- | --- | --- |
 | Compatibility Note | `compat.md` | `wiki/compatibility` |
+| Implementation Review | `reference.md` | `wiki/reviews` |
+
+An Implementation Review is a `reference.md` because that is what it is: evidence
+from an investigation, at a point in time. It keeps the `Sourced` status and the
+line-number citations it was written with, and it is **not** updated when the
+code moves underneath it — a review that is edited to stay current stops being a
+record of what was found. Durable conclusions from a review are promoted into a
+spec or a decision instead, which is where staleness *is* a defect.
+
+**Cite the wiki page, not the working file.** A review is usually drafted as a
+scratch file at the repository root (`review.md`, `worktree-review.md`) that is
+never committed. Three pages cite `review.md` in their `Sources:` and it has
+never existed in this repository, which makes those citations unfollowable —
+provenance that points at nothing is worse than none, because it reads as though
+it could be checked. Land the review as a `wiki/reviews/*.reference.md` page
+first, then cite that.
 
 ## Library Pack
 

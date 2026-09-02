@@ -8,8 +8,12 @@ facade runtime supervision with early clean-exit errors, named loop failures,
 and bounded drain. Phase 3 added explicit subsystem selection and a no-HTTP
 product worker. Phase 4 completed the Redpanda/Postgres full-loop acceptance
 pass. Phase 5 promoted the V1 acceptance envelope and closed implementation
-status. Release tagging remains outside the M7 implementation milestone.
-Updated: 2026-08-31
+status. A pre-merge hardening pass then fixed seventeen stale proof citations,
+added MSRV, lockfile, and advisory gates, made the crates publishable, and split
+`kafkaman-axum` into modules with an unchanged public API. Release tagging
+remains outside the M7 implementation milestone; the ordering it needs is
+recorded in `just publish-order`.
+Updated: 2026-09-03
 
 One-line: A Rust library plus optional worker runtime for Kafka-backed
 distributed caches of compact domain entity snapshots, using Postgres as the
@@ -148,7 +152,7 @@ durable entity propagation ledger and local cache store.
   the two things that read as legacy and were deliberately kept. Read this
   before assuming any older compat note's upgrade path still exists.
   Status: Active.
-- [compatibility/m1-durable-send-schema-and-api-changes.compatibility.md](compatibility/m1-durable-send-schema-and-api-changes.compatibility.md)
+- [compatibility/m1-durable-send-schema-and-api-changes.compat.md](compatibility/m1-durable-send-schema-and-api-changes.compat.md)
   - Records the review-fix schema/API changes: durable `idempotency_key` column
   plus its `AddIdempotencyKey` upgrade changeset for pre-existing tables,
   `mark_publish_failed` retry-duration signature, and reserved `kafkaman-` header

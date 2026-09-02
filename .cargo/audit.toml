@@ -1,0 +1,55 @@
+# `cargo audit` configuration.
+#
+# `cargo audit` scans `Cargo.lock`, which records the union of every package the
+# resolver *could* select — including optional dependencies no feature
+# combination in this workspace turns on. So a finding here is not yet a finding
+# about anything this repository builds, and each ignore below records which of
+# the two it is.
+#
+# The check that separates them:
+#
+#     cargo tree --workspace --all-features --target all -e normal | grep <crate>
+#
+# An empty result means the crate is in the lockfile and in no build.
+#
+# Every entry needs a reason and a revisit condition. An ignore list without
+# those decays into a mute button.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack, timing sidechannel key recovery in
+    # `rsa` 0.9.x. Medium (5.9), and upstream has no fixed release.
+    #
+    # `rsa` reaches the lockfile only through `sqlx-mysql`, which this workspace
+    # never builds: the sqlx dependency is pinned `default-features = false`
+    # with `postgres` and no other driver, and `cargo tree --workspace
+    # --all-features --target all` finds zero `sqlx-mysql` edges. kafkaman is
+    # PostgreSQL-only by design — see wiki/decisions/schema-and-change-management
+    # — so no build of this workspace links `rsa`, and no kafkaman code path
+    # performs RSA operations.
+    #
+    # Revisit if: a MySQL driver is ever enabled, `sqlx` moves `rsa` out from
+    # behind the mysql feature, or upstream ships a fixed `rsa`. The first two
+    # would make this a real exposure; the third lets the ignore be deleted.
+    "RUSTSEC-2023-0071",
+]
+
+# Yanked crates are reported, and deliberately only as warnings: yanking is
+# frequently administrative (a bad release tag, a version bump mistake) rather
+# than a security event, so failing the gate on one would train people to pass
+# `--ignore` rather than to read it.
+#
+# Current known warning: `chacha20` 0.10.1, reached only through
+# `testcontainers`, which is a dev-dependency of the integration-test packages
+# and ships in nothing.
+[yanked]
+enabled = true
+update_index = false
+
+# Yanked crates are reported but do not fail the gate, and one is expected:
+# `chacha20` reaches the lockfile through the test-only stack and is yanked
+# upstream. It is a warning rather than an ignore because there is nothing to
+# triage — no advisory, no exposure in a shipped artifact — and because a yanked
+# dev dependency should stay visible until the dependency that pulls it in moves
+# on. If `cargo audit` ever reports a *second* yanked crate, read it: this
+# comment is not a blanket exemption.

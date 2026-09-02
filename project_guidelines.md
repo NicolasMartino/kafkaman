@@ -10,7 +10,7 @@
 
 This file defines the documentation and execution model for kafkaman.
 
-We imagined the following, in a service oriented architecture each service would communicate with another using kafka instead of rest because of its reliabilty and monitoring story. In order to clarify when a message is consumed/sent it would first be saved in a  postgres database then a scheduler would attempt to run the code in the app to consume the message or send it and handle retries. So we plan to make a library to handle kafka that would plug in our modern rust projects.
+We imagined the following, in a service oriented architecture each service would communicate with another using kafka instead of rest because of its reliability and monitoring story. In order to clarify when a message is consumed/sent it would first be saved in a postgres database then a scheduler would attempt to run the code in the app to consume the message or send it and handle retries. So we plan to make a library to handle kafka that would plug in our modern rust projects.
 
 The model combines the LLM Wiki pattern (Karpathy, 2026) with typed document
 roles. The agent owns the wiki layer. The human curates raw sources and makes
@@ -246,6 +246,12 @@ Metadata block for all wiki documents:
 - Scope: [ONE SENTENCE]
 - Sources: [list of raw/ paths or external URLs that informed this page]
 ```
+
+`wiki/index.md` and `wiki/log.md` are exempt. They are not documents about the
+project — they are the catalog of documents and the append-only record of work,
+both of which the framework maintains. A `Status:` on the index would describe
+nothing, and a `Date:` on a log that spans every entry would be wrong the moment
+the next one lands. Every *typed* page above carries the block.
 
 Optional fields:
 

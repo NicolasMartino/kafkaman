@@ -1,9 +1,15 @@
 [package]
 name = "kafkaman"
 version = "0.1.0"
+description = "Kafka-backed distributed cache of domain entity snapshots, with a Postgres outbox, durable receive, and a role-driven runtime"
+readme = "README.md"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = ["metrics", "traces"]
@@ -44,12 +50,12 @@ traces = [
 
 [dependencies]
 axum = { workspace = true, optional = true }
-kafkaman-axum = { path = "../kafkaman-axum", optional = true }
-kafkaman-config = { path = "../kafkaman-config" }
-kafkaman-core = { path = "../kafkaman-core", default-features = false }
-kafkaman-rdkafka = { path = "../kafkaman-rdkafka", optional = true, default-features = false }
-kafkaman-sqlx = { path = "../kafkaman-sqlx", default-features = false }
-kafkaman-worker = { path = "../kafkaman-worker", default-features = false }
+kafkaman-axum = { path = "../kafkaman-axum", version = "0.1.0", optional = true }
+kafkaman-config = { path = "../kafkaman-config", version = "0.1.0" }
+kafkaman-core = { path = "../kafkaman-core", version = "0.1.0", default-features = false }
+kafkaman-rdkafka = { path = "../kafkaman-rdkafka", version = "0.1.0", optional = true, default-features = false }
+kafkaman-sqlx = { path = "../kafkaman-sqlx", version = "0.1.0", default-features = false }
+kafkaman-worker = { path = "../kafkaman-worker", version = "0.1.0", default-features = false }
 serde.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

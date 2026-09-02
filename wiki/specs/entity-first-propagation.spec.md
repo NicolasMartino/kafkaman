@@ -22,10 +22,10 @@
   - crates/kafkaman-rdkafka/src/lib.rs
   - crates/kafkaman-rdkafka/src/topics.rs
   - crates/kafkaman-worker/src/lib.rs
-  - tests/durable-send/tests/entity_first_propagation.rs
-  - tests/durable-send/tests/entity_first_outbox_supersede.rs
+  - tests/durable-send/tests/entity_first_propagation/
+  - tests/durable-send/tests/entity_first_outbox_supersede/
   - tests/durable-send/tests/outbox_retention.rs
-  - tests/durable-send/tests/redpanda_full_loop.rs
+  - tests/durable-send/tests/redpanda_full_loop/
   - tests/durable-send/tests/topic_convergence.rs
   - tests/distributed-cache/tests/provision.rs
   - examples/provision/src/lib.rs

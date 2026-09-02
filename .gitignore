@@ -30,4 +30,13 @@ kafkaman.toml
 # for reference but intentionally not committed. The distilled summary,
 # manifest, and small web/crate sources stay tracked.
 raw/research/2026-06-20-kafkaman-objectives-rust-microservice-architecture/sources/01-cqrs-fullstack/
+
+# Per-machine agent scaffolding. These hold absolute paths, install hashes, and
+# per-developer tool preferences, so committing one makes the next person's
+# working tree dirty on first run for a file neither of them meant to share.
+#
+# `.serena/project.yml` and `.serena/.gitignore` predate this rule and stay
+# tracked — git keeps tracking a file the ignore list gains later — which is
+# deliberate: the project id in there is shared, not per-machine.
 .serena
+.claude/

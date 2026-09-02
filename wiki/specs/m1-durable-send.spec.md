@@ -119,7 +119,7 @@
 - Schema/API changes from the review-hardening pass (durable `idempotency_key`,
   the `mark_publish_failed` retry-duration signature, reserved headers) are
   recorded in
-  `wiki/compatibility/m1-durable-send-schema-and-api-changes.compatibility.md`.
+  `wiki/compatibility/m1-durable-send-schema-and-api-changes.compat.md`.
 
 ## Evidence
 

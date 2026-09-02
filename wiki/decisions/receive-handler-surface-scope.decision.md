@@ -9,7 +9,7 @@
   - wiki/plans/m3-durable-completion.plan.md
   - wiki/decisions/message-consumption-and-handler-model.decision.md
   - crates/kafkaman-sqlx/src/lib.rs
-  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/durable_receive/
 - Related:
   - wiki/decisions/message-consumption-and-handler-model.decision.md
 

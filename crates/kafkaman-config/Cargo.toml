@@ -1,9 +1,14 @@
 [package]
 name = "kafkaman-config"
 version = "0.1.0"
+description = "Loading and validating kafkaman.toml, accumulating every problem in one pass"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # `default-features = false` is load-bearing, not tidiness. Cargo unifies
@@ -11,7 +16,7 @@ repository.workspace = true
 # puts `opentelemetry` back into a `kafkaman --no-default-features` build —
 # the opt-out `kafkaman/Cargo.toml` advertises. Nothing here touches the
 # trace API; it needs the config vocabulary only.
-kafkaman-core = { path = "../kafkaman-core", default-features = false }
+kafkaman-core = { path = "../kafkaman-core", version = "0.1.0", default-features = false }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

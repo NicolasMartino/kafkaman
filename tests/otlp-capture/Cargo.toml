@@ -2,6 +2,7 @@
 name = "otlp-capture"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
@@ -12,7 +13,7 @@ publish = false
 # message half without the tonic transport, which is all a decoder needs.
 #
 # Under `tests/` rather than `crates/` on purpose: the ownership decision
-# confines exporters and their vocabulary to `apps/` and `tests/`, and both
+# confines exporters and their vocabulary to `examples/` and `tests/`, and both
 # callers of this crate are test suites.
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",

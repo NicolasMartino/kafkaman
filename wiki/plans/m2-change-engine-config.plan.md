@@ -14,7 +14,7 @@
 - Related:
   - wiki/roadmaps/path-to-v1.roadmap.md
   - wiki/specs/m1-durable-send.spec.md
-  - wiki/compatibility/m1-durable-send-schema-and-api-changes.compatibility.md
+  - wiki/compatibility/m1-durable-send-schema-and-api-changes.compat.md
 
 ## How To Read This
 

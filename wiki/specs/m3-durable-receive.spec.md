@@ -17,8 +17,8 @@
   - wiki/decisions/dispatch-stats-semantics.decision.md
   - wiki/compatibility/m3-durable-receive-review-fix-api.compat.md
   - wiki/proposals/05-deep-durability-testing.proposal.md
-  - tests/durable-send/tests/durable_receive.rs
-  - tests/durable-send/tests/redpanda_full_loop.rs
+  - tests/durable-send/tests/durable_receive/
+  - tests/durable-send/tests/redpanda_full_loop/
 - Related:
   - wiki/specs/m1-durable-send.spec.md
   - wiki/specs/m2-change-engine-config.spec.md

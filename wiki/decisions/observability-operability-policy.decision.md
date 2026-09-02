@@ -13,8 +13,8 @@
   - crates/kafkaman-worker/src/lib.rs
   - crates/kafkaman-rdkafka/src/lib.rs
   - crates/kafkaman-axum/src/lib.rs
-  - tests/durable-send/tests/durable_send.rs
-  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/durable_send/
+  - tests/durable-send/tests/durable_receive/
 - Related:
   - wiki/specs/m6-observability-operability.spec.md
   - wiki/compatibility/m6-observability-operability-api.compat.md

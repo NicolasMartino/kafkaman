@@ -16,7 +16,7 @@
   - crates/kafkaman-core/src/lib.rs
   - crates/kafkaman-sqlx/src/lib.rs
   - crates/kafkaman-test/src/lib.rs
-  - tests/durable-send/tests/entity_first_propagation.rs
+  - tests/durable-send/tests/entity_first_propagation/
 
 ## Public API Changes
 

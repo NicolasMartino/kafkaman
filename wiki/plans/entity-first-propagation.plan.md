@@ -90,7 +90,7 @@ convergence contract before any of it exists.
 Progress 2026-08-13: `retry_after_newer_applied_does_not_regress_cache`,
 `concurrent_dispatch_of_two_states_converges_to_newer`, and
 `redrive_after_newer_applied_does_not_regress_cache` are implemented in
-`tests/durable-send/tests/entity_first_propagation.rs` and pass against the first
+`tests/durable-send/tests/entity_first_propagation/` and pass against the first
 cache-upsert slice. Redelivery-after-purge and bootstrap replay remain pending.
 
 ## Phase 1 — Entity Surface And Cache Tables

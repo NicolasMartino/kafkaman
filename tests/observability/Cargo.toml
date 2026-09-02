@@ -2,6 +2,7 @@
 name = "observability-tests"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
@@ -35,7 +36,7 @@ rdkafka = { workspace = true, optional = true }
 # `testing` on top of the workspace features: `InMemoryMetricExporter` lives
 # there, and no non-test member should carry it.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-# Exporters live in `apps/` and `tests/` and nowhere else, per
+# Exporters live in `examples/` and `tests/` and nowhere else, per
 # wiki/decisions/telemetry-pipeline-ownership.decision.md. This suite is the
 # `tests/` half: it is where "kafkaman's telemetry reaches the wire" is proved,
 # independent of whichever example currently ships.
@@ -59,8 +60,8 @@ sqlx.workspace = true
 # message half without the tonic transport, which is all a decoder needs.
 #
 # A test-only dependency, and allowed to be: the ownership decision confines
-# exporters and their vocabulary to `apps/` and `tests/`, and this is the `tests/`
-# half. Already in the tree behind `opentelemetry-otlp`, so it adds no
+# exporters and their vocabulary to `examples/` and `tests/`, and this is the
+# `tests/` half. Already in the tree behind `opentelemetry-otlp`, so it adds no
 # compilation that was not happening anyway.
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",

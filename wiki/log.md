@@ -1,3 +1,184 @@
+## [2026-09-03] lint | pre-merge hardening: stale proof links, release gates, and the one unsplit crate
+
+A line-by-line review of the `implementation/m7-hardening` worktree ahead of the
+merge. The Rust needed no correctness change — clippy is clean at
+`--all-targets --all-features`, there is no `TODO`, `unimplemented!`, or
+`unwrap()` outside test code, and the M7 acceptance evidence holds. What it found
+was four things around the code.
+
+**Stale proof links, in the document class that can least afford them.** The
+`durable-send` suites were split from single files into directories, and
+seventeen `Sources:` citations still named the old paths — across four Active
+specs, two Active compatibility notes, six Accepted decisions, two plans, and a
+proposal. A spec's `Sources` block *is* its proof link, so these were lint
+failures on exactly the pages that claim validated truth: a reader following one
+found nothing. All seventeen now name the directory.
+
+Deliberately **not** fixed: the same paths in `wiki/log.md` and in
+`wiki/reviews/*.reference.md`. Those cite line numbers as well as paths, so
+rewriting the path while leaving the line number would make them more wrong, not
+less — and both are records of what was true when written. `AGENTS.md` now says
+so outright, with `wiki/reviews/` added to the pack table: an Implementation
+Review is evidence at a point in time and is not updated when the code moves
+underneath it. Durable conclusions get promoted into a spec instead, which is
+where staleness is a defect.
+
+Same reasoning left `apps/axum-outbox` alone in the ~20 places it appears as
+narrative — "renamed from", "reverted", "briefly carried", "which that example
+replaces". Four were not narrative and are fixed: one live `Sources:` entry in
+the M6 compatibility note, which now points at the two example binaries that
+replaced it, and three statements of a *current* rule.
+
+That last group was the more interesting find. `telemetry-pipeline-ownership`
+item 6 — an Accepted decision — still said exporter dependencies live in
+"`apps/` and `tests/`", naming a directory renamed to `examples/` back on
+2026-08-24. The rule was never wrong and is still enforced by `just opt-out`;
+only the place's name had gone stale. But two `Cargo.toml` comments in
+`tests/observability` and `tests/otlp-capture` quote that decision verbatim, so
+they had inherited the stale name — a decision's wording propagating into code
+comments is exactly the coupling that makes this worth fixing rather than
+shrugging at. Item 6 now reads `examples/`, with a dated note saying what
+changed and that the rule did not, and the two comments follow it. The
+`kafkaman-otel-extraction` decision quotes item 6 "as written" and keeps its
+quotation, with a parenthetical pointing at the rename — a quotation that
+silently updates itself is not a quotation.
+
+**A security advisory nobody could see.** There was no advisory scan, and adding
+one surfaced RUSTSEC-2023-0071: the Marvin timing sidechannel in `rsa` 0.9.x,
+which upstream has not fixed. It reaches `Cargo.lock` through `sqlx-mysql`, which
+this workspace builds at zero feature combinations —
+`cargo tree --workspace --all-features --target all` finds no `sqlx-mysql` edge,
+because the sqlx dependency is pinned `default-features = false` with `postgres`
+alone. So it is a lockfile finding with no runtime exposure. That is now written
+down in `.cargo/audit.toml` with the command that proves it and the three
+conditions that would make it real, rather than being a thing nobody had looked
+at. An ignore list without reasons and revisit conditions decays into a mute
+button.
+
+**Gates that could not enforce what the manifests declared.** `rust-version =
+"1.90"` was an unverified promise; CI never passed `--locked`, so `Cargo.lock`
+was advisory; and no crate carried a `description`, which `cargo publish`
+requires — so the tag M7 exists to enable was blocked.
+
+The MSRV turned out to be worse than unverified. `[workspace.package]` declared
+it, but no member carried `rust-version.workspace = true`, so it was inherited by
+nothing: absent from every published manifest, invisible to Cargo's MSRV-aware
+resolver, and a promise made in a file no adopter reads. That surfaced only from
+unpacking a `cargo package` artifact and grepping the manifest it generates,
+which is the one place the question is answered honestly. Every member inherits
+it now, and the workspace does build on 1.90 — so the claim is both true and
+delivered.
+
+All of it is now gated:
+`just msrv` (verified: the workspace does build on 1.90), `just lockfile`, and
+`just publish-order`, which also records the topological order the crates must be
+published in, because publishing out of it fails with "no matching package
+named ...". That reads like a missing crate rather than a sequencing mistake.
+Adding the metadata surfaced a second blocker Cargo reports only at package time:
+internal path dependencies had no `version`, so none of them could have been
+published at all.
+
+**The one crate nobody had split.** `kafkaman-axum` was 1621 lines in a single
+file — the largest in the repository and the only crate not organised the way the
+other eight are. It is now `correlation`, `state`, `admin`, `redrive`, and
+`error`, with tests mirroring them; the largest file is 408 lines. The public API
+is byte-identical, verified item by item against the previous tree: fourteen
+names in, fourteen names out. `cargo doc` earned its place in the fast gate again
+by catching two intra-doc links that only broke once the items were in sibling
+modules, which is the same failure the gate was added for.
+
+One real gap closed while in there. Nothing enforced that `admin_router` stays
+free of the destructive route — merging redrive into it would have kept every
+test green while handing an unauthenticated reader a way to re-run handlers. A
+routing test now asserts the read-only router answers 404 for the redrive path,
+that the redrive router does not, and that the read-only router is serving at
+all, so a 404 cannot come from an empty router. Driven through a lazy pool, so it
+needs no database.
+
+Also: `.serena/project.yml` carried an uncommitted diff that was 44 lines of
+regenerated tool comments and zero functional change, reverted rather than
+merged; `.claude/` joined `.serena` in the ignore list with the reason spelled
+out; `.mcp.json` stopped hardcoding one developer's home directory; and the M1
+compatibility note was renamed from `.compatibility.md` to the `.compat.md`
+suffix `AGENTS.md` declares — the only page that had violated it.
+
+**The container flake, still open.** Four full-suite runs; three failed exactly
+one test, a different one each time, always in `Pool(...)`:
+
+| Run | Test | Error |
+| --- | --- | --- |
+| 1 | `metrics_surface` | `PoolTimedOut` |
+| 2 | `dispatch_handler_failure::a_handlers_database_error_...` | `Protocol("unknown message type: '\0'")` |
+| 3 | — | *481 passed, 0 failed* |
+| 4 | `cache_apply::..._no_resolvable_entity_key` | `PoolTimedOut` |
+
+Every one passed alone immediately afterwards — 3 to 9 seconds, no retry. So the
+rate is roughly one failure per 480 tests, on a machine at load average 6-11
+running Docker Desktop.
+
+This is not new. The M3/M4 pre-merge review recorded a `PoolTimedOut` in
+`replay_received_redrive_filters_...`, reached the same diagnosis, and asked for
+it to be watched. It is still worth watching, and it is now better characterised:
+it tracks container contention rather than any particular test, and a stray
+Redpanda container left in `Created` by a lost port race was enough to make it
+reproducible until `just clean-containers` removed it.
+
+A root cause was investigated and **the fix was wrong**, so it is recorded here
+rather than shipped. The `postgres:16-alpine` entrypoint logs `database system is
+ready to accept connections` twice on stderr — once for the temporary server
+`initdb` uses to apply `POSTGRES_DB`, which it then shuts down, and once for the
+real one. Waiting for the first would explain all three errors exactly. But
+changing the wait to `LogWaitStrategy::stderr(..).with_times(2)` made a *single*
+test fail at exactly the 60s startup timeout, deterministically, and
+testcontainers' own log stream is opened with `tail("all")`, which replays
+history and so should have seen both. The model does not survive that, the change
+was reverted, and both container helpers are byte-identical to what they were.
+Anyone picking this up starts from: the double message is real and verified, and
+`with_times(2)` is not the fix.
+
+The suite's best observed run is green: 481 passed, 0 failed, 74 suites under
+`--no-fail-fast` with containers cleaned first. That is the number to hold CI to;
+a single `Pool(...)` failure on a loaded developer machine is this flake and not a
+regression, and re-running the named test alone is the check that says so.
+
+Verified: `just lint` green end to end (fmt, clippy `-D warnings`, the
+no-default-features check, `just opt-out`, rustdoc `-D warnings`, workspace lib
+tests), `just lockfile`, `cargo audit`, `cargo +1.90.0 check --workspace
+--all-features --locked` all green, and `kafkaman-axum` at 21 tests where it had
+20.
+
+Pages affected: `wiki/specs/m3-durable-receive.spec.md`,
+`wiki/specs/m4-retry-backoff-dlq.spec.md`,
+`wiki/specs/m6-observability-operability.spec.md`,
+`wiki/specs/entity-first-propagation.spec.md`,
+`wiki/specs/m1-durable-send.spec.md`,
+`wiki/compatibility/m1-durable-send-schema-and-api-changes.compat.md`,
+`wiki/compatibility/m4-retry-backoff-runtime-api.compat.md`,
+`wiki/compatibility/m5-entity-first-cache-api.compat.md`,
+`wiki/compatibility/m5-entity-first-outbox-supersede.compat.md`,
+`wiki/compatibility/m6-observability-operability-api.compat.md`,
+`wiki/decisions/dispatch-infrastructure-error-classification.decision.md`,
+`wiki/decisions/dispatch-stats-semantics.decision.md`,
+`wiki/decisions/kafka-ingest-identity-and-ordering.decision.md`,
+`wiki/decisions/missing-handler-dispatch-policy.decision.md`,
+`wiki/decisions/observability-operability-policy.decision.md`,
+`wiki/decisions/receive-handler-surface-scope.decision.md`,
+`wiki/decisions/telemetry-pipeline-ownership.decision.md`,
+`wiki/decisions/kafkaman-otel-extraction.decision.md`,
+`wiki/plans/entity-first-propagation.plan.md`,
+`wiki/plans/m1-durable-send-implementation.plan.md`,
+`wiki/plans/m2-change-engine-config.plan.md`,
+`wiki/plans/m4-retry-backoff-dlq.plan.md`,
+`wiki/proposals/05-deep-durability-testing.proposal.md`,
+`wiki/index.md`, `wiki/log.md`, `AGENTS.md`, `Cargo.toml`, `justfile`,
+`.github/workflows/ci.yml`, `.cargo/audit.toml`, `.gitignore`, `.mcp.json`,
+`crates/*/Cargo.toml`, `crates/kafkaman/README.md`,
+`crates/kafkaman-axum/src/` (split into `admin.rs`, `correlation.rs`,
+`error.rs`, `redrive.rs`, `state.rs`, `tests.rs`, `tests/`),
+`examples/*/Cargo.toml`, `tests/*/Cargo.toml`,
+`tests/observability/Cargo.toml`, `tests/otlp-capture/Cargo.toml`,
+`README.md`.
+
 ## [2026-08-31] fix | the broker-outage scenario counted terminal rows as backlog
 
 Ran the examples from scratch against the V1 tree — `just examples down`, then

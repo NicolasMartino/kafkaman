@@ -484,4 +484,4 @@ were resolved after the initial completion. Outcome:
   demonstration code.
 
 Schema and API impact is recorded in
-[compatibility/m1-durable-send-schema-and-api-changes.compatibility.md](../compatibility/m1-durable-send-schema-and-api-changes.compatibility.md).
+[compatibility/m1-durable-send-schema-and-api-changes.compat.md](../compatibility/m1-durable-send-schema-and-api-changes.compat.md).

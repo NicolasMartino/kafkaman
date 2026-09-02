@@ -11,7 +11,7 @@
   - wiki/specs/m3-durable-receive.spec.md
   - crates/kafkaman-config/src/lib.rs
   - crates/kafkaman-sqlx/src/lib.rs
-  - tests/durable-send/tests/durable_receive.rs
+  - tests/durable-send/tests/durable_receive/
 - Related:
   - wiki/plans/m3-durable-completion.plan.md
   - wiki/proposals/05-deep-durability-testing.proposal.md
