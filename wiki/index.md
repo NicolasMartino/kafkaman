@@ -12,8 +12,9 @@ status. A pre-merge hardening pass then fixed seventeen stale proof citations,
 added MSRV, lockfile, and advisory gates, made the crates publishable, and split
 `kafkaman-axum` into modules with an unchanged public API. Release tagging
 remains outside the M7 implementation milestone; the ordering it needs is
-recorded in `just publish-order`.
-Updated: 2026-09-03
+recorded in `just publish-order`. A Kafka broker authentication proposal is open
+for review; nothing is implemented against it.
+Updated: 2026-09-08
 
 One-line: A Rust library plus optional worker runtime for Kafka-backed
 distributed caches of compact domain entity snapshots, using Postgres as the
@@ -715,6 +716,12 @@ durable entity propagation ledger and local cache store.
   `products` and `orders`, silently unable to support the rebuild the model
   promises. Rejects fixing it with a broker default, rejects a per-contract
   `topic_spec()`, and rejects a provisioner that creates tables. Status: Accepted.
+- [proposals/24-kafka-broker-authentication.proposal.md](proposals/24-kafka-broker-authentication.proposal.md)
+  - kafkaman offers no built-in authenticated broker connection, which contradicts
+  a `verify`-by-default topic mode chosen because application principals are
+  routinely ACL-denied. Proposes SASL_SSL with SCRAM through an optional `[kafka]`
+  section, settles where broker credentials live, and closes a confirmed
+  credential leak in config parse errors. Status: Proposed.
 - [proposals/14-runtime-builder-and-axum-composition.proposal.md](proposals/14-runtime-builder-and-axum-composition.proposal.md)
   - Accepted developer-UX proposal to replace the example's manual config,
   topic, changelog, migration, relay, ingest, dispatch, and shutdown wiring with

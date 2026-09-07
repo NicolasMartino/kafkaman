@@ -1,3 +1,34 @@
+## [2026-09-08] create | Kafka broker authentication proposal
+
+Proposal 24 proposes SASL_SSL with SCRAM-SHA-256/512 through a new optional
+`[kafka]` section. Nothing is implemented; the amendments it describes to
+`kafkaman.example.toml`, `examples/*/boot.rs`, and `examples/Dockerfile` are
+proposed, not made.
+
+**Why now.** Decision 4 of `topic-convergence-and-rebuild` makes `verify` the
+default topic mode *because* "application principals are routinely denied
+`CreateTopics` by ACL", and `topics.rs:177-190` writes an error naming "the
+configured principal" — which cannot exist, because kafkaman offers no way to
+configure one. On such a cluster the publisher and consumer can be hand-wired,
+but `TopicAdmin` cannot; the only escape is `[topics] mode = "off"`, switching off
+the boot check that exists for exactly that world. The active `configure` branch
+of `rdkafka-sys`'s `build.rs` passes `--disable-ssl` at the current feature set,
+so SCRAM is absent from the binary rather than switched off in config.
+
+**What the drafting found.** `ConfigError::Parse` carries `toml::de::Error`
+through, whose `Display` echoes the offending source line and whose `Debug`
+carries the whole document — reproduced against `toml 0.8.23`. Harmless while the
+config contract holds no secrets, and a live leak the moment `sasl_password` is a
+key, so redaction of parse errors is in scope and lands before the section does.
+
+Four questions are left open on purpose, including whether the OpenSSL dependency
+should be gated behind a cargo feature; acceptance has to close that one, because
+two sections read differently depending on the answer.
+
+Status: Proposed.
+Pages affected: wiki/proposals/24-kafka-broker-authentication.proposal.md,
+wiki/index.md, wiki/log.md
+
 ## [2026-09-03] lint | pre-merge hardening: stale proof links, release gates, and the one unsplit crate
 
 A line-by-line review of the `implementation/m7-hardening` worktree ahead of the
