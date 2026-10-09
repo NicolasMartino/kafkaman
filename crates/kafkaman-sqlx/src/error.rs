@@ -40,9 +40,9 @@ pub enum Error {
     #[error(
         "outbox replay is unsafe for entity snapshots: republishing a stored row for message type \
          `{message_type}` would emit stale state at a fresh, higher Kafka offset, and every consumer \
-         cache would treat that stale state as the newest. Use `kafkaman::sqlx::resync` to load \
-         current entity state under the enqueue lock; use `Replay::received` to redrive \
-         inbound rows"
+         cache would treat that stale state as the newest. Use `kafkaman::sqlx::resync` for \
+         state-sourced republish: load current entity state under the enqueue lock; use \
+         `Replay::received` to redrive inbound rows"
     )]
     UnsafeOutboxReplay { message_type: String },
 
