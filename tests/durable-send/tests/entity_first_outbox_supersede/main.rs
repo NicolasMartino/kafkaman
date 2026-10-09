@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 // Test cases, split by theme; the helpers they share follow.
+mod enqueue_order;
 mod publish_ordering;
 mod resync;
 mod supersede_on_enqueue;

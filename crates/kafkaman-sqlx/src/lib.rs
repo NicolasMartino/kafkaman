@@ -51,7 +51,9 @@ pub use changeset::{
     ChangeBuilder, Changeset, MigrationAction, MigrationContext, MigrationReport,
     MigrationStepReport,
 };
-pub use changesets::{CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema};
+pub use changesets::{
+    AddOutboxEnqueueOrder, CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema,
+};
 pub use dispatch::{dispatch_once, dispatch_once_sampled};
 pub use dispatch_cache::CacheApplyOutcome;
 pub use error::Error;

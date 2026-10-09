@@ -47,8 +47,8 @@ fn a_service_may_publish_and_consume_the_same_message_type() {
     assert_eq!(types(roles.consumed().collect()), vec!["order_snapshot"]);
     assert_eq!(
         roles.changelog().unwrap().len(),
-        4,
-        "init_schema plus outbox, received, and cache for the one type"
+        5,
+        "init_schema plus outbox, its upgrade, received, and cache for the one type"
     );
 }
 
@@ -163,6 +163,7 @@ fn the_order_services_roles_generate_their_changesets() {
     assert_eq!(
         sorted,
         vec![
+            "add_outbox_enqueue_order",
             "create_cache_table",
             "create_outbox_table",
             "create_received_table",

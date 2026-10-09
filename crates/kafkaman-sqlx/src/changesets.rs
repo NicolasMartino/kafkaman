@@ -2,7 +2,7 @@ use kafkaman_core::MessageDescriptor;
 
 use crate::changeset::{ChangeBuilder, Changeset};
 use crate::schema_sql::{
-    create_cache_table_sql, create_outbox_entity_state_index_sql,
+    add_outbox_enqueue_order_sql, create_cache_table_sql, create_outbox_entity_state_index_sql,
     create_outbox_retention_index_sql, create_outbox_state_index_sql, create_outbox_table_sql,
     create_received_failed_index_sql, create_received_idempotency_index_sql,
     create_received_state_index_sql, create_received_table_sql,
@@ -111,6 +111,15 @@ descriptor_changeset! {
         builder.push(create_outbox_state_index_sql(&table));
         builder.push(create_outbox_entity_state_index_sql(&table));
         builder.push(create_outbox_retention_index_sql(&table));
+    }
+}
+
+descriptor_changeset! {
+    /// Add INSERT-time ordering to an existing outbox, preserving legacy row order.
+    AddOutboxEnqueueOrder => "add_outbox_enqueue_order",
+    |cfg, descriptor, builder| {
+        let table = OutboxTable::new(cfg.schema.clone(), descriptor)?;
+        builder.push(add_outbox_enqueue_order_sql(&table));
     }
 }
 

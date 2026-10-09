@@ -56,7 +56,9 @@ use sha2::{Digest, Sha256};
 
 use crate::changelog::assert_changelog_order;
 use crate::changeset::Changeset;
-use crate::changesets::{CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema};
+use crate::changesets::{
+    AddOutboxEnqueueOrder, CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema,
+};
 use crate::schema_sql::{
     CACHE_TEMPLATE_VERSION, OUTBOX_TEMPLATE_VERSION, RECEIVED_TEMPLATE_VERSION,
 };
@@ -154,14 +156,15 @@ pub fn band_of(version: i64) -> i64 {
 
 /// Upgrade changesets for a table kind, for slots `1..=template_version`.
 ///
-/// Empty at V1: every table kind is still on template slot 0, its original
-/// create, because nothing has shipped for an upgrade to repair. This is the
-/// function a template bump extends — see the note at the top of
-/// `schema_sql.rs`. A bump without a matching entry here would move fresh
-/// databases forward while leaving existing databases on the old shape.
-fn upgrades(kind: TableKind, _descriptor: &MessageDescriptor) -> Vec<Box<dyn Changeset>> {
+/// A template bump must register an upgrade here so fresh and existing tables
+/// reach the same shape without changing any shipped changeset identity.
+fn upgrades(kind: TableKind, descriptor: &MessageDescriptor) -> Vec<Box<dyn Changeset>> {
     match kind {
-        TableKind::Outbox | TableKind::Received | TableKind::Cache => Vec::new(),
+        TableKind::Outbox => vec![Box::new(AddOutboxEnqueueOrder::new(
+            changeset_version(kind, descriptor.message_type.as_str(), 1),
+            descriptor.clone(),
+        ))],
+        TableKind::Received | TableKind::Cache => Vec::new(),
     }
 }
 

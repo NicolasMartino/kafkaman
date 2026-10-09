@@ -29,8 +29,8 @@ use std::sync::Arc;
 use example_contracts::{OrderSnapshot, ProductSnapshot};
 use kafkaman::rdkafka::{converge_topics, RdkafkaConsumer, RdkafkaPublisher, TopicAdmin};
 use kafkaman::sqlx::{
-    migrate, try_changelog, Changeset, CreateCacheTable, CreateOutboxTable, CreateReceivedTable,
-    InitSchema, MigrationContext, OutboxTable, ReceivedTable, ResolvedConfig,
+    migrate, try_changelog, AddOutboxEnqueueOrder, Changeset, CreateCacheTable, CreateOutboxTable,
+    CreateReceivedTable, InitSchema, MigrationContext, OutboxTable, ReceivedTable, ResolvedConfig,
 };
 use kafkaman::{worker, DispatcherConfig, KafkaMessage};
 use sqlx::postgres::PgPoolOptions;
@@ -58,6 +58,7 @@ fn changelog() -> Result<Vec<Box<dyn Changeset>>, BoxError> {
         CreateOutboxTable::new(2, ProductSnapshot::descriptor()?),
         CreateReceivedTable::new(3, OrderSnapshot::descriptor()?),
         CreateCacheTable::new(4, OrderSnapshot::descriptor()?),
+        AddOutboxEnqueueOrder::new(5, ProductSnapshot::descriptor()?),
     ]?)
 }
 

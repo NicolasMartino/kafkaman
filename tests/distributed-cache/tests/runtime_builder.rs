@@ -173,15 +173,13 @@ async fn the_generated_changelog_creates_every_table_the_roles_imply(
     }
 
     // Every generated changeset is recorded, plus `InitSchema` at version 1.
-    // Four: `InitSchema`, and one create apiece for the order outbox, the
-    // product received table, and the product cache. One per table, because V1
-    // ships no upgrade changesets — see the V1 legacy-removal compat note.
+    // InitSchema, three creates, and the outbox enqueue-order upgrade.
     let versions: Vec<i64> = sqlx::query_scalar(&format!(
         "SELECT version FROM {schema}.changelog_history ORDER BY version"
     ))
     .fetch_all(&pool)
     .await?;
-    assert_eq!(versions.len(), 4, "got {versions:?}");
+    assert_eq!(versions.len(), 5, "got {versions:?}");
     assert_eq!(versions[0], 1, "InitSchema must sort first");
     assert!(
         versions[1..].iter().all(|version| *version >= 1_000),
@@ -208,7 +206,7 @@ async fn building_twice_is_idempotent(cluster: &Cluster) -> TestResult {
     let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.changelog_history"))
         .fetch_one(&pool)
         .await?;
-    assert_eq!(rows, 4, "the second build must not duplicate history rows");
+    assert_eq!(rows, 5, "the second build must not duplicate history rows");
     Ok(())
 }
 

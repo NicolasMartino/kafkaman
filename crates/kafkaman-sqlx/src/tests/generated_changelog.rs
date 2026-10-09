@@ -126,12 +126,11 @@ fn band_of_inverts_the_version_computation() {
 /// Template slots are part of the generated changeset identity. A non-zero slot
 /// must have a matching upgrade changeset in `generated_changelog::upgrades`.
 ///
-/// Every kind is at slot 0 for V1: nothing has shipped, so no template has an
-/// upgrade to carry. The first kind to bump has to register one here and in
-/// `upgrades` together, which is what this assertion is for.
+/// Outboxes carry the slot-one enqueue-order upgrade; other kinds retain the
+/// original V1 shape.
 #[test]
 fn shipped_template_slots_match_their_registered_upgrades() {
-    assert_eq!(TableKind::Outbox.template_version(), 0);
+    assert_eq!(TableKind::Outbox.template_version(), 1);
     assert_eq!(TableKind::Received.template_version(), 0);
     assert_eq!(TableKind::Cache.template_version(), 0);
 }
@@ -177,6 +176,7 @@ fn the_generated_order_changelog_matches_the_hand_written_semantic_set() {
         vec![
             "init_schema",
             "create_outbox_table",
+            "add_outbox_enqueue_order",
             "create_cache_table",
             "create_received_table",
         ],
@@ -200,6 +200,7 @@ fn the_generated_product_changelog_matches_the_hand_written_semantic_set() {
     assert_eq!(
         sorted,
         vec![
+            "add_outbox_enqueue_order",
             "create_cache_table",
             "create_outbox_table",
             "create_received_table",
@@ -208,14 +209,13 @@ fn the_generated_product_changelog_matches_the_hand_written_semantic_set() {
     );
 }
 
-/// Every generated table sits at slot 0 of its own band, which is what "V1 has
-/// one create per table and no upgrades" means arithmetically.
+/// Every generated create retains slot zero even when upgrades are added.
 #[test]
 fn every_generated_table_sits_at_slot_zero_of_its_band() {
     let changelog = build_changelog(order_service_tables()).unwrap();
 
     for changeset in &changelog {
-        if changeset.name() == "init_schema" {
+        if !changeset.name().starts_with("create_") {
             continue;
         }
         let version = changeset.version();
@@ -275,7 +275,7 @@ fn declaring_the_same_table_twice_is_deduplicated() {
     duplicated.extend(order_service_tables());
 
     let changelog = build_changelog(duplicated).unwrap();
-    assert_eq!(changelog.len(), 4);
+    assert_eq!(changelog.len(), 5);
 }
 
 /// A collision is not reported as a duplicate version, because that error reads

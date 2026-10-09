@@ -157,6 +157,9 @@ where
         ))
         .await?;
     lock_outbox_entity(&mut guard, &table, &entity_key).await?;
+    // Every visible pending row precedes this lock holder's upcoming INSERT.
+    // Fixed snapshots can miss a predecessor; the relay also collapses by the
+    // INSERT-time enqueue_order, never by this transaction's start timestamp.
     supersede_pending_outbox_rows(&mut guard, &table, &entity_key).await?;
     insert
         .execute(&mut *guard, OutboxStatus::Pending, None)

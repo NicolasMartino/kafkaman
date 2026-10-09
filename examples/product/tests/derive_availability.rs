@@ -101,6 +101,7 @@ fn the_declared_roles_cover_every_table_this_service_needs() {
     assert_eq!(
         names,
         vec![
+            "add_outbox_enqueue_order",
             "create_cache_table",
             "create_outbox_table",
             "create_received_table",

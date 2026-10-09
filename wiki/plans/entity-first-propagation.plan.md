@@ -209,6 +209,38 @@ The complementary lock-wait gate proves a fresh read even when the pool defaults
 to REPEATABLE READ. See the
 [API compatibility note](../compatibility/state-sourced-republish-api.compat.md).
 
+Fix closeout 2026-10-09: outbox freshness now follows INSERT-time sequence
+allocation under the entity advisory lock, including earlier-started live
+transactions at REPEATABLE READ and SERIALIZABLE and a READ COMMITTED repair
+publish that fails transiently. All three new schedules reproduced stale v5
+publication on `2ad8a88`; the fixed relay publishes v6. The enqueue-time
+supersede predicate is unchanged: all visible pending rows precede the upcoming
+locked INSERT. The relay collapses unseen or retried predecessors by
+`enqueue_order`, retains the in-flight guard, and uses that order for bounded
+claim selection and returned rows.
+
+An additional deterministic boundary test pauses preliminary collapse and lets
+a fixed-snapshot writer commit before claim. It reproduced a predecessor
+publishing after the newly claimed state; claim now also supersedes predecessors
+in its own statement snapshot, closing that window.
+
+Outbox template slot 1 adds and backfills the sequence-backed BIGINT column;
+slot-0 creates and prior migration identities are preserved. Migration coverage
+starts with the old schema and existing rows, then checks legacy ordering, new
+allocation, repeated migration, and bounded claims. Extra regression gates cover
+two live writers without resync, claim order, and blocked or delayed siblings.
+Pagination tests now isolate duplicate keys, oversized pages, and keys at or
+before a cursor; an empty first page preserves the supplied cursor. Pacing is
+asserted from the batch's last commit to the next page request. See the
+[compatibility note](../compatibility/state-sourced-republish-api.compat.md)
+for migration, semver, and legacy-row limitations. Phase 5 remains outside this
+closeout.
+
+Final fix-round gates passed with `RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=2`:
+`just lint`, `just features`, `just msrv`, and `just test all`. The expanded
+`entity_first_outbox_supersede` target passes all 25 tests; the compatibility
+note records each old-code or guard-mutation failure and the passing result.
+
 ## Phase 5 — Topic-lifecycle invalidation
 
 - Verify whether rdkafka exposes the Kafka topic ID. If it does, persist it

@@ -64,8 +64,11 @@ pub struct ResyncProgress {
 ///
 /// A live writer holding the entity lock finishes before `load` reads; READ
 /// COMMITTED gives that read a fresh snapshot after the wait. A live writer
-/// arriving during `load` waits until this repair commits, then supersedes it
-/// normally. No stored outbox row is replayed and this function never contacts
+/// arriving during `load` waits until this repair commits and enqueues later.
+/// INSERT-time outbox ordering makes that live state win even if its transaction
+/// began earlier or its snapshot cannot see the repair row. The relay collapses
+/// any remaining pending predecessors once an in-flight publish settles.
+/// No stored outbox row is replayed and this function never contacts
 /// the broker; the relay publishes the resulting rows.
 ///
 /// `progress` runs after **each key's commit**, including skipped keys. Persist

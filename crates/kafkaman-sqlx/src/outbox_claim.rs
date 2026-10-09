@@ -4,7 +4,7 @@ use kafkaman_core::InstrumentDb;
 use std::time::Duration;
 
 use kafkaman_core::{ClaimedOutboxRow, OutboxStatus};
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::outbox_mark::row_from_pg;
@@ -38,7 +38,8 @@ pub async fn claim_batch(
     // between the worker and PostgreSQL.
     let sql = format!(
         "WITH candidates AS (
-             SELECT candidate.message_id FROM {name} candidate
+             SELECT candidate.message_id, candidate.entity_key, candidate.enqueue_order
+             FROM {name} candidate
              WHERE (
                     candidate.status = {pending}
                     AND candidate.next_attempt_at <= now()
@@ -50,11 +51,25 @@ pub async fn claim_batch(
                               AND inflight.status = {publishing}
                         )
                     )
-                 )
-                OR (candidate.status = {publishing} AND candidate.claim_expires_at <= now())
-             ORDER BY candidate.created_at
+                 AND NOT EXISTS (
+                   SELECT 1 FROM {name} newer
+                   WHERE newer.entity_key = candidate.entity_key
+                     AND newer.status = {pending}
+                     AND newer.enqueue_order > candidate.enqueue_order
+               )
+             ) OR (candidate.status = {publishing} AND candidate.claim_expires_at <= now())
+             ORDER BY candidate.enqueue_order
              FOR UPDATE SKIP LOCKED
              LIMIT $1
+         ), superseded AS (
+             UPDATE {name} AS stale
+             SET status = {superseded}, claim_id = NULL, claimed_by = NULL,
+                 claim_expires_at = NULL,
+                 last_error = 'superseded by newer pending state for the same entity'
+             FROM candidates
+             WHERE stale.entity_key = candidates.entity_key
+               AND stale.status = {pending}
+               AND stale.enqueue_order < candidates.enqueue_order
          )
          UPDATE {name} AS target
          SET status = {publishing},
@@ -68,6 +83,7 @@ pub async fn claim_batch(
         name = table.qualified_name(),
         pending = OutboxStatus::Pending.sql_literal(),
         publishing = OutboxStatus::Publishing.sql_literal(),
+        superseded = OutboxStatus::Superseded.sql_literal(),
     );
 
     let claim_id = Uuid::new_v4();
@@ -86,23 +102,21 @@ pub async fn claim_batch(
 
     let mut claimed = Vec::with_capacity(rows.len());
     for row in rows {
-        claimed.push(ClaimedOutboxRow {
-            row: row_from_pg(row)?,
-            claim_id,
-        });
+        let enqueue_order: i64 = row.try_get("enqueue_order")?;
+        claimed.push((
+            enqueue_order,
+            ClaimedOutboxRow {
+                row: row_from_pg(row)?,
+                claim_id,
+            },
+        ));
     }
 
-    // `UPDATE ... FROM` does not honour the CTE's ORDER BY, but per-entity
-    // ordering is what the relay depends on, so restore it here. Publishing is
-    // sequential in `relay_once`, so claim order is publish order.
-    claimed.sort_by(|a, b| {
-        a.row
-            .created_at
-            .cmp(&b.row.created_at)
-            .then_with(|| a.row.message_id.cmp(&b.row.message_id))
-    });
-
-    Ok(claimed)
+    // UPDATE ... FROM does not preserve the candidate ordering. Restore INSERT
+    // order for the relay's sequential publishes; keep the storage ordinal
+    // internal rather than changing the public OutboxRow API.
+    claimed.sort_unstable_by_key(|(enqueue_order, _)| *enqueue_order);
+    Ok(claimed.into_iter().map(|(_, row)| row).collect())
 }
 
 /// Supersede every `Pending` outbox row that a newer `Pending` row for the same
@@ -123,11 +137,16 @@ pub async fn claim_batch(
 /// entity-first propagation decision, point 9; this is that failure mode reached
 /// through retry rather than through replay.
 ///
-/// Ordering is `(created_at, message_id)`, matching how [`claim_batch`] sorts what
-/// it hands the relay, so "newer" means the same thing in both places.
+/// Ordering is `enqueue_order`, allocated by INSERT under the entity lock,
+/// matching [`claim_batch`]. Transaction start time can run in reverse of that
+/// order, including when a fixed snapshot misses a preceding enqueue entirely.
 ///
-/// This is one statement per relay cycle, not per row, and it must be separate
-/// from the claim below: a data-modifying CTE would not see its own writes.
+/// This preliminary cleanup is bounded and separate from the claim. The claim
+/// also supersedes its candidates' predecessors in its own statement snapshot:
+/// a fixed-snapshot writer can commit another row between these statements.
+/// Candidate selection already excludes older pending siblings, so that final
+/// cleanup and the claim update touch disjoint rows without needing to see each
+/// other's writes.
 // Stays in the debug tier: part of the same empty poll as `claim_batch`.
 // See the span-depth decision for the rule.
 #[tracing::instrument(level = "debug", target = "kafkaman::internal", skip_all)]
@@ -150,22 +169,11 @@ async fn collapse_stale_pending_rows(
 
 /// The statement [`collapse_stale_pending_rows`] runs.
 ///
-/// Exposed so its query plan can be measured against the claim it precedes; see
-/// `tests/outbox_claim_cost.rs`. The shape below was chosen from those
-/// measurements, not from reading the SQL.
-///
-/// It drives from the same bounded window the claim is about to take — `Pending`,
-/// due, ordered by `created_at`, `LIMIT $1` — and looks *backwards* for older
-/// siblings of each driver. The obvious formulation instead scans every `Pending`
-/// row and looks forward with an `EXISTS`, which the planner executes as a hash
-/// semi join over two full table scans: at a 200k backlog that measured 252ms and
-/// spilled 2202 temp blocks, against 71ms and no spill for this one, for identical
-/// results.
-///
-/// Driving from the claim window is also why it is *correct* to find nothing when
-/// an overtaken pair sits outside that window. A row that will not be claimed this
-/// cycle cannot be published out of order this cycle, and the pair is collapsed on
-/// whichever cycle it does enter the window.
+/// Exposed so its query plan can be measured; see `tests/outbox_claim_cost.rs`.
+/// Drives from the claim's bounded window of due, newest pending rows, excluding
+/// entities with an in-flight publication. Older siblings never take a window
+/// slot, even with limit one, and a newer pending row that is not due also blocks
+/// its predecessors. The entity/status/order index serves the sibling lookup.
 #[cfg(feature = "internal-hooks")]
 #[doc(hidden)]
 pub fn collapse_stale_pending_rows_sql(table: &OutboxTable) -> String {
@@ -181,20 +189,29 @@ fn collapse_stale_pending_rows_sql_impl(table: &OutboxTable) -> String {
              claim_expires_at = NULL,
              last_error = 'superseded by newer pending state for the same entity'
          FROM (
-             SELECT entity_key, created_at, message_id
-             FROM {name}
-             WHERE status = {pending}
-               AND next_attempt_at <= now()
-               AND entity_key IS NOT NULL
-             ORDER BY created_at
-             LIMIT $1
+             SELECT candidate.entity_key, candidate.enqueue_order
+             FROM {name} candidate
+             WHERE candidate.status = {pending} AND candidate.next_attempt_at <= now()
+               AND candidate.entity_key IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM {name} inflight
+                   WHERE inflight.entity_key = candidate.entity_key
+                     AND inflight.status = {publishing}
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM {name} later
+                   WHERE later.entity_key = candidate.entity_key
+                     AND later.status = {pending}
+                     AND later.enqueue_order > candidate.enqueue_order
+               )
+             ORDER BY candidate.enqueue_order LIMIT $1
          ) AS newer
          WHERE stale.entity_key = newer.entity_key
            AND stale.status = {pending}
-           AND (stale.created_at, stale.message_id)
-               < (newer.created_at, newer.message_id)",
+           AND stale.enqueue_order < newer.enqueue_order",
         name = table.qualified_name(),
         superseded = OutboxStatus::Superseded.sql_literal(),
         pending = OutboxStatus::Pending.sql_literal(),
+        publishing = OutboxStatus::Publishing.sql_literal(),
     )
 }

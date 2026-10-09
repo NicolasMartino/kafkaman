@@ -40,7 +40,7 @@ use crate::{CacheTable, OutboxTable, ReceivedTable, ResolvedConfig, Result};
 // changeset, register it in `generated_changelog::upgrades`, then bump.
 
 /// Slot of the current outbox table template. See the note above before bumping.
-pub const OUTBOX_TEMPLATE_VERSION: i64 = 0;
+pub const OUTBOX_TEMPLATE_VERSION: i64 = 1;
 
 /// Slot of the current received table template. See the note above before bumping.
 pub const RECEIVED_TEMPLATE_VERSION: i64 = 0;
@@ -87,6 +87,42 @@ pub fn create_outbox_state_index_sql(table: &OutboxTable) -> String {
         "CREATE INDEX IF NOT EXISTS {} ON {} (status, next_attempt_at, claim_expires_at, created_at)",
         table.state_index_name().quoted(),
         table.qualified_name()
+    )
+}
+
+/// Slot 1: preserve the legacy ordering for existing rows, then allocate each
+/// new ordinal at INSERT under the enqueue path's entity lock. The table lock
+/// keeps inserts out until the backfill and sequence default are both ready.
+pub(crate) fn add_outbox_enqueue_order_sql(table: &OutboxTable) -> String {
+    let name = table.qualified_name();
+    let sequence = qualified_name(&table.schema, &table.index_name("_enqueue_order_seq"));
+    let entity_index = table.entity_state_index_name();
+    format!(
+        "DO $migration$ BEGIN
+            LOCK TABLE {name} IN ACCESS EXCLUSIVE MODE;
+            IF NOT EXISTS (SELECT FROM pg_attribute
+                WHERE attrelid = {table_literal}::regclass
+                  AND attname = 'enqueue_order' AND NOT attisdropped) THEN
+                ALTER TABLE {name} ADD COLUMN enqueue_order BIGINT;
+                CREATE SEQUENCE {sequence} AS BIGINT CACHE 1 OWNED BY {name}.enqueue_order;
+                UPDATE {name} AS target SET enqueue_order = ranked.ordinal
+                FROM (SELECT message_id, row_number() OVER (ORDER BY created_at, message_id) AS ordinal
+                      FROM {name}) AS ranked
+                WHERE target.message_id = ranked.message_id;
+                PERFORM setval({sequence_literal}::regclass,
+                    COALESCE((SELECT max(enqueue_order) FROM {name}), 1),
+                    EXISTS(SELECT FROM {name}));
+                ALTER TABLE {name} ALTER COLUMN enqueue_order SET DEFAULT nextval({sequence_literal}::regclass),
+                    ALTER COLUMN enqueue_order SET NOT NULL;
+                DROP INDEX {qualified_entity_index};
+                CREATE INDEX {entity_index} ON {name} (entity_key, status, enqueue_order)
+                    WHERE entity_key IS NOT NULL;
+            END IF;
+        END $migration$",
+        table_literal = sql_string_literal(&name),
+        sequence_literal = sql_string_literal(&sequence),
+        qualified_entity_index = qualified_name(&table.schema, &entity_index),
+        entity_index = entity_index.quoted(),
     )
 }
 

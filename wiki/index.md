@@ -14,7 +14,7 @@ added MSRV, lockfile, and advisory gates, made the crates publishable, and split
 remains outside the M7 implementation milestone; the ordering it needs is
 recorded in `just publish-order`. A Kafka broker authentication proposal is open
 for review; nothing is implemented against it.
-Updated: 2026-09-08
+Updated: 2026-10-09
 
 One-line: A Rust library plus optional worker runtime for Kafka-backed
 distributed caches of compact domain entity snapshots, using Postgres as the
@@ -196,8 +196,9 @@ durable entity propagation ledger and local cache store.
 - [compatibility/state-sourced-republish-api.compat.md](compatibility/state-sourced-republish-api.compat.md)
   - Additive `kafkaman::sqlx::resync` API with ordered key batches, pacing,
     per-key loaders under the enqueue lock, committed progress, and resume cursors.
-    Phase 4 closes both read/enqueue race directions; outbox row replay still
-    refuses. No schema or wire changes. Status: Implemented.
+    Phase 4 closes both read/enqueue race directions and transaction-start-order
+    inversions. Outbox slot 1 adds migrated enqueue ordering; pagination guards
+    and batch-boundary pacing are pinned. Wire format unchanged. Status: Implemented.
 - [compatibility/m5-entity-first-outbox-supersede.compat.md](compatibility/m5-entity-first-outbox-supersede.compat.md)
   - M5 outbound schema/API and relay behavior changes: `OutboxStatus::Superseded`,
     `OutboxRow.entity_key`, nullable outbox `entity_key`, `AddOutboxEntityKey`,
@@ -981,8 +982,9 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
   cache bootstrap/readiness, boot-time broker topic validation, advisory origin
   intent, proactive topic-lifecycle
   re-bootstrap hooks, soft-delete workflow/reclamation, and the two-service
-  wiring example. Phase 4's state-sourced republish API and race gates shipped
-  2026-10-09. Status: Completed.
+  wiring example. Phase 4's state-sourced republish API, enqueue-order migration,
+  transaction-isolation race gates, pagination guards, and batch-boundary pacing
+  shipped 2026-10-09. Status: Completed.
 - [plans/two-service-distributed-cache-example.plan.md](plans/two-service-distributed-cache-example.plan.md)
 - Replaces the single send-only example app with two services — `product` and
   `order` — proving entity-first cache convergence end to end over HTTP alone.

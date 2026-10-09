@@ -42,7 +42,7 @@ async fn migrate_is_idempotent_and_template_generalizes() -> TestResult {
     ))
     .fetch_one(harness.pool())
     .await?;
-    assert_eq!(history_count, 3);
+    assert_eq!(history_count, 5);
 
     Ok(())
 }

@@ -5,9 +5,9 @@ use kafkaman_core::{
     RelayStats, SqlIdentifier,
 };
 use kafkaman_sqlx::{
-    enqueue, insert_received, migrate, outbox_row, received_row_by_idempotency_key, Changeset,
-    CreateCacheTable, CreateOutboxTable, CreateReceivedTable, InitSchema, MigrationContext,
-    MigrationReport, OutboxTable, ReceivedTable, ResolvedConfig,
+    enqueue, insert_received, migrate, outbox_row, received_row_by_idempotency_key,
+    AddOutboxEnqueueOrder, Changeset, CreateCacheTable, CreateOutboxTable, CreateReceivedTable,
+    InitSchema, MigrationContext, MigrationReport, OutboxTable, ReceivedTable, ResolvedConfig,
 };
 use serde::Serialize;
 use sqlx::PgPool;
@@ -60,6 +60,14 @@ impl Tables {
                     changesets.push(Box::new(CreateReceivedTable::new(base, descriptor.clone())));
                     changesets.push(Box::new(CreateCacheTable::new(base + 1, descriptor)));
                 }
+            }
+        }
+        if matches!(self, Tables::Outbox) {
+            for (idx, descriptor) in cfg.messages().iter().cloned().enumerate() {
+                changesets.push(Box::new(AddOutboxEnqueueOrder::new(
+                    20_000 + idx as i64,
+                    descriptor,
+                )));
             }
         }
         changesets

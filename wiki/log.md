@@ -6449,3 +6449,30 @@ Pages affected: `crates/kafkaman-sqlx/src/lib.rs`,
 `wiki/proposals/05-deep-durability-testing.proposal.md`,
 `wiki/reviews/m3-durable-completion-implementation-review.reference.md`,
 `wiki/index.md`, `wiki/log.md`.
+
+## [2026-10-09] fix | outbox enqueue order
+
+Changed outbox freshness from transaction-start timestamps to sequence-backed
+INSERT order under the entity advisory lock. Outbox template slot 1 migrates
+fresh and existing tables, preserves the slot-0 create and history, backfills
+legacy rows in their prior deterministic order, and advances the sequence for
+new writes. Relay collapse and claim ordering use the ordinal while retaining
+the in-flight publication guard; enqueue-time supersede remains unchanged.
+Claim also supersedes its selected rows' predecessors in the same statement
+snapshot, with a deterministic regression for enqueue between collapse and claim.
+
+All three requested isolation/retry schedules reproduced stale v5 publication
+on `2ad8a88` and pass with the fix. Added regression coverage for migration,
+bounded and returned claim order, blocked/delayed siblings, and two live writers
+without resync. Added independent duplicate, oversized-page, cursor-boundary,
+initial-empty-page, and batch-boundary pacing assertions. Compatibility guidance
+now records migration steps, semver impact, and the limit of legacy backfill;
+the Phase 4 closeout and index reflect this correction. Phase 5 is unchanged.
+
+Final verification: `just lint`, `just features`, `just msrv`, and `just test all`
+passed with `RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=2`; all 25 outbox/resync tests
+pass. The compatibility note records old-code and mutation failures for every
+new regression case.
+
+Pages affected: `wiki/compatibility/state-sourced-republish-api.compat.md`,
+`wiki/plans/entity-first-propagation.plan.md`, `wiki/index.md`, `wiki/log.md`.
