@@ -75,6 +75,9 @@ async fn dispatch_once_commits_handler_effect_and_processed_status() -> TestResu
     });
 
     let now = OffsetDateTime::now_utc();
+    // PostgreSQL stores microseconds; keep the exact round-trip assertion by
+    // supplying a timestamp it can represent without losing precision.
+    let now = now.replace_nanosecond(now.nanosecond() / 1_000 * 1_000)?;
     let stats = dispatch_once(harness.pool(), &table, &router, now).await?;
     assert_eq!(stats.claimed, 1);
     assert_eq!(stats.processed, 1);
