@@ -117,6 +117,10 @@ impl RuntimeTasks {
     /// writes it can no longer publish, rather than filling an outbox nothing is
     /// draining. A clean exit is therefore a failure unless shutdown had already
     /// been requested.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn wait(&mut self) -> Result<(), RuntimeError> {
         match self.tasks.join_next_with_id().await {
             Some(joined) => match self.classify_completion(joined, !self.shutdown.is_cancelled()) {
@@ -132,6 +136,10 @@ impl RuntimeTasks {
     /// Drains rather than aborting: a loop cancelled mid-transaction still needs
     /// to reach its own commit-or-rollback, and killing the task would leave the
     /// decision to the connection being dropped.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
         self.shutdown_with_timeout(DEFAULT_DRAIN_TIMEOUT).await
     }
@@ -139,6 +147,10 @@ impl RuntimeTasks {
     /// [`shutdown`](Self::shutdown) with an explicit drain bound.
     ///
     /// A zero timeout skips the drain and aborts any still-running loops.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn shutdown_with_timeout(
         mut self,
         drain_timeout: Duration,
@@ -165,6 +177,10 @@ impl RuntimeTasks {
         first
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     async fn drain(
         &mut self,
         drain_timeout: Duration,

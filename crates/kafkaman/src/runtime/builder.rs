@@ -756,6 +756,10 @@ impl Runtime {
     /// Returns rather than exiting the process. What a dead relay means is the
     /// host's decision, and a library that called `std::process::exit` would be
     /// taking it.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn run(self, shutdown: CancellationToken) -> Result<(), RuntimeError> {
         let mut tasks = self
             .into_tasks_with(shutdown)

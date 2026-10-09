@@ -131,6 +131,10 @@ impl Serve {
     /// Start everything, wait for the first loop to exit, then drain.
     ///
     /// The shorthand for a host that has nothing to do with the bound address.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn run(self) -> Result<(), RuntimeError> {
         let service = self.spawn().map_err(RuntimeError::Build)?;
         service.run().await
@@ -169,16 +173,28 @@ impl RunningService {
     /// Supervision, not cleanup: if the relay dies the process must stop
     /// accepting writes it can no longer publish, rather than filling an outbox
     /// nothing is draining.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn wait(&mut self) -> Result<(), RuntimeError> {
         self.tasks.wait().await
     }
 
     /// Cancel everything and drain, reporting the first failure.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
         self.tasks.shutdown().await
     }
 
     /// Cancel everything and drain with an explicit bound.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn shutdown_with_timeout(self, drain_timeout: Duration) -> Result<(), RuntimeError> {
         self.tasks.shutdown_with_timeout(drain_timeout).await
     }
@@ -191,6 +207,10 @@ impl RunningService {
     /// with a gap where the service lifetime should be. The poll half of the
     /// tier (`health`, `ready`) stays at `debug` for the opposite reason.
     #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "Keep the public error shape; boxing it would be a breaking change"
+    )]
     pub async fn run(mut self) -> Result<(), RuntimeError> {
         let first = self.wait().await;
         let drained = self.shutdown().await;
