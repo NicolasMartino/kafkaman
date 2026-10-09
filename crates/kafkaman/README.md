@@ -21,7 +21,11 @@ an analytics event pipeline, and it will not become one.
   a broker left to auto-create them makes them `delete`, which silently breaks
   rebuild-from-log.
 - Retry, backoff, dead-lettering, and redrive.
-- State-sourced republish for repair. Row-sourced outbox replay is refused, not
+- State-sourced republish for repair through
+  [`kafkaman::sqlx::resync`](../kafkaman-sqlx/src/resync.rs): walk ordered keys in
+  paced batches, load each entity under the enqueue lock, and checkpoint the
+  committed cursor and enqueued/skipped counts. The relay publishes the rows.
+  Row-sourced outbox replay is refused, not
   offered: republishing a stored row emits stale state at a *newer* Kafka offset,
   which every consumer's convergence guard would then correctly and permanently
   believe.

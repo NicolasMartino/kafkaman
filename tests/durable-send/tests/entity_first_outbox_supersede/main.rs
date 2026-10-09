@@ -2,6 +2,7 @@
 
 // Test cases, split by theme; the helpers they share follow.
 mod publish_ordering;
+mod resync;
 mod supersede_on_enqueue;
 
 use std::time::Duration;

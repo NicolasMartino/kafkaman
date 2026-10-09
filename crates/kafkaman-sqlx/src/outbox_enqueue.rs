@@ -247,7 +247,7 @@ impl InsertOutboxRow<'_> {
 }
 
 #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
-async fn lock_outbox_entity(
+pub(crate) async fn lock_outbox_entity(
     tx: &mut Transaction<'_, Postgres>,
     table: &OutboxTable,
     entity_key: &str,

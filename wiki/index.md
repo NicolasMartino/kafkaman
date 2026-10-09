@@ -193,6 +193,11 @@ durable entity propagation ledger and local cache store.
     plus `CacheTable`, `CreateCacheTable`, received-row entity-key persistence,
     and receive dispatch cache upsert guarded by Kafka offset for registered
     entity message types. Status: Active.
+- [compatibility/state-sourced-republish-api.compat.md](compatibility/state-sourced-republish-api.compat.md)
+  - Additive `kafkaman::sqlx::resync` API with ordered key batches, pacing,
+    per-key loaders under the enqueue lock, committed progress, and resume cursors.
+    Phase 4 closes both read/enqueue race directions; outbox row replay still
+    refuses. No schema or wire changes. Status: Implemented.
 - [compatibility/m5-entity-first-outbox-supersede.compat.md](compatibility/m5-entity-first-outbox-supersede.compat.md)
   - M5 outbound schema/API and relay behavior changes: `OutboxStatus::Superseded`,
     `OutboxRow.entity_key`, nullable outbox `entity_key`, `AddOutboxEntityKey`,
@@ -974,9 +979,10 @@ SQLx DDL/primitives, relay, Harness, tests, and example. Status: Completed.
 - Completed M5 execution plan for entity-first propagation. Validated behavior
   is promoted to `specs/entity-first-propagation.spec.md`; deferred work remains
   cache bootstrap/readiness, boot-time broker topic validation, advisory origin
-  intent, a positive state-sourced republish API, proactive topic-lifecycle
+  intent, proactive topic-lifecycle
   re-bootstrap hooks, soft-delete workflow/reclamation, and the two-service
-  wiring example. Status: Completed.
+  wiring example. Phase 4's state-sourced republish API and race gates shipped
+  2026-10-09. Status: Completed.
 - [plans/two-service-distributed-cache-example.plan.md](plans/two-service-distributed-cache-example.plan.md)
 - Replaces the single send-only example app with two services — `product` and
   `order` — proving entity-first cache convergence end to end over HTTP alone.

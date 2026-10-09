@@ -39,6 +39,7 @@ mod received_rows;
 mod received_storage;
 mod replay;
 mod resolved_config;
+mod resync;
 mod retry_backoff;
 mod roles;
 mod router;
@@ -79,6 +80,7 @@ pub use received_storage::{
 };
 pub use replay::{redrive_received, Replay};
 pub use resolved_config::ResolvedConfig;
+pub use resync::{resync, ResyncFuture, ResyncOptions, ResyncProgress};
 pub use roles::{Role, RoleRegistry};
 pub use router::{BeforeHandlerFuture, DispatchStats, HandlerFlow, HandlerFuture, MessageRouter};
 pub use schema_sql::{

@@ -37,6 +37,10 @@ boot-time broker topic validation, advisory origin intent, a positive
 state-sourced republish API, proactive topic-lifecycle invalidation, and a typed
 soft-delete workflow are explicitly deferred.
 
+Amendment 2026-10-09: the state-sourced republish API and its race gates are now
+complete; see the Phase 4 closeout and
+[compatibility note](../compatibility/state-sourced-republish-api.compat.md).
+
 ## In Scope
 
 - Entity message surface: `entity_key`, advisory origin intent.
@@ -193,8 +197,17 @@ first transaction commits.
   corruption case, now expected to resolve in favor of the live update.
 
 Closeout 2026-08-24: the negative half shipped: `Replay::outbox` is now always
-rejected as `UnsafeOutboxReplay`. The positive state-sourced resync API and race
-gate remain deferred.
+rejected as `UnsafeOutboxReplay`.
+
+Closeout 2026-10-09: Phase 4 complete. `kafkaman::sqlx::resync` walks ordered
+entity keys in configurable, paced batches and reports committed progress and a
+resume cursor. Each loader runs after the ordinary enqueue entity lock is taken,
+on the same connection in an explicit READ COMMITTED transaction; normal enqueue
+then preserves supersede. The race gate pauses after the repair's read and before
+enqueue, proves that a live writer waits, and verifies that live state wins.
+The complementary lock-wait gate proves a fresh read even when the pool defaults
+to REPEATABLE READ. See the
+[API compatibility note](../compatibility/state-sourced-republish-api.compat.md).
 
 ## Phase 5 — Topic-lifecycle invalidation
 

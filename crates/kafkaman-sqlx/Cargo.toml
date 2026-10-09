@@ -30,12 +30,8 @@ sqlx.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 time.workspace = true
+tokio.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-# The pool-size guard in `migrate` is checked before anything connects, so it is
-# a unit test rather than an integration one — but `migrate` is still async.
-tokio = { workspace = true }
 
 [lints]
 workspace = true

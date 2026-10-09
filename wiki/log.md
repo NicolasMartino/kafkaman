@@ -1,3 +1,19 @@
+## [2026-10-09] implement | state-sourced republish API
+
+Completed entity-first Phase 4 with `kafkaman::sqlx::resync`: ordered key batches,
+configurable pacing, a start-after cursor, and committed enqueued/skipped progress.
+Per-key loaders run after the existing enqueue advisory lock in an explicit
+READ COMMITTED transaction, then use normal enqueue/supersede. The race gate
+pauses after loading old state and before enqueue, verifies the live writer
+waits, and confirms live state wins; a second gate verifies freshness after a
+lock wait despite a REPEATABLE READ pool default. Integration coverage also
+checks pagination, resume after failure, missing entities, rollback, validation,
+and continued `Replay::outbox` refusal. Phase 5 is outside this change.
+
+Pages affected: `wiki/plans/entity-first-propagation.plan.md`,
+`wiki/compatibility/state-sourced-republish-api.compat.md`, `wiki/index.md`,
+`wiki/log.md`, and `crates/kafkaman/README.md`.
+
 ## [2026-09-08] create | Kafka broker authentication proposal
 
 Proposal 24 proposes SASL_SSL with SCRAM-SHA-256/512 through a new optional

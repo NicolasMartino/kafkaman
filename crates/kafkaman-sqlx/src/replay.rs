@@ -30,10 +30,10 @@ impl Replay {
     /// and applies it — permanently and silently overwriting current state. The
     /// guard cannot detect this, because the record genuinely is newer in the log.
     ///
-    /// Repair is state-sourced instead: re-read the entity's current state and
-    /// enqueue it normally. A concurrent live update then supersedes the pending
-    /// repair row and correctly wins. See the entity-first propagation decision,
-    /// point 9.
+    /// Repair is state-sourced instead: [`crate::resync()`] loads current state
+    /// under the entity lock and enqueues it normally. A concurrent live update
+    /// supersedes the pending repair row and correctly wins. See the entity-first
+    /// propagation decision, point 9.
     ///
     /// This exists as a refusal rather than as an absent function on purpose: an
     /// operator reaching for outbox replay during an incident gets the reason

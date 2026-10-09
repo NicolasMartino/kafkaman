@@ -40,11 +40,14 @@ pub enum Error {
     #[error(
         "outbox replay is unsafe for entity snapshots: republishing a stored row for message type \
          `{message_type}` would emit stale state at a fresh, higher Kafka offset, and every consumer \
-         cache would treat that stale state as the newest. Repair by re-reading current entity state \
-         and enqueueing it normally (state-sourced republish); use `Replay::received` to redrive \
+         cache would treat that stale state as the newest. Use `kafkaman::sqlx::resync` to load \
+         current entity state under the enqueue lock; use `Replay::received` to redrive \
          inbound rows"
     )]
     UnsafeOutboxReplay { message_type: String },
+
+    #[error("invalid state-sourced resync: {0}")]
+    InvalidResync(String),
 
     #[error("invalid received ingest failure kind `{0}`")]
     InvalidIngestFailureKind(String),
@@ -181,6 +184,7 @@ impl kafkaman_core::ProblemType for Error {
             Self::Config(_)
             | Self::ConfigErrors(_)
             | Self::InvalidReceivedFilter(_)
+            | Self::InvalidResync(_)
             | Self::MigrationPoolTooSmall { .. } => problem::CONFIGURATION,
 
             Self::DuplicateChangesetVersion(_)
