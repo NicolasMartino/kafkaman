@@ -13,6 +13,7 @@ mod ingest_failures;
 mod publish_and_consume;
 mod retry_dlq;
 mod run_ingester;
+mod topic_prefix;
 
 use std::collections::HashMap;
 use std::time::Duration;

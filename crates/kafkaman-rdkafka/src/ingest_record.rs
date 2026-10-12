@@ -12,8 +12,11 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
+/// `expected_topic` is the registered topic, prefix included, which is what the
+/// quarantine row should say the record ought to have arrived on.
 pub(crate) fn ingest_failure_record<P, M>(
     message: &M,
+    expected_topic: &str,
     kind: ReceivedIngestFailureKind,
     error: String,
 ) -> ReceivedIngestFailure
@@ -29,7 +32,7 @@ where
         headers: all_headers(message.headers()),
         payload: message.payload().map(Vec::from),
         message_type: P::MESSAGE_TYPE.to_owned(),
-        expected_topic: P::TOPIC.to_owned(),
+        expected_topic: expected_topic.to_owned(),
         kind,
         error,
     }
@@ -86,17 +89,22 @@ pub(crate) struct DecodedRecord<P> {
 /// before the decode it exists to describe. Scanning the header list once and
 /// handing the result to both is what lets the ordering be right without paying
 /// for a second pass on every record.
+///
+/// `expected_topic` is the registered topic, `[topics] prefix` included, rather
+/// than `P::TOPIC`: a record on the bare name, or under another environment's
+/// prefix, is someone else's and is refused as `UnexpectedTopic`.
 pub(crate) fn record_envelope<P, M>(
     message: &M,
+    expected_topic: &str,
     headers: &RecordHeaders,
 ) -> Result<DecodedRecord<P>>
 where
     P: KafkaMessage + DeserializeOwned,
     M: Message,
 {
-    if message.topic() != P::TOPIC {
+    if message.topic() != expected_topic {
         return Err(Error::UnexpectedTopic {
-            expected: P::TOPIC,
+            expected: expected_topic.to_owned(),
             actual: message.topic().to_owned(),
         });
     }

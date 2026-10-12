@@ -5,6 +5,7 @@
 - Date: 2026-08-24
 - Revised: 2026-08-25 (topic convergence; see the topic-convergence-and-rebuild decision)
 - Revised: 2026-08-26 (dispatch handler ordering; the handler now runs *after* the cache upsert)
+- Revised: 2026-10-12 (`[topics] prefix` and `KAFKAMAN_TOPICS_PREFIX`)
 - Category: Entity-first propagation
 - Scope: Validated M5 behavior for compact entity-cache propagation, offset-guarded cache convergence, per-entity outbound supersede, unsafe replay rejection, wire-carried producer metadata, retry jitter, and opt-in outbox retention.
 - Sources:
@@ -267,6 +268,17 @@ topic and will not let a broker auto-create one, so provisioning is a
 prerequisite rather than a convenience. kafkaman still calls none of this on a
 consumer's behalf: it is a capability an application wires in, and now one the
 in-tree example demonstrates wiring.
+
+**Revised 2026-10-12: a global topic prefix.** `[topics] prefix` (empty by
+default), overridden by `KAFKAMAN_TOPICS_PREFIX` when set and not blank, is
+prepended to every registered type's `TOPIC` when `ResolvedConfig` registers it.
+The stored descriptor is the one enqueue, the receive store, the dispatch cache,
+`subscribe` and `converge_topics` read, so the outbox row, the subscription, the
+ingester's topic check and boot convergence all use the prefixed name;
+`KafkaMessage::TOPIC` stays bare and changeset checksums are taken on the bare
+topic. A producer and a consumer with different prefixes fail loudly: the
+ingester quarantines the record as `UnexpectedTopic`. There is no fallback to the
+bare name. See `wiki/compatibility/topic-convergence-api.compat.md`.
 
 There is no public advisory origin-intent enum yet. The accepted decision still
 requires intent to be advisory and forward-compatible, but M5 does not expose or

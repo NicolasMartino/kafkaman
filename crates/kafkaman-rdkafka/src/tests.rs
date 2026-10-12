@@ -46,6 +46,10 @@ impl KafkaMessage for PanickingPayload {
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 fn record(headers: OwnedHeaders) -> OwnedMessage {
+    record_on(ProductSnapshot::TOPIC, headers)
+}
+
+fn record_on(topic: &str, headers: OwnedHeaders) -> OwnedMessage {
     OwnedMessage::new(
         Some(
             serde_json::to_vec(&serde_json::json!({
@@ -55,7 +59,7 @@ fn record(headers: OwnedHeaders) -> OwnedMessage {
             .unwrap(),
         ),
         Some(b"p-1".to_vec()),
-        ProductSnapshot::TOPIC.to_owned(),
+        topic.to_owned(),
         Timestamp::NotAvailable,
         0,
         7,
@@ -80,7 +84,8 @@ fn decode(headers: OwnedHeaders) -> crate::Result<Ingested> {
     // the producer's context before the payload has been looked at.
     let scanned = RecordHeaders::of(&message);
     let producer_trace = scanned.trace_context();
-    let decoded = record_envelope::<ProductSnapshot, _>(&message, &scanned)?;
+    let decoded =
+        record_envelope::<ProductSnapshot, _>(&message, ProductSnapshot::TOPIC, &scanned)?;
     Ok(Ingested {
         envelope: decoded.envelope,
         producer_trace,
@@ -152,11 +157,67 @@ fn a_malformed_occurred_at_is_rejected_rather_than_degraded() {
     ));
 }
 
+/// The ingester's expected topic is the registered one, `[topics] prefix`
+/// included. A record on the prefixed name is accepted; the same record on the
+/// bare name, or under another environment's prefix, is quarantinable as
+/// `UnexpectedTopic` — there is no fallback to `TOPIC`.
+#[test]
+fn a_prefixed_topic_is_accepted_and_the_bare_or_other_prefix_is_refused() {
+    let expected = format!("p.{}", ProductSnapshot::TOPIC);
+
+    let message = record_on(&expected, header("kafkaman-idempotency-key", DIGEST));
+    let scanned = RecordHeaders::of(&message);
+    record_envelope::<ProductSnapshot, _>(&message, &expected, &scanned)
+        .expect("a record on the prefixed topic is accepted");
+
+    for actual in [
+        ProductSnapshot::TOPIC.to_owned(),
+        format!("q.{}", ProductSnapshot::TOPIC),
+    ] {
+        let message = record_on(&actual, header("kafkaman-idempotency-key", DIGEST));
+        let scanned = RecordHeaders::of(&message);
+        let Err(err) = record_envelope::<ProductSnapshot, _>(&message, &expected, &scanned) else {
+            panic!("a record on `{actual}` must be refused when `{expected}` is expected");
+        };
+        assert!(
+            matches!(
+                &err,
+                Error::UnexpectedTopic { expected: e, actual: a } if *e == expected && *a == actual
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.ingest_failure_kind(),
+            Some(kafkaman_core::ReceivedIngestFailureKind::UnexpectedTopic)
+        );
+    }
+}
+
+/// The quarantine row records the registered topic as the one expected, not the
+/// bare `TOPIC`, so an operator sees which prefix the consumer was running.
+#[test]
+fn a_quarantine_record_names_the_prefixed_topic_as_expected() {
+    let message = record_on(
+        ProductSnapshot::TOPIC,
+        header("kafkaman-idempotency-key", DIGEST),
+    );
+    let failure = crate::ingest_record::ingest_failure_record::<ProductSnapshot, _>(
+        &message,
+        "p.products",
+        kafkaman_core::ReceivedIngestFailureKind::UnexpectedTopic,
+        "wrong topic".to_owned(),
+    );
+    assert_eq!(failure.expected_topic, "p.products");
+    assert_eq!(failure.source_topic, "products");
+}
+
 #[test]
 fn a_payload_deserializer_panic_is_quarantinable() {
     let message = record(header("kafkaman-idempotency-key", DIGEST));
     let scanned = RecordHeaders::of(&message);
-    let Err(err) = record_envelope::<PanickingPayload, _>(&message, &scanned) else {
+    let Err(err) =
+        record_envelope::<PanickingPayload, _>(&message, PanickingPayload::TOPIC, &scanned)
+    else {
         panic!("a panicking deserializer must not unwind out of ingest");
     };
 
@@ -437,7 +498,7 @@ mod problem_types {
             crate::Error::MissingIdempotencyKey,
             crate::Error::PayloadPanicked("unwound".to_owned()),
             crate::Error::UnexpectedTopic {
-                expected: "orders",
+                expected: "orders".to_owned(),
                 actual: "products".to_owned(),
             },
             crate::Error::InvalidHeader {

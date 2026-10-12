@@ -319,7 +319,10 @@ durable entity propagation ledger and local cache store.
   records and the entity-first spec carries the correction. Revised 2026-08-25
   for phase 5: `ResolvedConfig` gains `topics: TopicMode`, both example services
   call `converge_topics` at boot, and a verified deployment now needs its topics
-  provisioned first. Status: Active.
+  provisioned first. Revised 2026-10-12: `[topics] prefix`, overridden by
+  `KAFKAMAN_TOPICS_PREFIX`, is prepended to every registered topic at run time
+  (`TOPIC` stays bare; checksums stay on the bare topic), and
+  `Error::UnexpectedTopic.expected` becomes a `String`. Status: Active.
 
 ## Decisions
 

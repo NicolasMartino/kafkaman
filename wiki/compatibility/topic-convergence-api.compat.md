@@ -4,6 +4,7 @@
 - Status: Active
 - Date: 2026-08-24
 - Revised: 2026-08-25 (phase 5: boot wiring and `examples/provision`)
+- Revised: 2026-10-12 (`[topics] prefix` and `KAFKAMAN_TOPICS_PREFIX`)
 - Category: Topic configuration and cache-origin API compatibility
 - Scope: Records the public API and runtime behaviour changes from implementing
   boot-time topic convergence, the authorized cache-origin invalidation path,
@@ -15,6 +16,7 @@
   - crates/kafkaman-sqlx/src/resolved_config.rs
   - crates/kafkaman-sqlx/src/lib.rs
   - examples/provision/src/lib.rs
+  - https://github.com/NicolasMartino/repforge/issues/494#issuecomment-6121760029
 - Related:
   - wiki/decisions/topic-convergence-and-rebuild.decision.md
   - wiki/plans/topic-convergence.plan.md
@@ -51,6 +53,62 @@
   literal. `from_config` resolves `[topics] mode` alongside every other section,
   so an unknown mode is reported in the same error as the rest of the config
   rather than surfacing later at the call site.
+
+### Global topic prefix (2026-10-12)
+
+**Breaking.**
+
+- `kafkaman_rdkafka::Error::UnexpectedTopic { expected }` is now a `String`
+  rather than `&'static str`, because the expected topic is resolved at run time.
+  Code matching the field as `&str` or constructing the variant with a literal
+  must change; the `Display` text is unchanged.
+
+**Additive.**
+
+- `kafkaman_config::TopicsSection` gains `prefix: String` (default empty) and
+  `TopicsSection::validate_prefix`. Empty, or `[a-z0-9][a-z0-9.-]*` ending in `.`
+  or `-`. The trailing separator is required so prefix and bare topic stay
+  separable.
+- `KAFKAMAN_TOPICS_PREFIX`, read by `ResolvedConfig::from_config`, overrides
+  `[topics] prefix` when set and not blank. An invalid value is reported under
+  the key that supplied it (`topics.prefix` or `KAFKAMAN_TOPICS_PREFIX`) with
+  the rest of the config errors.
+
+**Behaviour.**
+
+- `ResolvedConfig` stores each registered descriptor with the prefix applied, and
+  `descriptor_for::<P>()` now returns that registered descriptor instead of
+  `P::descriptor()`. Enqueue (the outbox row and the `kafkaman.enqueue` span),
+  the receive store, the dispatch cache, `subscribe`, `converge_topics` (so
+  `verify` checks and `create` creates the prefixed topic), the ingester's topic
+  check, its quarantine row's `expected_topic`, its span and its metrics all use
+  the prefixed name. `KafkaMessage::TOPIC` stays the bare name.
+- There is no fallback to the bare name. A producer and a consumer with
+  different prefixes fail loudly: the ingester quarantines the record as
+  `UnexpectedTopic`. No legacy topic names exist to migrate.
+- Changeset checksums keep the bare topic. The changelog is derived from the
+  declared roles, which carry `P::descriptor()`, so this needed no change to
+  `changesets.rs` or `replay.rs`, and a slot's prefix never alters migration
+  history.
+- Consumer group names are not prefixed; the host passes them to
+  `RuntimeBuilder::consumer_group`.
+
+**Verified (2026-10-12).** `just check` on the branch, which includes a lockfile
+bump of `rustls` to 0.23.45 for RUSTSEC-2026-0285. The live round trip is
+`a_prefixed_message_round_trips_on_the_prefixed_topic_and_the_bare_one_is_refused`
+(`tests/durable-send`, `--features redpanda`): enqueue writes `p.orders`, the
+relay publishes there, the ingester subscribed on `p.orders` stores the record,
+and the same type published to `orders` is quarantined as `UnexpectedTopic` with
+`expected_topic = p.orders`. Turning the prefix off in `ResolvedConfig` fails it
+at the first assertion. Unit coverage:
+`a_topic_prefix_is_accepted_only_in_its_documented_shape`,
+`the_topic_prefix_is_applied_to_every_registered_descriptor`,
+`the_environment_prefix_overrides_the_file`,
+`an_invalid_prefix_is_reported_under_the_key_that_supplied_it`,
+`a_topic_prefix_changes_no_checksum`,
+`a_prefixed_topic_is_accepted_and_the_bare_or_other_prefix_is_refused`,
+`a_quarantine_record_names_the_prefixed_topic_as_expected`,
+`the_topic_prefix_reaches_convergence_subscribe_and_the_outbox`.
 
 ## Runtime Behavior Changes
 

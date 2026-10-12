@@ -47,10 +47,7 @@ pub enum Error {
     InvalidHeader { name: &'static str, message: String },
 
     #[error("Kafka record arrived on topic `{actual}` while `{expected}` was expected")]
-    UnexpectedTopic {
-        expected: &'static str,
-        actual: String,
-    },
+    UnexpectedTopic { expected: String, actual: String },
 
     #[error(
         "consecutive ingest skip limit {limit} reached at partition {partition} offset {offset}"

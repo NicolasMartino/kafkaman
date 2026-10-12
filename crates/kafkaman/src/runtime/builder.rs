@@ -440,7 +440,10 @@ impl RuntimeBuilder {
             let received = table_for(&cfg, &entry.descriptor, ReceivedTable::for_descriptor)?;
             consumed.push(ConsumedPlan {
                 message_type: entry.descriptor.message_type.as_str().to_owned(),
-                topic: entry.descriptor.topic.clone(),
+                // The table's descriptor, not the role's: `table_for` swapped in
+                // the registered one, so this is the prefixed topic the ingester
+                // subscribes to and expects records on.
+                topic: received.descriptor.topic.clone(),
                 received,
                 start_ingest: entry.start_ingest,
             });
@@ -466,15 +469,26 @@ impl RuntimeBuilder {
 /// `ReceivedTable::new` substitutes the library defaults for it. Handing the
 /// constructor a schema was enough to make the shorter one fit, and a builder-
 /// booted service therefore ignored every `[retry]` key in its own config file.
-fn table_for<T>(
+///
+/// `descriptor` is the role's, which carries the bare `TOPIC`. The table is
+/// built from the descriptor `cfg` registered for the same type instead, which
+/// carries the `[topics] prefix`.
+pub(super) fn table_for<T>(
     cfg: &ResolvedConfig,
     descriptor: &MessageDescriptor,
     build: impl Fn(&ResolvedConfig, MessageDescriptor) -> kafkaman_sqlx::Result<T>,
 ) -> Result<T, BuildError> {
-    build(cfg, descriptor.clone()).map_err(|source| BuildError::Table {
-        message_type: descriptor.message_type.as_str().to_owned(),
-        source,
-    })
+    let message_type = descriptor.message_type.as_str();
+    cfg.messages()
+        .iter()
+        .find(|registered| registered.message_type == descriptor.message_type)
+        .cloned()
+        .ok_or_else(|| kafkaman_sqlx::Error::UnknownMessageType(message_type.to_owned()))
+        .and_then(|registered| build(cfg, registered))
+        .map_err(|source| BuildError::Table {
+            message_type: message_type.to_owned(),
+            source,
+        })
 }
 
 struct ConsumedPlan {

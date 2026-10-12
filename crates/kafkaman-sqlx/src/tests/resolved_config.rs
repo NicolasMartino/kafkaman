@@ -1,4 +1,4 @@
-use kafkaman_core::MessageDescriptor;
+use kafkaman_core::{KafkaMessage, MessageDescriptor};
 
 use crate::tests::{descriptor, minimal_config};
 use crate::{Error, ResolvedConfig};
@@ -230,4 +230,100 @@ fn an_unknown_topic_mode_fails_resolution_rather_than_defaulting() {
     let message = err.to_string();
     assert!(message.contains("topics"), "{message}");
     assert!(message.contains("verfy"), "{message}");
+}
+
+fn config_with_prefix(prefix: &str) -> kafkaman_config::Config {
+    kafkaman_config::Config::parse(&format!(
+        r#"
+            [database]
+            schema = "kafkaman"
+
+            [relay]
+            worker_id = "worker-a"
+            batch_limit = 10
+            lease_for = "30s"
+            retry_after = "1s"
+            poll_interval = "250ms"
+
+            [topics]
+            prefix = "{prefix}"
+            "#,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn the_topic_prefix_is_applied_to_every_registered_descriptor() {
+    // Stored prefixed at registration, so every reader of `descriptor.topic` —
+    // the outbox and receive binds, subscribe, converge_topics — agrees on it
+    // without each applying the prefix itself.
+    let cfg = ResolvedConfig::from_config_with_prefix_env(
+        Some(&config_with_prefix("p.")),
+        [crate::tests::OrderCreated::descriptor().unwrap()],
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.messages()[0].topic, "p.orders");
+    assert_eq!(
+        cfg.descriptor_for::<crate::tests::OrderCreated>()
+            .unwrap()
+            .topic,
+        "p.orders"
+    );
+    // `TOPIC` itself stays the bare name.
+    assert_eq!(crate::tests::OrderCreated::TOPIC, "orders");
+
+    // A later registration on the same config gets the same prefix.
+    let cfg = cfg.with_message(descriptor("order_shipped"));
+    assert_eq!(cfg.messages()[1].topic, "p.topic");
+}
+
+#[test]
+fn no_prefix_leaves_the_bare_topic() {
+    let cfg = ResolvedConfig::from_config_with_prefix_env(
+        Some(&minimal_config()),
+        [crate::tests::OrderCreated::descriptor().unwrap()],
+        None,
+    )
+    .unwrap();
+    assert_eq!(cfg.messages()[0].topic, "orders");
+}
+
+#[test]
+fn the_environment_prefix_overrides_the_file() {
+    let file = config_with_prefix("file.");
+    let messages = || [crate::tests::OrderCreated::descriptor().unwrap()];
+
+    let cfg =
+        ResolvedConfig::from_config_with_prefix_env(Some(&file), messages(), Some("env-".into()))
+            .unwrap();
+    assert_eq!(cfg.messages()[0].topic, "env-orders");
+
+    // Blank is unset, the same as `KAFKAMAN_APPLIED_BY`: a deployment that
+    // renders `KAFKAMAN_TOPICS_PREFIX=` must not silently drop the file's.
+    let cfg =
+        ResolvedConfig::from_config_with_prefix_env(Some(&file), messages(), Some("  ".into()))
+            .unwrap();
+    assert_eq!(cfg.messages()[0].topic, "file.orders");
+}
+
+#[test]
+fn an_invalid_prefix_is_reported_under_the_key_that_supplied_it() {
+    let messages = || [crate::tests::OrderCreated::descriptor().unwrap()];
+
+    let err = ResolvedConfig::from_config_with_prefix_env(
+        Some(&config_with_prefix("dev")),
+        messages(),
+        None,
+    )
+    .expect_err("a prefix without a trailing separator is rejected");
+    assert!(err.to_string().contains("topics.prefix"), "{err}");
+
+    let err = ResolvedConfig::from_config_with_prefix_env(
+        Some(&minimal_config()),
+        messages(),
+        Some("Dev.".into()),
+    )
+    .expect_err("an upper-case prefix is rejected");
+    assert!(err.to_string().contains("KAFKAMAN_TOPICS_PREFIX"), "{err}");
 }

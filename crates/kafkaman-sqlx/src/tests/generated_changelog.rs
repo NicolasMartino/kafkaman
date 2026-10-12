@@ -329,3 +329,36 @@ fn a_forced_collision_is_not_reported_as_a_duplicate_version() {
         "collision detection must run before the ordering assertion"
     );
 }
+
+/// A topic prefix names the topic one environment uses; it is not a schema
+/// fact. The changelog is derived from the declared roles, whose descriptors
+/// carry the bare `TOPIC`, so two environments that share a database schema
+/// layout but not a prefix record identical changesets.
+#[test]
+fn a_topic_prefix_changes_no_checksum() {
+    let mut roles = crate::RoleRegistry::new();
+    roles.declare(order(), crate::Role::Publish).unwrap();
+    roles.declare(product(), crate::Role::Cache).unwrap();
+
+    let cfg = crate::ResolvedConfig::from_config_with_prefix_env(
+        Some(&crate::tests::minimal_config()),
+        roles.descriptors(),
+        Some("p.".to_owned()),
+    )
+    .unwrap();
+    assert!(cfg.messages().iter().all(|d| d.topic.starts_with("p.")));
+
+    let prefixed_run = roles.changelog().unwrap();
+    let bare = build_changelog(order_service_tables()).unwrap();
+    assert_eq!(versions(&prefixed_run), versions(&bare));
+    assert_eq!(
+        prefixed_run
+            .iter()
+            .map(|c| c.checksum())
+            .collect::<Vec<_>>(),
+        bare.iter().map(|c| c.checksum()).collect::<Vec<_>>(),
+    );
+    assert!(prefixed_run
+        .iter()
+        .all(|c| !c.checksum_material().contains("topic=p.")));
+}
