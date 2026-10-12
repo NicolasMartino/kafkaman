@@ -186,6 +186,45 @@ impl RetrySection {
 pub struct TopicsSection {
     #[serde(default)]
     pub mode: TopicMode,
+    /// Prepended to every registered type's `TOPIC` wherever kafkaman resolves
+    /// a topic at run time: enqueue, subscribe, the ingester's topic check and
+    /// boot convergence. `KafkaMessage::TOPIC` itself stays the bare name.
+    ///
+    /// Empty, the default, means no prefix. `KAFKAMAN_TOPICS_PREFIX` overrides
+    /// it; that read lives in `kafkaman-sqlx`'s `ResolvedConfig`, beside the
+    /// rest of resolution, because this crate only parses the file.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+impl TopicsSection {
+    /// Check a topic prefix: empty, or `[a-z0-9][a-z0-9.-]*` ending in `.` or
+    /// `-`.
+    ///
+    /// The trailing separator is required rather than suggested: without it,
+    /// `dev-slot1` and `user.snapshot.v1` run together into a name nobody can
+    /// split back apart, and two slots whose names share a stem can collide.
+    pub fn validate_prefix(prefix: &str) -> std::result::Result<(), String> {
+        if prefix.is_empty() {
+            return Ok(());
+        }
+        let mut chars = prefix.chars();
+        let starts_well = chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit());
+        let charset = prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
+        if !starts_well || !charset {
+            return Err(format!(
+                "topic prefix `{prefix}` must match [a-z0-9][a-z0-9.-]*"
+            ));
+        }
+        if !prefix.ends_with(['.', '-']) {
+            return Err(format!("topic prefix `{prefix}` must end in `.` or `-`"));
+        }
+        Ok(())
+    }
 }
 
 /// The `[observability]` section of `kafkaman.toml`: defaults plus per-type

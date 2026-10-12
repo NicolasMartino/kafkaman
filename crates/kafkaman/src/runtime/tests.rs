@@ -585,3 +585,67 @@ async fn runtime_tasks_report_named_panics() {
         .await
         .expect("no remaining tasks should drain");
 }
+
+// ---------------------------------------------------------------------------
+// Topic prefix
+// ---------------------------------------------------------------------------
+
+/// What `build()` hands to `converge_topics` and to `subscribe`, with
+/// `[topics] prefix` set: the prefixed name for both, while `TOPIC` stays bare.
+///
+/// Exercised through the pieces `build()` composes, because `build()` itself
+/// dials the broker for convergence before it gets that far. `converge_topics`
+/// reads `cfg.messages()`; the ingester subscribes to the received table's
+/// topic, which `table_for` builds from the registered descriptor.
+#[test]
+fn the_topic_prefix_reaches_convergence_subscribe_and_the_outbox() {
+    use kafkaman_sqlx::{OutboxTable, ReceivedTable, ResolvedConfig};
+
+    let prefixed = Config::parse(
+        r#"
+            [database]
+            schema = "kafkaman"
+
+            [relay]
+            worker_id = "worker-a"
+            batch_limit = 10
+            lease_for = "30s"
+            retry_after = "1s"
+            poll_interval = "250ms"
+
+            [topics]
+            prefix = "p."
+            "#,
+    )
+    .unwrap();
+    // Skipped rather than failed when the environment overrides the file: the
+    // override is pinned by `kafkaman-sqlx`'s resolution tests, which do not
+    // read the process environment.
+    if std::env::var("KAFKAMAN_TOPICS_PREFIX").is_ok_and(|value| !value.trim().is_empty()) {
+        return;
+    }
+
+    let order = OrderSnapshot::descriptor().unwrap();
+    let product = ProductSnapshot::descriptor().unwrap();
+    let cfg =
+        ResolvedConfig::from_config(Some(&prefixed), [order.clone(), product.clone()]).unwrap();
+
+    let converged: Vec<&str> = cfg.messages().iter().map(|d| d.topic.as_str()).collect();
+    assert_eq!(converged, ["p.orders", "p.products"]);
+
+    // The role's descriptor carries the bare topic; the table built from it
+    // carries the prefixed one.
+    assert_eq!(product.topic, ProductSnapshot::TOPIC);
+    let received =
+        super::builder::table_for(&cfg, &product, ReceivedTable::for_descriptor).unwrap();
+    assert_eq!(received.descriptor.topic, "p.products");
+    let outbox = super::builder::table_for(&cfg, &order, OutboxTable::for_descriptor).unwrap();
+    assert_eq!(outbox.descriptor.topic, "p.orders");
+    assert_eq!(
+        OutboxTable::for_message::<OrderSnapshot>(&cfg)
+            .unwrap()
+            .descriptor
+            .topic,
+        "p.orders"
+    );
+}

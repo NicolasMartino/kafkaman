@@ -6476,3 +6476,20 @@ new regression case.
 
 Pages affected: `wiki/compatibility/state-sourced-republish-api.compat.md`,
 `wiki/plans/entity-first-propagation.plan.md`, `wiki/index.md`, `wiki/log.md`.
+
+## [2026-10-12] update | global topic prefix
+
+`[topics] prefix` (empty by default; empty or `[a-z0-9][a-z0-9.-]*` ending in `.`
+or `-`), overridden by `KAFKAMAN_TOPICS_PREFIX` when set and not blank, is now
+prepended to every registered type's `TOPIC` when `ResolvedConfig` registers it.
+Enqueue, the receive store, the dispatch cache, `subscribe`, `converge_topics`
+and the ingester's topic check therefore all use the prefixed name, while
+`KafkaMessage::TOPIC` stays bare and changeset checksums stay on the bare topic.
+A producer and consumer with different prefixes fail as `UnexpectedTopic` with a
+quarantine row; there is no fallback to the bare name. Built so each local
+environment of a host can run its own copy of every topic on one shared broker.
+`Error::UnexpectedTopic.expected` is now a `String` (breaking).
+
+Pages affected: `wiki/compatibility/topic-convergence-api.compat.md`,
+`wiki/specs/entity-first-propagation.spec.md`, `wiki/index.md`, `wiki/log.md`,
+and `kafkaman.example.toml`.

@@ -186,6 +186,9 @@ impl RdkafkaConsumer {
     where
         P: KafkaMessage + DeserializeOwned + Serialize,
     {
+        // The registered topic, prefix included, resolved before a record is
+        // taken: an unregistered type fails here without consuming anything.
+        let topic = cfg.descriptor_for::<P>()?.topic;
         let message = self.consumer.recv().await?;
         let at = RecordLocation::of(&message);
         // Headers are readable before the payload is, and that is what lets the
@@ -199,13 +202,13 @@ impl RdkafkaConsumer {
             .observability
             .policy_for(P::MESSAGE_TYPE)
             .kafka_trace_handoff;
-        let span = ingest_span::<P>(&at, headers.trace_context().as_ref(), trace_handoff);
+        let span = ingest_span::<P>(&at, &topic, headers.trace_context().as_ref(), trace_handoff);
         // Captured from the ingest span by name. What lands in the received row's
         // `traceparent` is the phase, not whichever inner function happened to be
         // on the stack when the insert ran.
         let trace = kafkaman_core::capture_trace_context_of(&span);
         let result = self
-            .ingest_decoded::<P>(pool, cfg, &message, at, &headers, trace)
+            .ingest_decoded::<P>(pool, cfg, &message, at, &topic, &headers, trace)
             .instrument(span.clone())
             .await;
         match &result {
@@ -240,19 +243,21 @@ impl RdkafkaConsumer {
     /// included — runs inside one `.instrument`, rather than each arm opening a
     /// span of its own after the decision has already been made.
     #[tracing::instrument(level = "info", target = "kafkaman::internal", skip_all)]
+    #[allow(clippy::too_many_arguments)]
     async fn ingest_decoded<P>(
         &self,
         pool: &PgPool,
         cfg: &ResolvedConfig,
         message: &BorrowedMessage<'_>,
         at: RecordLocation,
+        expected_topic: &str,
         headers: &RecordHeaders,
         trace: Option<kafkaman_core::TraceContext>,
     ) -> Result<IngestOutcome>
     where
         P: KafkaMessage + DeserializeOwned + Serialize,
     {
-        match record_envelope::<P, _>(message, headers) {
+        match record_envelope::<P, _>(message, expected_topic, headers) {
             Ok(record) => {
                 self.store::<P>(pool, cfg, message, at, &record.envelope, record.key, trace)
                     .await
@@ -353,6 +358,7 @@ impl RdkafkaConsumer {
             // insert, so the audit row exists exactly when the rejection does.
             let failure = ingest_failure_record::<P, _>(
                 message,
+                &table.descriptor.topic,
                 ReceivedIngestFailureKind::MessageIdConflict,
                 detail,
             );
@@ -421,8 +427,9 @@ impl RdkafkaConsumer {
     where
         P: KafkaMessage,
     {
-        let failure = ingest_failure_record::<P, _>(message, kind, error.clone());
         let table = ReceivedTable::for_message::<P>(cfg)?;
+        let failure =
+            ingest_failure_record::<P, _>(message, &table.descriptor.topic, kind, error.clone());
         let mut tx = pool
             .begin()
             .instrument_db(kafkaman_core::db_span!(
@@ -491,7 +498,10 @@ impl RdkafkaConsumer {
         // whichever meter provider is installed when it is built. Building it
         // here means a host that installs its pipeline before starting the
         // ingester is reported, regardless of what else the process did first.
-        let metrics = IngestMetrics::new(P::MESSAGE_TYPE, P::TOPIC);
+        //
+        // The registered topic, so the series names the topic actually consumed.
+        let topic = cfg.descriptor_for::<P>()?.topic;
+        let metrics = IngestMetrics::new(P::MESSAGE_TYPE, topic);
 
         loop {
             let result = tokio::select! {
@@ -557,6 +567,7 @@ impl RdkafkaConsumer {
 /// stored it.
 fn ingest_span<P: KafkaMessage>(
     at: &RecordLocation,
+    topic: &str,
     producer_trace: Option<&kafkaman_core::TraceContext>,
     trace_handoff: KafkaTraceHandoff,
 ) -> tracing::Span {
@@ -568,7 +579,7 @@ fn ingest_span<P: KafkaMessage>(
         "error.type" = tracing::field::Empty,
         message_type = P::MESSAGE_TYPE,
         messaging.system = "kafka",
-        messaging.destination.name = P::TOPIC,
+        messaging.destination.name = topic,
         messaging.operation.name = "receive",
         messaging.kafka.partition = at.partition,
         messaging.kafka.offset = at.offset,

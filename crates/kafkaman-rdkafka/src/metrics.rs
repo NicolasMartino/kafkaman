@@ -91,7 +91,7 @@ mod enabled {
     }
 
     impl IngestMetrics {
-        pub(crate) fn new(message_type: &'static str, topic: &'static str) -> Self {
+        pub(crate) fn new(message_type: &'static str, topic: String) -> Self {
             let meter = global::meter("kafkaman");
             Self {
                 records: meter
@@ -201,7 +201,7 @@ mod disabled {
     pub(crate) struct IngestMetrics;
 
     impl IngestMetrics {
-        pub(crate) fn new(_message_type: &'static str, _topic: &'static str) -> Self {
+        pub(crate) fn new(_message_type: &'static str, _topic: String) -> Self {
             Self
         }
 

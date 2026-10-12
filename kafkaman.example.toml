@@ -36,6 +36,20 @@ schema = "kafkaman"
 # disables topic checks and leaves all responsibility with the host deployment.
 [topics]
 mode = "verify"
+# Prepended to every registered type's `TOPIC` wherever kafkaman resolves a topic
+# at run time: the outbox row it enqueues, the topic it subscribes to, the topic
+# the ingester accepts records from, and the topic `mode` verifies or creates.
+# `KafkaMessage::TOPIC` stays the bare name in code; with `prefix = "dev-slot1."`
+# a type declaring `user.snapshot.v1` runs on `dev-slot1.user.snapshot.v1`.
+# Empty (the default) means no prefix. Otherwise it must match
+# `[a-z0-9][a-z0-9.-]*` and end in `.` or `-`. The environment variable
+# `KAFKAMAN_TOPICS_PREFIX`, when set and not blank, overrides this key, so one
+# file can serve environments that differ only in their topic names. Producer and
+# consumer must agree: a record arriving on a topic with another prefix is
+# quarantined as `UnexpectedTopic`. Consumer group names are not prefixed; the
+# host passes those. Changeset checksums use the bare topic, so the prefix never
+# changes migration history.
+prefix = ""
 
 # REQUIRED. Drives the outbox relay: how it claims rows, how long it owns them,
 # and how fast it polls. Every key below is mandatory — there are no defaults.

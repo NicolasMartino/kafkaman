@@ -58,9 +58,15 @@ where
         "error.type" = tracing::field::Empty,
         message_type = P::MESSAGE_TYPE,
         messaging.system = "kafka",
-        messaging.destination.name = P::TOPIC,
+        messaging.destination.name = tracing::field::Empty,
         messaging.operation.name = "create",
     );
+    // The registered topic, prefix included, rather than `P::TOPIC`: the span
+    // names the topic the row is written for. An unregistered type leaves it
+    // empty and fails inside, where the error is recorded on this span.
+    if let Ok(descriptor) = cfg.descriptor_for::<P>() {
+        span.record("messaging.destination.name", descriptor.topic.as_str());
+    }
     // Captured from `span` by name rather than from whatever span is current
     // inside `enqueue_inner`. The comment above has always claimed this; now it
     // is true regardless of what nests in between.
