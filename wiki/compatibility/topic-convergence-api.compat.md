@@ -93,6 +93,23 @@
 - Consumer group names are not prefixed; the host passes them to
   `RuntimeBuilder::consumer_group`.
 
+**Verified (2026-10-12).** `just check` on the branch, which includes a lockfile
+bump of `rustls` to 0.23.45 for RUSTSEC-2026-0285. The live round trip is
+`a_prefixed_message_round_trips_on_the_prefixed_topic_and_the_bare_one_is_refused`
+(`tests/durable-send`, `--features redpanda`): enqueue writes `p.orders`, the
+relay publishes there, the ingester subscribed on `p.orders` stores the record,
+and the same type published to `orders` is quarantined as `UnexpectedTopic` with
+`expected_topic = p.orders`. Turning the prefix off in `ResolvedConfig` fails it
+at the first assertion. Unit coverage:
+`a_topic_prefix_is_accepted_only_in_its_documented_shape`,
+`the_topic_prefix_is_applied_to_every_registered_descriptor`,
+`the_environment_prefix_overrides_the_file`,
+`an_invalid_prefix_is_reported_under_the_key_that_supplied_it`,
+`a_topic_prefix_changes_no_checksum`,
+`a_prefixed_topic_is_accepted_and_the_bare_or_other_prefix_is_refused`,
+`a_quarantine_record_names_the_prefixed_topic_as_expected`,
+`the_topic_prefix_reaches_convergence_subscribe_and_the_outbox`.
+
 ## Runtime Behavior Changes
 
 - **`[topics]` absent now means `verify`, not "skip".** Opting out is
