@@ -37,8 +37,7 @@ pub use kafkaman_rdkafka as rdkafka;
 #[cfg(feature = "rdkafka")]
 pub mod runtime;
 
-/// Resync and redrive from a declared source list, behind the `rdkafka`
-/// feature because a resync verifies its topics on the broker first.
+// Behind `rdkafka` because a resync verifies its topics on the broker first.
 #[cfg(feature = "rdkafka")]
 pub mod recovery;
 
