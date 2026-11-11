@@ -155,8 +155,9 @@ fn from_config_rejects_a_message_type_registered_under_two_topics() {
                 ref registered,
                 ref conflicting,
             } if message_type == "order_created"
-                && registered == "orders"
-                && conflicting == "orders_v2"
+                // A runner may set `KAFKAMAN_TOPICS_PREFIX`, which `from_config` applies.
+                && registered.ends_with("orders")
+                && conflicting.ends_with("orders_v2")
         ),
         "expected ConflictingMessageType, got {err:?}"
     );
