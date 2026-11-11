@@ -13,11 +13,13 @@ repository.workspace = true
 # broker started as a testcontainer and asserts the consumed record.
 redpanda = [
     "kafkaman-test/redpanda",
+    "dep:kafkaman",
     "dep:kafkaman-rdkafka",
     "dep:rdkafka",
 ]
 
 [dependencies]
+kafkaman = { path = "../../crates/kafkaman", optional = true, features = ["rdkafka"] }
 kafkaman-config = { path = "../../crates/kafkaman-config" }
 kafkaman-core = { path = "../../crates/kafkaman-core" }
 kafkaman-sqlx = { path = "../../crates/kafkaman-sqlx" }
@@ -38,6 +40,8 @@ testcontainers.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

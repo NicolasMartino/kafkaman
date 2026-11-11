@@ -174,7 +174,8 @@ impl TableAccess {
                  one, so something else owns this name"
             }
             Self::NoPrivilege => {
-                "grant this service's database role the privileges the route needs on the table"
+                "grant this service's database role the privileges the route needs on the table, \
+                 and USAGE on its schema"
             }
         }
     }
@@ -188,6 +189,10 @@ impl TableAccess {
 /// passes `["SELECT"]`; one that writes has to say so, because a role with
 /// `SELECT` and no `UPDATE` would otherwise pass a read-shaped probe and then
 /// fail against the statement it was cleared for.
+///
+/// Any privilege also needs `USAGE` on the schema. `has_table_privilege` does
+/// not check it, so a role granted the table but not its schema used to pass
+/// the probe and then fail on the statement itself.
 ///
 /// The predicates are selected as columns rather than filtered on, so an
 /// unusable table can say *why* instead of being indistinguishable from an
@@ -210,13 +215,15 @@ pub async fn service_table_access(
     let found: Option<(bool, bool)> = sqlx::query_as(
         "SELECT class.relkind IN ('r', 'p'),
                 coalesce(bool_and(has_table_privilege(class.oid, privilege)), true)
+                  AND (cardinality($3::text[]) = 0
+                       OR has_schema_privilege(namespace.oid, 'USAGE'))
          FROM pg_namespace namespace
          JOIN pg_class class
            ON class.relnamespace = namespace.oid
           AND class.relname = $2
          LEFT JOIN unnest($3::text[]) AS privilege ON true
          WHERE namespace.nspname = $1
-         GROUP BY class.relkind",
+         GROUP BY class.relkind, namespace.oid",
     )
     .bind(schema.as_str())
     .bind(table.as_str())

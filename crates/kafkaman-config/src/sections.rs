@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use kafkaman_core::{DispatcherConfig, LifecycleEmission, PurgeConfig, RelayConfig, TopicMode};
+use kafkaman_core::{
+    DispatcherConfig, LifecycleEmission, PurgeConfig, RelayConfig, TopicMode, MAX_REDRIVE_ROWS,
+};
 use serde::Deserialize;
 
 use crate::duration::{deserialize_duration, deserialize_optional_duration};
@@ -73,6 +76,64 @@ impl RetentionSection {
         };
         cfg.validate().map_err(|err| err.to_string())?;
         Ok(cfg)
+    }
+}
+
+/// The `[recovery]` section of `kafkaman.toml`: how the recovery entry point
+/// paces a resync and how many rows one redrive may move.
+///
+/// Optional, and every field too. Integers rather than unsigned types so a
+/// negative value is refused with its key named, not as a serde type error.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct RecoverySection {
+    /// Keys loaded per page. Must be > 0. Default 100.
+    pub batch_size: i64,
+    /// Sleep between pages, in milliseconds. Must be >= 0. Default 0.
+    pub pause_ms: i64,
+    /// Ceiling on a redrive's row count, `1..=MAX_REDRIVE_ROWS`. Default
+    /// `MAX_REDRIVE_ROWS`.
+    pub max_redrive_rows: i64,
+}
+
+impl Default for RecoverySection {
+    fn default() -> Self {
+        Self {
+            batch_size: 100,
+            pause_ms: 0,
+            max_redrive_rows: MAX_REDRIVE_ROWS,
+        }
+    }
+}
+
+/// A validated `[recovery]` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryConfig {
+    pub batch_size: NonZeroUsize,
+    pub pause: Duration,
+    pub max_redrive_rows: i64,
+}
+
+impl RecoverySection {
+    pub fn into_recovery_config(self) -> std::result::Result<RecoveryConfig, String> {
+        let batch_size = usize::try_from(self.batch_size)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| format!("batch_size must be > 0, got {}", self.batch_size))?;
+        let pause = u64::try_from(self.pause_ms)
+            .map(Duration::from_millis)
+            .map_err(|_| format!("pause_ms must be >= 0, got {}", self.pause_ms))?;
+        if !(1..=MAX_REDRIVE_ROWS).contains(&self.max_redrive_rows) {
+            return Err(format!(
+                "max_redrive_rows must be between 1 and {MAX_REDRIVE_ROWS}, got {}",
+                self.max_redrive_rows
+            ));
+        }
+        Ok(RecoveryConfig {
+            batch_size,
+            pause,
+            max_redrive_rows: self.max_redrive_rows,
+        })
     }
 }
 

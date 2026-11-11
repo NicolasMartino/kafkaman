@@ -121,6 +121,12 @@ fn the_shipped_example_config_resolves_and_covers_every_section() {
         .expect("the example must document the [retention] section")
         .into_purge_config()
         .expect("the example's retention section must be valid");
+    assert!(
+        cfg.contains("recovery"),
+        "the example must document the [recovery] section"
+    );
+    cfg.recovery()
+        .expect("the example's recovery section must be valid");
 }
 
 #[test]

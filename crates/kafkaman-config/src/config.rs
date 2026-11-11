@@ -7,8 +7,8 @@ use serde::de::DeserializeOwned;
 use crate::duration::parse_duration;
 use crate::{
     ConfigError, ConfigErrors, ConfigSchema, DispatcherSection, ObservabilityConfig,
-    ObservabilitySection, RelaySection, Result, RetentionSection, RetryConfig, RetrySection,
-    TopicsSection,
+    ObservabilitySection, RecoveryConfig, RecoverySection, RelaySection, Result, RetentionSection,
+    RetryConfig, RetrySection, TopicsSection,
 };
 
 /// A parsed `kafkaman.toml`.
@@ -107,6 +107,47 @@ impl Config {
     /// exactly the behaviour that predates the section.
     pub fn dispatcher(&self) -> Result<DispatcherSection> {
         Ok(self.section("dispatcher")?.unwrap_or_default())
+    }
+
+    /// The `[recovery]` section, resolved and validated. Absent means every
+    /// default.
+    pub fn recovery(&self) -> Result<RecoveryConfig> {
+        self.section::<RecoverySection>("recovery")?
+            .unwrap_or_default()
+            .into_recovery_config()
+            .map_err(|message| ConfigError::InvalidValue {
+                key: "recovery".to_owned(),
+                message,
+            })
+    }
+
+    /// Replace `database.schema`, for a host that picks the schema per
+    /// deployment. The value is validated where it is resolved, like the file's.
+    pub fn with_schema(self, schema: &str) -> Result<Self> {
+        self.with_string("database", "schema", schema)
+    }
+
+    /// Replace `relay.worker_id`, which has to be unique per process and so
+    /// cannot live in a checked-in file.
+    pub fn with_worker_id(self, worker_id: &str) -> Result<Self> {
+        self.with_string("relay", "worker_id", worker_id)
+    }
+
+    fn with_string(mut self, section: &str, key: &str, value: &str) -> Result<Self> {
+        let entry = self
+            .table
+            .entry(section)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let found = value_type(entry);
+        let Some(table) = entry.as_table_mut() else {
+            return Err(ConfigError::WrongType {
+                key: section.to_owned(),
+                expected: "table",
+                found,
+            });
+        };
+        table.insert(key.to_owned(), toml::Value::String(value.to_owned()));
+        Ok(self)
     }
 
     /// The `[retry]` section.

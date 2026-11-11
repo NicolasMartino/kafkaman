@@ -1,0 +1,404 @@
+//! The recovery entry point: resync and redrive from a declared source list.
+//!
+//! Behind `redpanda` because a resync verifies its topics on a real broker
+//! before it touches storage.
+#![cfg(feature = "redpanda")]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod redrive;
+mod resync;
+mod selection;
+
+use std::sync::{Arc, Mutex};
+
+use durable_send_tests::{
+    postgres, redpanda, KeylessProduct, ProductSnapshot, RegionalProduct, TestPostgres, TestResult,
+};
+use kafkaman::config::Config;
+use kafkaman::recovery::{Recovery, RecoveryError, RecoveryInputs, Report, Source, SourceProgress};
+use kafkaman_core::{Envelope, KafkaMessage, MessageDescriptor, TopicMode};
+use kafkaman_rdkafka::{converge_topics, TopicAdmin};
+use kafkaman_sqlx::{
+    migrate, InitSchema, MigrationContext, OutboxTable, ResolvedConfig, ResyncFuture,
+    ResyncProgress,
+};
+use kafkaman_test::EnvelopeTestExt;
+use sqlx::{PgConnection, PgPool};
+use testcontainers::{ContainerAsync, GenericImage};
+use uuid::Uuid;
+
+/// The relay settings every resolved file needs.
+const RELAY: &str = "[relay]
+worker_id = \"recovery-test\"
+batch_limit = 100
+lease_for = \"30s\"
+retry_after = \"1s\"
+poll_interval = \"100ms\"
+";
+
+/// A database with a fresh kafkaman schema, and the config that names it.
+struct Fixture {
+    _postgres: TestPostgres,
+    pool: PgPool,
+    schema: String,
+}
+
+impl Fixture {
+    async fn start() -> TestResult<Self> {
+        let postgres = postgres().await?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(postgres.url())
+            .await?;
+        let schema = format!("recovery_{}", Uuid::new_v4().simple());
+        sqlx::raw_sql(
+            "CREATE TABLE product_state (id text PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE regional_state (id text PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE keyless_state (id text PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE recovery_fault (key text PRIMARY KEY, kind text NOT NULL)",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(Self {
+            _postgres: postgres,
+            pool,
+            schema,
+        })
+    }
+
+    /// The service file, with resync pages of two.
+    fn config(&self) -> Config {
+        self.config_with("[recovery]\nbatch_size = 2\n")
+    }
+
+    fn config_with(&self, extra: &str) -> Config {
+        Config::parse(&format!(
+            "{extra}[database]\nschema = \"{}\"\n{RELAY}",
+            self.schema
+        ))
+        .unwrap()
+    }
+
+    fn resolved(&self) -> ResolvedConfig {
+        ResolvedConfig::from_config(Some(&self.config()), [products(), regional(), keyless()])
+            .unwrap()
+    }
+
+    async fn seed(&self, table: &str, rows: &[(&str, &str)]) -> TestResult {
+        for (id, name) in rows {
+            sqlx::query(&format!(
+                "INSERT INTO {table} VALUES ($1, $2)
+                 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name"
+            ))
+            .bind(id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn fault(&self, key: &str, kind: &str) -> TestResult {
+        sqlx::query("INSERT INTO recovery_fault VALUES ($1, $2)")
+            .bind(key)
+            .bind(kind)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_faults(&self) -> TestResult {
+        sqlx::query("DELETE FROM recovery_fault")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether `P`'s outbox table exists.
+    async fn outbox_exists<P: KafkaMessage>(&self) -> TestResult<bool> {
+        let table = OutboxTable::for_message::<P>(&self.resolved())?;
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+                .bind(table.qualified_name())
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// `(entity_key, name, idempotency_key)` for every outbox row, in enqueue
+    /// order.
+    async fn outbox<P: KafkaMessage>(&self) -> TestResult<Vec<(String, String, String)>> {
+        let table = OutboxTable::for_message::<P>(&self.resolved())?;
+        Ok(sqlx::query_as(&format!(
+            "SELECT entity_key, payload->>'name', idempotency_key FROM {}
+             ORDER BY enqueue_order",
+            table.qualified_name()
+        ))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Changesets applied beyond the baseline schema.
+    async fn applied_changesets(&self) -> TestResult<i64> {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("\"{}\".changelog_history", self.schema))
+            .fetch_one(&self.pool)
+            .await?;
+        if !exists {
+            return Ok(0);
+        }
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM \"{}\".changelog_history WHERE version <> 1",
+            self.schema
+        ))
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Lay down the baseline schema without any message tables.
+    async fn init_schema(&self) -> TestResult {
+        let changesets: Vec<Box<dyn kafkaman_sqlx::Changeset>> = vec![Box::new(InitSchema)];
+        migrate(
+            &self.pool,
+            &self.resolved(),
+            &MigrationContext::default(),
+            &changesets,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn run(
+        &self,
+        recovery: &mut Recovery,
+        brokers: Option<&str>,
+        inputs: RecoveryInputs,
+    ) -> Result<Report, RecoveryError> {
+        let request = recovery.request_from(&self.config(), inputs).unwrap();
+        recovery
+            .run(
+                &self.pool,
+                &self.config(),
+                brokers,
+                &MigrationContext::default(),
+                request,
+            )
+            .await
+    }
+}
+
+/// A broker on which `topics` already exist, as an operator provisions them.
+/// `topics` as a run resolves them, under any `KAFKAMAN_TOPICS_PREFIX`.
+fn prefixed(topics: &[MessageDescriptor]) -> Vec<MessageDescriptor> {
+    let file = Config::parse(&format!("[database]\nschema = \"kafkaman\"\n{RELAY}")).unwrap();
+    ResolvedConfig::from_config(Some(&file), topics.to_vec())
+        .unwrap()
+        .messages()
+        .to_vec()
+}
+
+async fn broker_with(
+    topics: &[MessageDescriptor],
+) -> TestResult<(ContainerAsync<GenericImage>, String)> {
+    let (container, brokers) = redpanda().await?;
+    let admin = TopicAdmin::from_brokers(&brokers)?;
+    for topic in prefixed(topics) {
+        admin
+            .create(&topic.topic, 1, None, &topic.topic_spec)
+            .await?;
+    }
+    Ok((container, brokers))
+}
+
+fn products() -> MessageDescriptor {
+    ProductSnapshot::descriptor().unwrap()
+}
+
+fn regional() -> MessageDescriptor {
+    RegionalProduct::descriptor().unwrap()
+}
+
+fn keyless() -> MessageDescriptor {
+    KeylessProduct::descriptor().unwrap()
+}
+
+fn keys_from<'a>(
+    table: &'static str,
+    conn: &'a mut PgConnection,
+    after: Option<&'a str>,
+    limit: usize,
+) -> ResyncFuture<'a, Vec<String>> {
+    Box::pin(async move {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT id FROM {table} WHERE ($1::text IS NULL OR id COLLATE \"C\" > $1)
+             ORDER BY id COLLATE \"C\" LIMIT $2"
+        ))
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap())
+        .fetch_all(conn)
+        .await?)
+    })
+}
+
+/// Current state for `key`, or a planted fault: `mismatch` returns another
+/// entity's envelope, `error` fails the query, `missing` finds nothing.
+async fn current(
+    table: &str,
+    conn: &mut PgConnection,
+    key: &str,
+) -> kafkaman_sqlx::Result<Option<(String, String)>> {
+    let fault: Option<String> =
+        sqlx::query_scalar("SELECT kind FROM recovery_fault WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&mut *conn)
+            .await?;
+    match fault.as_deref() {
+        Some("error") => {
+            sqlx::query("SELECT 1 / 0").execute(&mut *conn).await?;
+            unreachable!("the planted fault fails the query");
+        }
+        Some("mismatch") => return Ok(Some(("someone-else".to_owned(), "wrong".to_owned()))),
+        Some("missing") => return Ok(None),
+        _ => {}
+    }
+    let name: Option<String> =
+        sqlx::query_scalar(&format!("SELECT name FROM {table} WHERE id = $1"))
+            .bind(key)
+            .fetch_optional(conn)
+            .await?;
+    Ok(name.map(|name| (key.to_owned(), name)))
+}
+
+fn product_source(name: &str) -> Source {
+    Source::resync::<ProductSnapshot, _, _>(
+        name,
+        |conn, after, limit| keys_from("product_state", conn, after, limit),
+        |conn, key, run_id| {
+            Box::pin(async move {
+                Ok(current("product_state", conn, key)
+                    .await?
+                    .map(|(id, name)| {
+                        ProductSnapshot::envelope(&id, &name)
+                            .with_idempotency_key(format!("product:{id}:recovery:{run_id}"))
+                    }))
+            })
+        },
+    )
+}
+
+fn regional_source(name: &str) -> Source {
+    Source::resync::<RegionalProduct, _, _>(
+        name,
+        |conn, after, limit| keys_from("regional_state", conn, after, limit),
+        |conn, key, run_id| {
+            Box::pin(async move {
+                Ok(current("regional_state", conn, key)
+                    .await?
+                    .map(|(id, name)| {
+                        Envelope::new(RegionalProduct {
+                            product_id: id.clone(),
+                            region: "eu".to_owned(),
+                            name,
+                        })
+                        .with_idempotency_key(format!("regional:{id}:recovery:{run_id}"))
+                    }))
+            })
+        },
+    )
+}
+
+fn keyless_source(name: &str) -> Source {
+    Source::resync::<KeylessProduct, _, _>(
+        name,
+        |conn, after, limit| keys_from("keyless_state", conn, after, limit),
+        |conn, key, run_id| {
+            Box::pin(async move {
+                Ok(current("keyless_state", conn, key)
+                    .await?
+                    .map(|(id, name)| {
+                        KeylessProduct::envelope(&id, &name)
+                            .with_idempotency_key(format!("keyless:{id}:recovery:{run_id}"))
+                    }))
+            })
+        },
+    )
+}
+
+fn resync_inputs(source: Option<&str>, start_after: Option<&str>) -> RecoveryInputs {
+    RecoveryInputs {
+        source: source.map(str::to_owned),
+        start_after: start_after.map(str::to_owned),
+        ..RecoveryInputs::default()
+    }
+}
+
+fn resync_progress(enqueued: u64, skipped: u64, last_key: Option<&str>) -> SourceProgress {
+    SourceProgress::Resync(ResyncProgress {
+        enqueued,
+        skipped,
+        last_key: last_key.map(str::to_owned),
+    })
+}
+
+/// The `kafkaman` events a scope emitted, each as `{"fields": {...}}`.
+#[derive(Clone, Default)]
+struct Events(Arc<Mutex<Vec<serde_json::Value>>>);
+
+impl Events {
+    /// Capture events on this thread until the guard drops. The tests run on
+    /// the current-thread runtime, so every await stays on it.
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(self.0.clone())),
+        )
+    }
+
+    fn named(&self, message: &str) -> Vec<serde_json::Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["fields"]["message"] == message)
+            .cloned()
+            .collect()
+    }
+}
+
+struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if !event.metadata().target().starts_with("kafkaman") {
+            return;
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        self.0
+            .lock()
+            .unwrap()
+            .push(serde_json::json!({ "fields": fields.0 }));
+    }
+}
+
+#[derive(Default)]
+struct Fields(serde_json::Map<String, serde_json::Value>);
+
+impl tracing::field::Visit for Fields {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_owned(), value.into());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_owned(), value.into());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.into());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_owned(), format!("{value:?}").into());
+    }
+}
