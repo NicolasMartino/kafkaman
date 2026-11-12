@@ -76,12 +76,23 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
             ("regional", resync_progress(0, 0, None)),
         ]
     );
-    assert_eq!(
+    // The pool hands dropped connections back on short tasks of its own, so
+    // wait for those to end rather than counting at one instant.
+    let alive = || {
         tokio::runtime::Handle::current()
             .metrics()
-            .num_alive_tasks(),
-        tasks_before,
-        "recovery runs in the caller's task and leaves nothing running"
+            .num_alive_tasks()
+    };
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        while alive() > tasks_before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok() && alive() == tasks_before,
+        "recovery runs in the caller's task and leaves nothing running: {} alive, {tasks_before} before",
+        alive()
     );
     let rows = fixture.outbox::<ProductSnapshot>().await?;
     assert_eq!(
