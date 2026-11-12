@@ -37,6 +37,10 @@ pub use kafkaman_rdkafka as rdkafka;
 #[cfg(feature = "rdkafka")]
 pub mod runtime;
 
+// Behind `rdkafka` because a resync verifies its topics on the broker first.
+#[cfg(feature = "rdkafka")]
+pub mod recovery;
+
 /// Axum admin/health routes, correlation middleware, and runtime composition.
 ///
 /// A module rather than `pub use kafkaman_axum as axum`, because the runtime

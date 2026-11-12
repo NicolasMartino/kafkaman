@@ -141,6 +141,10 @@ fn from_config_rejects_a_message_type_registered_under_two_topics() {
     )
     .expect_err("two topics for one message type must be rejected");
 
+    // A runner may set the prefix variable, which `from_config` applies.
+    let prefix = std::env::var(crate::resolved_config::TOPICS_PREFIX_ENV)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_default();
     assert!(
         matches!(
             err,
@@ -149,8 +153,8 @@ fn from_config_rejects_a_message_type_registered_under_two_topics() {
                 ref registered,
                 ref conflicting,
             } if message_type == "order_created"
-                && registered == "orders"
-                && conflicting == "orders_v2"
+                && *registered == format!("{prefix}orders")
+                && *conflicting == format!("{prefix}orders_v2")
         ),
         "expected ConflictingMessageType, got {err:?}"
     );

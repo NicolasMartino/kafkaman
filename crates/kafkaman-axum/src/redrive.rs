@@ -45,12 +45,9 @@ pub fn redrive_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// Largest number of rows one redrive request may re-enqueue.
-///
-/// Redrive moves rows back to `Pending`, so an unbounded request is a way to
-/// hand the dispatcher an entire DLQ in one transaction. Operators who need more
-/// issue more requests, which also gives them a natural place to stop.
-pub const MAX_REDRIVE_ROWS: i64 = 10_000;
+/// Re-exported from core, where the recovery entry point reads the same
+/// ceiling.
+pub use kafkaman_sqlx::MAX_REDRIVE_ROWS;
 
 /// Body of a DLQ redrive request.
 ///

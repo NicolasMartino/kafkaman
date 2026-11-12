@@ -29,6 +29,11 @@ an analytics event pipeline, and it will not become one.
   offered: republishing a stored row emits stale state at a *newer* Kafka offset,
   which every consumer's convergence guard would then correctly and permanently
   believe.
+- A recovery entry point, [`kafkaman::recovery`](src/recovery.rs) (feature
+  `rdkafka`): declare resync and received sources once, and a run checks its
+  selection before any I/O, verifies every topic before migrating, stops at the
+  first failure and reports the last committed key to resume from. Pacing and
+  the redrive ceiling come from `[recovery]` in `kafkaman.toml`.
 
 ## Assembling a service
 

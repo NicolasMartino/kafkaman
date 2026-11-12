@@ -323,6 +323,11 @@ durable entity propagation ledger and local cache store.
   `KAFKAMAN_TOPICS_PREFIX`, is prepended to every registered topic at run time
   (`TOPIC` stays bare; checksums stay on the bare topic), and
   `Error::UnexpectedTopic.expected` becomes a `String`. Status: Active.
+- [compatibility/recovery-entry-point.compat.md](compatibility/recovery-entry-point.compat.md)
+  - Additive: `kafkaman::recovery` resyncs and redrives from a declared source
+  list, `[recovery]` paces it and caps redrives, `Config::with_schema` and
+  `Config::with_worker_id` override per deployment, and the table probe now
+  requires schema `USAGE`. Status: Implemented.
 
 ## Decisions
 

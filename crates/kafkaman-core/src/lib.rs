@@ -25,6 +25,7 @@ mod identifier;
 mod lifecycle;
 mod message;
 mod purge_config;
+mod redrive;
 mod relay_config;
 mod rows;
 mod span;
@@ -54,6 +55,7 @@ pub use lifecycle::{LifecycleEmission, LifecycleSampler};
 pub use message::{reserved_header, KafkaMessage, MessageDescriptor, RESERVED_HEADER_PREFIX};
 pub use problem::ProblemType;
 pub use purge_config::{PurgeConfig, PurgeStats};
+pub use redrive::MAX_REDRIVE_ROWS;
 pub use relay_config::{RelayConfig, RelayStats};
 pub use rows::{
     ClaimedOutboxRow, MarkOutcome, OutboxRow, PublishAck, PublishedRecord, ReceivedError,

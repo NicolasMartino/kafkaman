@@ -579,3 +579,88 @@ async fn a_message_type_with_no_table_on_either_side_fails_the_summaries() -> Te
 
     Ok(())
 }
+
+/// Table grants without `USAGE` on the schema answer 503 with the repair, not
+/// a 500 from the `UPDATE` the probe let through.
+///
+/// `has_table_privilege` passes such a role, and every statement against the
+/// table then fails with a raw permission error. The probe checks the schema
+/// too, so the route names the missing grant and moves nothing.
+#[tokio::test]
+async fn a_role_without_schema_usage_cannot_redrive() -> TestResult {
+    let postgres = postgres_for_suite(SUITE).await?;
+    let harness = Harness::connect(postgres.url()).await?;
+    let event =
+        ProductSnapshot::envelope("no-usage", "a product").try_with_idempotency_key("no-usage")?;
+    harness
+        .insert_received(&event, 0, 1, Some(b"no-usage"))
+        .await?;
+    let table = harness
+        .received_table::<ProductSnapshot>()
+        .await?
+        .qualified_name();
+    sqlx::query(&format!(
+        "UPDATE {table} SET status = {}",
+        kafkaman_core::ReceiveStatus::Failed.sql_literal()
+    ))
+    .execute(harness.pool())
+    .await?;
+
+    let role = format!("no_usage_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {role} LOGIN PASSWORD 'secret'"))
+        .execute(harness.pool())
+        .await?;
+    sqlx::query(&format!("GRANT SELECT, UPDATE ON {table} TO {role}"))
+        .execute(harness.pool())
+        .await?;
+    let schema = harness.config().schema().as_str().to_owned();
+    let usage: bool = sqlx::query_scalar("SELECT has_schema_privilege($1, $2, 'USAGE')")
+        .bind(&role)
+        .bind(&schema)
+        .fetch_one(harness.pool())
+        .await?;
+    assert!(
+        !usage,
+        "the fixture's role must lack USAGE for this to test anything"
+    );
+
+    let url = postgres
+        .url()
+        .replacen("postgres:postgres@", &format!("{role}:secret@"), 1);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let state = AdminState::new(pool, Arc::new(harness.config()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let server = AdminServer {
+        base,
+        task: tokio::spawn(async move {
+            let _ = axum::serve(listener, redrive_router(state)).await;
+        }),
+    };
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/dlq/product_snapshot/redrive", server.base))
+        .json(&serde_json::json!({ "max_rows": 10 }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 503);
+    let body: serde_json::Value = response.json().await?;
+    assert!(
+        body["repair"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("USAGE"),
+        "the repair should name the missing schema grant: {body}"
+    );
+    let failed: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE status = {}",
+        kafkaman_core::ReceiveStatus::Failed.sql_literal()
+    ))
+    .fetch_one(harness.pool())
+    .await?;
+    assert_eq!(failed, 1, "a refused redrive moves nothing");
+    Ok(())
+}

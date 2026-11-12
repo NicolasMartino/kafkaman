@@ -61,6 +61,7 @@ pub use generated_changelog::{
     band, band_of, changeset_version, TableKind, BAND_WIDTH, RESERVED_CEILING,
 };
 pub use ingest_failure::{ReceivedIngestFailure, ReceivedIngestFailureRow, ReceivedInsertOutcome};
+pub use kafkaman_core::MAX_REDRIVE_ROWS;
 pub use migration_runner::{migrate, migrate_dry_run};
 pub use operability::{
     outbox_status_summary, outbox_stuck_rows, received_ingest_failure_summary,

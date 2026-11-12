@@ -221,3 +221,13 @@ poll_interval = "60s"
 # audit trail, and unlike every other terminal row nothing else records that the
 # work was rejected.
 include_failed = false
+
+[recovery]
+# Keys a resync reads per page, each committed in its own transaction. Must be
+# > 0. Default 100.
+batch_size = 100
+# Sleep after each resync page, in milliseconds, to spare live traffic. Must be
+# >= 0. Default 0.
+pause_ms = 100
+# Most rows one redrive may request, between 1 and 10000. Default 10000.
+max_redrive_rows = 10000
