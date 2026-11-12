@@ -768,11 +768,9 @@ impl<'r> Run<'r> {
             // changeset checksum covers the topic, so a prefixed one would
             // refuse the outbox the service already migrated.
             let mut roles = RoleRegistry::new();
-            let changelog = self
-                .resolved(&cfg, index)
-                .map(|_| roles.declare(self.sources[index].descriptor.clone(), Role::Publish))
-                .transpose()
-                .and_then(|_| roles.changelog());
+            let changelog = roles
+                .declare(self.sources[index].descriptor.clone(), Role::Publish)
+                .and_then(|()| roles.changelog());
             let result = match changelog {
                 Ok(changelog) => migrate(pool, &cfg, migration_context, &changelog).await,
                 Err(err) => Err(err),

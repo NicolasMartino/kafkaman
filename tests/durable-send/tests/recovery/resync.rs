@@ -57,6 +57,13 @@ async fn a_resync_takes_over_the_outbox_its_service_migrated_under_a_prefix() ->
         report.completed[0].progress,
         resync_progress(1, 0, Some("p-01"))
     );
+    let topics: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT topic FROM {}",
+        OutboxTable::for_message::<ProductSnapshot>(&fixture.resolved())?.qualified_name()
+    ))
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(topics, [topic.topic]);
     Ok(())
 }
 
@@ -83,9 +90,7 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
         product_source("products"),
         regional_source("regional"),
     ])?;
-    let tasks_before = tokio::runtime::Handle::current()
-        .metrics()
-        .num_alive_tasks();
+    let tasks_before = fixture.settled_tasks().await?;
 
     let events = Events::default();
     let first = {
@@ -117,23 +122,10 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
             ("regional", resync_progress(0, 0, None)),
         ]
     );
-    // The pool hands connections back on short tasks of its own, at either
-    // count, so wait for those to end and allow fewer than before.
-    let alive = || {
-        tokio::runtime::Handle::current()
-            .metrics()
-            .num_alive_tasks()
-    };
-    let settled = tokio::time::timeout(Duration::from_secs(5), async {
-        while alive() > tasks_before {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        settled.is_ok() && alive() <= tasks_before,
-        "recovery runs in the caller's task and leaves nothing running: {} alive, {tasks_before} before",
-        alive()
+    assert_eq!(
+        fixture.settled_tasks().await?,
+        tasks_before,
+        "recovery runs in the caller's task and leaves nothing running"
     );
     let rows = fixture.outbox::<ProductSnapshot>().await?;
     assert_eq!(
