@@ -117,8 +117,8 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
             ("regional", resync_progress(0, 0, None)),
         ]
     );
-    // The pool hands dropped connections back on short tasks of its own, so
-    // wait for those to end rather than counting at one instant.
+    // The pool hands connections back on short tasks of its own, at either
+    // count, so wait for those to end and allow fewer than before.
     let alive = || {
         tokio::runtime::Handle::current()
             .metrics()
@@ -131,7 +131,7 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
     })
     .await;
     assert!(
-        settled.is_ok() && alive() == tasks_before,
+        settled.is_ok() && alive() <= tasks_before,
         "recovery runs in the caller's task and leaves nothing running: {} alive, {tasks_before} before",
         alive()
     );
