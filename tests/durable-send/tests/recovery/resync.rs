@@ -46,10 +46,24 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
         .metrics()
         .num_alive_tasks();
 
-    let first = fixture
-        .run(&mut recovery, Some(&brokers), RecoveryInputs::default())
-        .await?;
+    let events = Events::default();
+    let first = {
+        let _capture = events.capture();
+        fixture
+            .run(&mut recovery, Some(&brokers), RecoveryInputs::default())
+            .await?
+    };
     assert_eq!(first.failed, None);
+    let started = &events.named("recovery started")[0]["fields"];
+    assert_eq!(started["sources"], "products,regional");
+    assert!(started.get("source").is_none());
+    let completed = events.named("recovery source completed");
+    assert_eq!(completed.len(), 2, "{completed:?}");
+    assert_eq!(completed[0]["fields"]["source"], "products");
+    assert_eq!(completed[0]["fields"]["last_key"], "p-05");
+    assert_eq!(completed[0]["fields"]["enqueued"], 4);
+    assert_eq!(completed[1]["fields"]["source"], "regional");
+    assert!(completed[1]["fields"].get("last_key").is_none());
     assert!(first.not_run.is_empty());
     assert_eq!(
         first
@@ -375,6 +389,16 @@ async fn a_failure_stops_the_run_at_the_last_committed_key() -> TestResult {
     assert_eq!(failure["last_key"], "p-02");
     assert_eq!(failure["enqueued"], 2);
     assert_eq!(failure["not_run"], "keyless");
+    let completed = events.named("recovery source completed");
+    assert_eq!(completed.len(), 1, "{completed:?}");
+    assert_eq!(completed[0]["fields"]["source"], "regional");
+    assert_eq!(completed[0]["fields"]["last_key"], "r-01");
+    let messages = events.messages();
+    let position = |message: &str| messages.iter().position(|seen| seen == message);
+    assert!(
+        position("recovery source completed") < position("recovery failed"),
+        "{messages:?}"
+    );
     assert_eq!(
         fixture
             .outbox::<ProductSnapshot>()
@@ -676,14 +700,22 @@ async fn a_live_write_waits_for_the_key_being_loaded() -> TestResult {
         report.completed[0].progress,
         resync_progress(2, 0, Some("p-02"))
     );
+    // The lock orders one entity's rows; p-02 may land before or after the
+    // live row.
     let rows = fixture.outbox::<ProductSnapshot>().await?;
-    assert_eq!(
+    let names = |wanted: &str| {
         rows.iter()
-            .map(|(key, name, _)| (key.as_str(), name.as_str()))
-            .collect::<Vec<_>>(),
-        [("p-01", "old"), ("p-01", "live"), ("p-02", "b")],
+            .filter(|(key, _, _)| key == wanted)
+            .map(|(_, name, _)| name.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names("p-01"),
+        ["old", "live"],
         "the live snapshot follows the one loaded under the lock"
     );
+    assert_eq!(names("p-02"), ["b"]);
+    assert_eq!(rows.len(), 3);
 
     // Through the broker to a receiver's cache. The live write superseded
     // the pending recovery row for p-01, so two records go out.

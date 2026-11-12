@@ -563,6 +563,8 @@ impl Recovery {
     /// probes the received table and moves at most `max_rows` rows once.
     /// Each source the request names is looked up in this list, so a request
     /// built from another list runs what its names mean here or is refused.
+    /// `config` must be the file `request` was built from: pacing and the row
+    /// limit come from the request.
     pub async fn run(
         &mut self,
         pool: &PgPool,
@@ -711,27 +713,18 @@ impl<'r> Run<'r> {
     }
 
     fn finish(self) -> Report {
+        // A resync logs each source as it completes.
         let report = self.report(None, self.sources.len());
         for outcome in &report.completed {
-            match &outcome.progress {
-                SourceProgress::Resync(progress) => tracing::info!(
-                    target: "kafkaman",
-                    run_id = %self.run_id,
-                    operation = "resync",
-                    source = %outcome.source,
-                    enqueued = progress.enqueued,
-                    skipped = progress.skipped,
-                    last_key = progress.last_key.as_deref(),
-                    "recovery source completed"
-                ),
-                SourceProgress::Redrive { moved } => tracing::info!(
+            if let SourceProgress::Redrive { moved } = &outcome.progress {
+                tracing::info!(
                     target: "kafkaman",
                     run_id = %self.run_id,
                     operation = "redrive",
                     source = %outcome.source,
                     moved,
                     "recovery source completed; rows requeued for dispatch"
-                ),
+                );
             }
         }
         report
@@ -803,7 +796,7 @@ impl<'r> Run<'r> {
                 SourceProgress::Redrive { .. } => ResyncProgress::default(),
             };
             let SourceKind::Resync(run) = &mut self.sources[index].kind else {
-                continue;
+                unreachable!("`run` refuses a received source in a resync");
             };
             let mut record = |progress: &ResyncProgress, ends_page: bool| {
                 observed = progress.clone();
@@ -822,7 +815,19 @@ impl<'r> Run<'r> {
             };
             let result = run.run(pool, &cfg, options, run_id, &mut record).await;
             match result {
-                Ok(done) => self.progress[index] = SourceProgress::Resync(done),
+                Ok(done) => {
+                    tracing::info!(
+                        target: "kafkaman",
+                        %run_id,
+                        operation = "resync",
+                        source = %self.sources[index].name,
+                        enqueued = done.enqueued,
+                        skipped = done.skipped,
+                        last_key = done.last_key.as_deref(),
+                        "recovery source completed"
+                    );
+                    self.progress[index] = SourceProgress::Resync(done);
+                }
                 Err(err) => {
                     self.progress[index] = SourceProgress::Resync(observed);
                     return Err(self.fail(index, index, Failure::Resync(err)));

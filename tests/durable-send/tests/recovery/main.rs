@@ -464,16 +464,31 @@ fn resync_progress(enqueued: u64, skipped: u64, last_key: Option<&str>) -> Sourc
 
 /// The `kafkaman` events a scope emitted, each as `{"fields": {...}}`.
 #[derive(Clone, Default)]
-struct Events(Arc<Mutex<Vec<serde_json::Value>>>);
+struct Events(Sink);
 
 impl Events {
     /// Capture events on this thread until the guard drops. The tests run on
-    /// the current-thread runtime, so every await stays on it.
-    fn capture(&self) -> tracing::subscriber::DefaultGuard {
-        use tracing_subscriber::layer::SubscriberExt;
-        tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(Capture(self.0.clone())),
-        )
+    /// the current-thread runtime, so every await stays on it. One subscriber
+    /// stays installed for the whole binary: a per-test default can lose a
+    /// callsite another test's thread registers at the same moment.
+    fn capture(&self) -> CaptureGuard {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Capture))
+                .expect("no other global subscriber in this binary");
+        });
+        SINK.with(|sink| *sink.borrow_mut() = Some(self.0.clone()));
+        CaptureGuard
+    }
+
+    fn messages(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["fields"]["message"].as_str().map(str::to_owned))
+            .collect()
     }
 
     fn named(&self, message: &str) -> Vec<serde_json::Value> {
@@ -487,17 +502,33 @@ impl Events {
     }
 }
 
-struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
+type Sink = Arc<Mutex<Vec<serde_json::Value>>>;
+
+thread_local! {
+    static SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        SINK.with(|sink| *sink.borrow_mut() = None);
+    }
+}
+
+struct Capture;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if !event.metadata().target().starts_with("kafkaman") {
             return;
         }
+        let Some(sink) = SINK.with(|sink| sink.borrow().clone()) else {
+            return;
+        };
         let mut fields = Fields::default();
         event.record(&mut fields);
-        self.0
-            .lock()
+        sink.lock()
             .unwrap()
             .push(serde_json::json!({ "fields": fields.0 }));
     }

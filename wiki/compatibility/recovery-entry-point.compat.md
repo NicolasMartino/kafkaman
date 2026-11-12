@@ -54,9 +54,10 @@ Additive, minor release. Nothing existing changes signature.
   the reported key, under a new run id.
 - A redrive whose table is missing or unwritable is refused by name with
   `Failure::NotRedrivable` and changes nothing.
-- Events go to the `kafkaman` target: `recovery started`, `recovery progress`
-  (once per page), `recovery source completed` and `recovery failed`, each
-  with `run_id`, `operation` and `source`.
+- Events go to the `kafkaman` target, each with `run_id` and `operation`.
+  `recovery started` names the selected sources in `sources`. `recovery
+  progress` (once per page), `recovery source completed` (as each source
+  completes) and `recovery failed` name theirs in `source`.
 
 ## Operator impact
 
