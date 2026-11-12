@@ -1,17 +1,7 @@
 //! Choosing what a run does, before any I/O (T12).
 use super::*;
 
-use kafkaman::recovery::Operation;
-
-/// Two resync sources around a received one, in declaration order.
-fn mixed() -> Recovery {
-    Recovery::new(vec![
-        product_source("products"),
-        Source::received::<KeylessProduct>("keyless"),
-        regional_source("regional"),
-    ])
-    .unwrap()
-}
+use kafkaman::recovery::{Failure, Operation};
 
 /// `extra` goes first, so a top-level key stays top-level.
 fn file(extra: &str) -> Config {
@@ -256,6 +246,13 @@ fn a_redrive_names_its_source_and_a_bounded_row_count() {
 
 #[test]
 fn pacing_comes_from_the_file() {
+    for (batch_size, pause_ms) in [("7", "900"), ("0", "-1"), ("lots", "soon")] {
+        let _legacy = LegacyPacing::set(batch_size, pause_ms);
+        file_pacing_is_used();
+    }
+}
+
+fn file_pacing_is_used() {
     let recovery = mixed();
     let defaults = recovery
         .request_from(&file(""), RecoveryInputs::default())
@@ -334,5 +331,99 @@ async fn a_resync_without_brokers_is_refused_before_any_database_work() {
             .await
             .unwrap_err();
         assert!(matches!(error, RecoveryError::MissingBrokers), "{error}");
+    }
+}
+
+/// A request names its sources, so run on another list it runs what those
+/// names mean there, or is refused before any I/O.
+#[tokio::test]
+async fn a_request_runs_the_sources_it_names_on_the_list_it_is_given() {
+    let pool = sentinel_pool();
+    let config = file("");
+    let declared = Recovery::new(vec![
+        Source::received::<ProductSnapshot>("a"),
+        Source::received::<RegionalProduct>("b"),
+    ])
+    .unwrap();
+    let request = declared
+        .request_from(&config, redrive(Some("b"), Some("5")))
+        .unwrap();
+    let run = |mut recovery: Recovery| {
+        let (pool, request) = (pool.clone(), request.clone());
+        async move {
+            let config = file(RELAY);
+            recovery
+                .run(&pool, &config, None, &MigrationContext::default(), request)
+                .await
+                .unwrap_err()
+        }
+    };
+
+    // Reordered: `b` still runs, and reaches the pool.
+    let reordered = Recovery::new(vec![
+        Source::received::<RegionalProduct>("b"),
+        Source::received::<ProductSnapshot>("a"),
+    ])
+    .unwrap();
+    match run(reordered).await {
+        RecoveryError::Failed {
+            source_name, cause, ..
+        } => {
+            assert_eq!(source_name, "b");
+            assert!(matches!(*cause, Failure::Redrive(_)), "{cause}");
+        }
+        other => panic!("{other}"),
+    }
+
+    let shorter = Recovery::new(vec![Source::received::<ProductSnapshot>("a")]).unwrap();
+    match run(shorter).await {
+        RecoveryError::UnknownSource { name, valid } => {
+            assert_eq!(name, "b");
+            assert_eq!(valid, ["a"]);
+        }
+        other => panic!("{other}"),
+    }
+
+    let resync_only = Recovery::new(vec![product_source("a"), regional_source("b")]).unwrap();
+    assert!(matches!(
+        run(resync_only).await,
+        RecoveryError::IncompatibleSource {
+            source_name,
+            operation: Operation::Redrive,
+        } if source_name == "b"
+    ));
+}
+
+/// A file override for a type no source declares is still refused, naming
+/// the first selected source, before any I/O.
+#[tokio::test]
+async fn an_override_for_an_undeclared_type_is_refused() {
+    let mut recovery = mixed();
+    let pool = sentinel_pool();
+    let config = file(&format!(
+        "{RETRY_DEFAULTS}[retry.messages.order_snapshot]\nmax_attempts = 3\n{RELAY}"
+    ));
+    let request = recovery
+        .request_from(&config, RecoveryInputs::default())
+        .unwrap();
+    let error = recovery
+        .run(
+            &pool,
+            &config,
+            Some("127.0.0.1:1"),
+            &MigrationContext::default(),
+            request,
+        )
+        .await
+        .unwrap_err();
+    match error {
+        RecoveryError::Failed {
+            source_name, cause, ..
+        } => {
+            assert_eq!(source_name, "products");
+            assert!(matches!(*cause, Failure::Resolve(_)), "{cause}");
+            assert!(cause.to_string().contains("order_snapshot"), "{cause}");
+        }
+        other => panic!("{other}"),
     }
 }

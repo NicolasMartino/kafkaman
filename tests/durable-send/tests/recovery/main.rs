@@ -9,7 +9,8 @@ mod redrive;
 mod resync;
 mod selection;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use durable_send_tests::{
     postgres, redpanda, KeylessProduct, ProductSnapshot, RegionalProduct, TestPostgres, TestResult,
@@ -20,7 +21,7 @@ use kafkaman_core::{Envelope, KafkaMessage, MessageDescriptor, TopicMode};
 use kafkaman_rdkafka::{converge_topics, TopicAdmin};
 use kafkaman_sqlx::{
     migrate, InitSchema, MigrationContext, OutboxTable, ResolvedConfig, ResyncFuture,
-    ResyncProgress,
+    ResyncProgress, Role, RoleRegistry,
 };
 use kafkaman_test::EnvelopeTestExt;
 use sqlx::{PgConnection, PgPool};
@@ -34,6 +35,16 @@ batch_limit = 100
 lease_for = \"30s\"
 retry_after = \"1s\"
 poll_interval = \"100ms\"
+";
+
+/// Retry defaults, which a `[retry.messages.*]` override needs beside it.
+const RETRY_DEFAULTS: &str = "[retry.defaults]
+max_attempts = 5
+initial_backoff = \"500ms\"
+max_backoff = \"30s\"
+multiplier = 2.0
+errors_limit = 16
+dlq = \"table\"
 ";
 
 /// A database with a fresh kafkaman schema, and the config that names it.
@@ -168,23 +179,134 @@ impl Fixture {
         Ok(())
     }
 
+    /// Received and cache tables for `descriptor`, as a handler migrates them.
+    async fn migrate_handler(&self, descriptor: MessageDescriptor) -> TestResult {
+        let cfg = self.resolved();
+        let resolved = cfg
+            .messages()
+            .iter()
+            .find(|declared| declared.message_type == descriptor.message_type)
+            .cloned()
+            .unwrap();
+        let mut roles = RoleRegistry::new();
+        roles.declare(resolved, Role::Handle)?;
+        migrate(
+            &self.pool,
+            &cfg,
+            &MigrationContext::default(),
+            &roles.changelog()?,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn run(
         &self,
         recovery: &mut Recovery,
         brokers: Option<&str>,
         inputs: RecoveryInputs,
     ) -> Result<Report, RecoveryError> {
-        let request = recovery.request_from(&self.config(), inputs).unwrap();
+        self.run_with(&self.config(), recovery, brokers, inputs)
+            .await
+    }
+
+    async fn run_with(
+        &self,
+        config: &Config,
+        recovery: &mut Recovery,
+        brokers: Option<&str>,
+        inputs: RecoveryInputs,
+    ) -> Result<Report, RecoveryError> {
+        let request = recovery.request_from(config, inputs).unwrap();
         recovery
             .run(
                 &self.pool,
-                &self.config(),
+                config,
                 brokers,
                 &MigrationContext::default(),
                 request,
             )
             .await
     }
+}
+
+/// Two resync sources around a received one, in declaration order.
+fn mixed() -> Recovery {
+    Recovery::new(vec![
+        product_source("products"),
+        Source::received::<KeylessProduct>("keyless"),
+        regional_source("regional"),
+    ])
+    .unwrap()
+}
+
+/// The pacing variables the Job read before the file carried its pacing, set
+/// for as long as the guard lives. One guard at a time, so tests that set
+/// them do not see each other's values.
+struct LegacyPacing(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+impl LegacyPacing {
+    fn set(batch_size: &str, pause_ms: &str) -> Self {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("REPUBLISH_BATCH_SIZE", batch_size);
+        std::env::set_var("REPUBLISH_PAUSE_MS", pause_ms);
+        Self(guard)
+    }
+}
+
+impl Drop for LegacyPacing {
+    fn drop(&mut self) {
+        std::env::remove_var("REPUBLISH_BATCH_SIZE");
+        std::env::remove_var("REPUBLISH_PAUSE_MS");
+    }
+}
+
+/// Start a stopped broker again and wait until it answers for `topics`.
+async fn restart(
+    broker: &ContainerAsync<GenericImage>,
+    brokers: &str,
+    topics: &[MessageDescriptor],
+) -> TestResult {
+    broker.start().await?;
+    let admin = TopicAdmin::from_brokers(brokers)?;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while converge_topics(&admin, TopicMode::Verify, &prefixed(topics))
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// Relay `P`'s outbox until `rows` records are on the broker.
+async fn relay<P: KafkaMessage + serde::Serialize>(
+    fixture: &Fixture,
+    brokers: &str,
+    rows: usize,
+) -> TestResult {
+    let cfg = fixture.resolved();
+    let table = OutboxTable::for_message::<P>(&cfg)?;
+    let publisher = kafkaman_rdkafka::RdkafkaPublisher::from_brokers(brokers)?;
+    let mut published = 0;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while published < rows {
+            let stats =
+                kafkaman_worker::relay_once(&fixture.pool, &publisher, &table, &cfg.relay).await?;
+            published += stats.published;
+            if stats.published == 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        Ok::<_, durable_send_tests::BoxError>(())
+    })
+    .await??;
+    Ok(())
 }
 
 /// A broker on which `topics` already exist, as an operator provisions them.

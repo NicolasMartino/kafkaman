@@ -137,3 +137,20 @@ fn an_override_creates_a_missing_section_and_refuses_a_non_table() {
         "{err:?}"
     );
 }
+
+#[test]
+fn the_example_documents_a_valid_recovery_section() {
+    let example = Config::parse(include_str!("../../../kafkaman.example.toml")).unwrap();
+    assert!(
+        example.contains("recovery"),
+        "the example must document the [recovery] section"
+    );
+    assert_eq!(
+        example.recovery().unwrap(),
+        RecoveryConfig {
+            batch_size: NonZeroUsize::new(100).unwrap(),
+            pause: Duration::from_millis(100),
+            max_redrive_rows: MAX_REDRIVE_ROWS,
+        }
+    );
+}

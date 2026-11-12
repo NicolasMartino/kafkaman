@@ -70,9 +70,11 @@ async fn seed(harness: &Harness, rows: &[(&str, ReceiveStatus)]) -> TestResult<S
             .insert_received(&event, 0, offset as i64, Some(id.as_bytes()))
             .await?;
         sqlx::query(&format!(
-            "UPDATE {table} SET status = {status}, attempts = 3, errors = '[{{\"detail\": \"boom\", \"occurred_at\": \"2026-01-01T00:00:00Z\"}}]'::jsonb
+            "UPDATE {table} SET status = {status}, attempts = 3, errors = '[{{\"detail\": \"boom\", \"occurred_at\": \"2026-01-01T00:00:00Z\"}}]'::jsonb,
+             last_failed_at = '2026-01-01T00:00:00Z', last_failure_kind = '{kind}'
              WHERE source_offset = $1",
-            status = status.sql_literal()
+            status = status.sql_literal(),
+            kind = kafkaman_core::ReceivedFailureKind::Handler.discriminant()
         ))
         .bind(offset as i64)
         .execute(harness.pool())
@@ -81,12 +83,38 @@ async fn seed(harness: &Harness, rows: &[(&str, ReceiveStatus)]) -> TestResult<S
     Ok(table)
 }
 
-async fn statuses(harness: &Harness, table: &str) -> TestResult<Vec<(i64, String, i32)>> {
-    Ok(sqlx::query_as(&format!(
-        "SELECT source_offset, status, attempts FROM {table} ORDER BY source_offset"
+/// One received row: its offset and status, then everything a redrive keeps.
+type Row = (i64, String, History);
+
+/// `attempts`, `errors`, `last_failed_at`, `last_failure_kind`, `message_id`
+/// and `idempotency_key`, as text.
+type History = (i32, String, Option<String>, Option<String>, String, String);
+
+async fn statuses(harness: &Harness, table: &str) -> TestResult<Vec<Row>> {
+    use sqlx::Row as _;
+    let rows = sqlx::query(&format!(
+        "SELECT source_offset, status, attempts, errors::text, last_failed_at::text,
+                last_failure_kind, message_id::text, idempotency_key
+         FROM {table} ORDER BY source_offset"
     ))
     .fetch_all(harness.pool())
-    .await?)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                (
+                    row.try_get(2)?,
+                    row.try_get(3)?,
+                    row.try_get(4)?,
+                    row.try_get(5)?,
+                    row.try_get(6)?,
+                    row.try_get(7)?,
+                ),
+            ))
+        })
+        .collect()
 }
 
 /// T2 and T10: a bounded redrive moves only unlocked `Failed` rows, keeps
@@ -134,7 +162,7 @@ async fn a_redrive_moves_at_most_max_rows_failed_rows() -> TestResult {
     holder.rollback().await?;
 
     let after = statuses(&harness, &table).await?;
-    let still_failed = |rows: &[(i64, String, i32)]| {
+    let still_failed = |rows: &[Row]| {
         rows.iter()
             .filter(|(_, status, _)| format!("'{status}'") == failed)
             .map(|(offset, _, _)| *offset)
@@ -143,9 +171,9 @@ async fn a_redrive_moves_at_most_max_rows_failed_rows() -> TestResult {
     let now_failed = still_failed(&after);
     assert_eq!(now_failed.len(), 2);
     assert!(now_failed.contains(&0), "the locked row was skipped");
-    for ((offset, was, attempts_before), (same_offset, is, attempts)) in before.iter().zip(&after) {
+    for ((offset, was, history_before), (same_offset, is, history)) in before.iter().zip(&after) {
         assert_eq!(offset, same_offset);
-        assert_eq!(attempts_before, attempts, "history is kept");
+        assert_eq!(history_before, history, "history and identity are kept");
         if format!("'{was}'") != failed {
             assert_eq!(was, is, "only Failed rows move");
         }
@@ -218,8 +246,9 @@ async fn role(harness: &Harness, table: &str, grants: &str, usage: bool) -> Test
     }
     // Prove the fixture: the table grants hold, and USAGE is only what was
     // granted, with nothing inherited from PUBLIC.
-    let (table_ok, usage_ok): (bool, bool) = sqlx::query_as(
-        "SELECT has_table_privilege($1, $2, 'SELECT'), has_schema_privilege($1, $3, 'USAGE')",
+    let (table_ok, update_ok, usage_ok): (bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege($1, $2, 'SELECT'), has_table_privilege($1, $2, 'UPDATE'),
+                has_schema_privilege($1, $3, 'USAGE')",
     )
     .bind(&name)
     .bind(table)
@@ -227,6 +256,7 @@ async fn role(harness: &Harness, table: &str, grants: &str, usage: bool) -> Test
     .fetch_one(harness.pool())
     .await?;
     assert!(table_ok);
+    assert_eq!(update_ok, grants.contains("UPDATE"));
     assert_eq!(usage_ok, usage);
     Ok(name)
 }

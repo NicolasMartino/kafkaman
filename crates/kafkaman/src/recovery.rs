@@ -61,6 +61,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kafkaman_config::{Config, ConfigError};
@@ -175,7 +177,7 @@ trait ResyncRun: Send {
         cfg: &'a ResolvedConfig,
         options: ResyncOptions,
         run_id: Uuid,
-        progress: &'a mut (dyn FnMut(&ResyncProgress) + Send),
+        progress: &'a mut (dyn FnMut(&ResyncProgress, bool) + Send),
     ) -> ResyncFuture<'a, ResyncProgress>;
 }
 
@@ -201,17 +203,31 @@ where
         cfg: &'a ResolvedConfig,
         options: ResyncOptions,
         run_id: Uuid,
-        progress: &'a mut (dyn FnMut(&ResyncProgress) + Send),
+        progress: &'a mut (dyn FnMut(&ResyncProgress, bool) + Send),
     ) -> ResyncFuture<'a, ResyncProgress> {
         let keys = &mut self.keys;
         let load = &mut self.load;
+        // Keys left in the current page, so the commit that ends it is known.
+        let left = Arc::new(AtomicUsize::new(0));
+        let page = left.clone();
         Box::pin(resync::<M, _, _, _>(
             pool,
             cfg,
             options,
-            keys,
+            move |conn: &mut PgConnection, after: Option<&str>, limit| {
+                let listed = keys(conn, after, limit);
+                let page = page.clone();
+                Box::pin(async move {
+                    let keys = listed.await?;
+                    page.store(keys.len(), Ordering::SeqCst);
+                    Ok(keys)
+                }) as ResyncFuture<'_, Vec<String>>
+            },
             move |conn, key| load(conn, key, run_id),
-            progress,
+            move |done: &ResyncProgress| {
+                let ends_page = left.fetch_sub(1, Ordering::SeqCst) == 1;
+                progress(done, ends_page);
+            },
         ))
     }
 }
@@ -256,7 +272,7 @@ pub struct RecoveryInputs {
 #[derive(Clone, Debug)]
 pub struct Request {
     operation: Operation,
-    selected: Vec<usize>,
+    selected: Vec<String>,
     start_after: Option<String>,
     max_rows: i64,
     batch_size: std::num::NonZeroUsize,
@@ -474,7 +490,7 @@ impl Recovery {
                         operation,
                     });
                 }
-                Some(index)
+                Some(name.to_owned())
             }
         };
 
@@ -489,7 +505,7 @@ impl Recovery {
                     return Err(RecoveryError::MaxRowsOnResync);
                 }
                 let selected = match named {
-                    Some(index) => vec![index],
+                    Some(name) => vec![name],
                     None => {
                         if start_after.is_some() {
                             return Err(RecoveryError::StartAfterNeedsSource);
@@ -497,9 +513,8 @@ impl Recovery {
                         let all = self
                             .sources
                             .iter()
-                            .enumerate()
-                            .filter(|(_, source)| source.operation() == Operation::Resync)
-                            .map(|(index, _)| index)
+                            .filter(|source| source.operation() == Operation::Resync)
+                            .map(|source| source.name.clone())
                             .collect::<Vec<_>>();
                         if all.is_empty() {
                             return Err(RecoveryError::NoResyncSources);
@@ -517,7 +532,7 @@ impl Recovery {
                 })
             }
             Operation::Redrive => {
-                let index = named.ok_or(RecoveryError::RedriveNeedsSource)?;
+                let name = named.ok_or(RecoveryError::RedriveNeedsSource)?;
                 let raw = max_rows.ok_or(RecoveryError::MissingMaxRows)?;
                 let ceiling = recovery.max_redrive_rows;
                 let rows = raw
@@ -531,7 +546,7 @@ impl Recovery {
                     })?;
                 Ok(Request {
                     operation,
-                    selected: vec![index],
+                    selected: vec![name],
                     // A redrive has no cursor; one inherited from a resync
                     // environment means nothing here.
                     start_after: None,
@@ -546,6 +561,8 @@ impl Recovery {
     /// Run `request`. A resync verifies every selected topic, then migrates
     /// each selected outbox, then rebuilds the sources in order. A redrive
     /// probes the received table and moves at most `max_rows` rows once.
+    /// Each source the request names is looked up in this list, so a request
+    /// built from another list runs what its names mean here or is refused.
     pub async fn run(
         &mut self,
         pool: &PgPool,
@@ -554,6 +571,22 @@ impl Recovery {
         migration_context: &MigrationContext,
         request: Request,
     ) -> Result<Report, RecoveryError> {
+        for name in &request.selected {
+            let source = self
+                .sources
+                .iter()
+                .find(|source| source.name == *name)
+                .ok_or_else(|| RecoveryError::UnknownSource {
+                    name: name.clone(),
+                    valid: self.source_names(),
+                })?;
+            if source.operation() != request.operation {
+                return Err(RecoveryError::IncompatibleSource {
+                    source_name: name.clone(),
+                    operation: request.operation,
+                });
+            }
+        }
         let brokers = match request.operation {
             Operation::Resync => Some(
                 brokers
@@ -574,6 +607,8 @@ impl Recovery {
 struct Run<'r> {
     run_id: Uuid,
     request: &'r Request,
+    /// Every declared descriptor: the file is checked against all of them.
+    catalog: Vec<MessageDescriptor>,
     sources: Vec<&'r mut Declared>,
     progress: Vec<SourceProgress>,
 }
@@ -581,12 +616,15 @@ struct Run<'r> {
 impl<'r> Run<'r> {
     fn start(recovery: &'r mut Recovery, request: &'r Request) -> Self {
         let run_id = Uuid::now_v7();
+        let catalog = recovery
+            .sources
+            .iter()
+            .map(|source| source.descriptor.clone())
+            .collect();
         let sources = recovery
             .sources
             .iter_mut()
-            .enumerate()
-            .filter(|(index, _)| request.selected.contains(index))
-            .map(|(_, source)| source)
+            .filter(|source| request.selected.contains(&source.name))
             .collect::<Vec<_>>();
         // Seeded before any I/O, so a failure in preparation still reports
         // the cursor it was given.
@@ -616,6 +654,7 @@ impl<'r> Run<'r> {
         Self {
             run_id,
             request,
+            catalog,
             sources,
             progress,
         }
@@ -698,13 +737,6 @@ impl<'r> Run<'r> {
         report
     }
 
-    fn descriptors(&self) -> Vec<MessageDescriptor> {
-        self.sources
-            .iter()
-            .map(|source| source.descriptor.clone())
-            .collect()
-    }
-
     /// The resolved (prefixed) descriptor for source `index`.
     fn resolved(&self, cfg: &ResolvedConfig, index: usize) -> Option<MessageDescriptor> {
         let declared = &self.sources[index].descriptor;
@@ -721,7 +753,7 @@ impl<'r> Run<'r> {
         brokers: &str,
         migration_context: &MigrationContext,
     ) -> Result<Report, RecoveryError> {
-        let cfg = match ResolvedConfig::from_config(Some(config), self.descriptors()) {
+        let cfg = match ResolvedConfig::from_config(Some(config), self.catalog.clone()) {
             Ok(cfg) => cfg,
             Err(err) => return Err(self.fail(0, 0, Failure::Resolve(err))),
         };
@@ -773,10 +805,9 @@ impl<'r> Run<'r> {
             let SourceKind::Resync(run) = &mut self.sources[index].kind else {
                 continue;
             };
-            let mut record = |progress: &ResyncProgress| {
+            let mut record = |progress: &ResyncProgress, ends_page: bool| {
                 observed = progress.clone();
-                let done = progress.enqueued + progress.skipped;
-                if done.is_multiple_of(batch_size.get() as u64) {
+                if ends_page {
                     tracing::info!(
                         target: "kafkaman",
                         %run_id,
@@ -802,7 +833,7 @@ impl<'r> Run<'r> {
     }
 
     async fn redrive(mut self, pool: &PgPool, config: &Config) -> Result<Report, RecoveryError> {
-        let cfg = match ResolvedConfig::from_config(Some(config), self.descriptors()) {
+        let cfg = match ResolvedConfig::from_config(Some(config), self.catalog.clone()) {
             Ok(cfg) => cfg,
             Err(err) => return Err(self.fail(0, 0, Failure::Resolve(err))),
         };
