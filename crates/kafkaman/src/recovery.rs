@@ -764,12 +764,13 @@ impl<'r> Run<'r> {
             }
         }
         for index in 0..self.sources.len() {
+            // Declared unprefixed, as the service's runtime declares it: the
+            // changeset checksum covers the topic, so a prefixed one would
+            // refuse the outbox the service already migrated.
             let mut roles = RoleRegistry::new();
-            let changelog = self
-                .resolved(&cfg, index)
-                .map(|descriptor| roles.declare(descriptor, Role::Publish))
-                .transpose()
-                .and_then(|_| roles.changelog());
+            let changelog = roles
+                .declare(self.sources[index].descriptor.clone(), Role::Publish)
+                .and_then(|()| roles.changelog());
             let result = match changelog {
                 Ok(changelog) => migrate(pool, &cfg, migration_context, &changelog).await,
                 Err(err) => Err(err),

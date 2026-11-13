@@ -149,6 +149,20 @@ impl Fixture {
         .await?)
     }
 
+    /// Tasks alive once every pool connection is back idle: the pool hands a
+    /// connection back on a short task of its own.
+    async fn settled_tasks(&self) -> TestResult<usize> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.pool.num_idle() < self.pool.size() as usize {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok(tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks())
+    }
+
     /// Changesets applied beyond the baseline schema.
     async fn applied_changesets(&self) -> TestResult<i64> {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")

@@ -19,6 +19,54 @@ fn failed(error: RecoveryError) -> (String, Report, Failure) {
     }
 }
 
+/// The service file with a topic prefix.
+const PREFIXED: &str = "[recovery]\nbatch_size = 2\n[topics]\nprefix = \"svc.\"\n";
+
+/// A resync over the outbox its service's runtime migrated, under a topic
+/// prefix: both record the outbox's changesets the same way.
+#[tokio::test]
+async fn a_resync_takes_over_the_outbox_its_service_migrated_under_a_prefix() -> TestResult {
+    let fixture = Fixture::start().await?;
+    let config = fixture.config_with(PREFIXED);
+    let topic = ResolvedConfig::from_config(Some(&config), [products()])?.messages()[0].clone();
+    assert!(topic.topic.ends_with(&products().topic) && topic.topic != products().topic);
+    let (_broker, brokers) = redpanda().await?;
+    TopicAdmin::from_brokers(&brokers)?
+        .create(&topic.topic, 1, None, &topic.topic_spec)
+        .await?;
+    kafkaman::RuntimeBuilder::new()
+        .config(fixture.config_with(PREFIXED))
+        .pool(fixture.pool.clone())
+        .brokers(brokers.as_str())
+        .consumer_group("recovery-test")
+        .publish::<ProductSnapshot>()
+        .build()
+        .await?;
+    fixture.seed("product_state", &[("p-01", "a")]).await?;
+
+    let mut recovery = Recovery::new(vec![product_source("products")]).unwrap();
+    let report = fixture
+        .run_with(
+            &config,
+            &mut recovery,
+            Some(&brokers),
+            RecoveryInputs::default(),
+        )
+        .await?;
+    assert_eq!(
+        report.completed[0].progress,
+        resync_progress(1, 0, Some("p-01"))
+    );
+    let topics: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT topic FROM {}",
+        OutboxTable::for_message::<ProductSnapshot>(&fixture.resolved())?.qualified_name()
+    ))
+    .fetch_all(&fixture.pool)
+    .await?;
+    assert_eq!(topics, [topic.topic]);
+    Ok(())
+}
+
 /// T1 and T10: pages of two from current state, a key that vanished between
 /// listing and loading, and a second run under its own identity.
 #[tokio::test]
@@ -42,9 +90,7 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
         product_source("products"),
         regional_source("regional"),
     ])?;
-    let tasks_before = tokio::runtime::Handle::current()
-        .metrics()
-        .num_alive_tasks();
+    let tasks_before = fixture.settled_tasks().await?;
 
     let events = Events::default();
     let first = {
@@ -76,23 +122,10 @@ async fn a_resync_rebuilds_every_page_from_current_state() -> TestResult {
             ("regional", resync_progress(0, 0, None)),
         ]
     );
-    // The pool hands dropped connections back on short tasks of its own, so
-    // wait for those to end rather than counting at one instant.
-    let alive = || {
-        tokio::runtime::Handle::current()
-            .metrics()
-            .num_alive_tasks()
-    };
-    let settled = tokio::time::timeout(Duration::from_secs(5), async {
-        while alive() > tasks_before {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        settled.is_ok() && alive() == tasks_before,
-        "recovery runs in the caller's task and leaves nothing running: {} alive, {tasks_before} before",
-        alive()
+    assert_eq!(
+        fixture.settled_tasks().await?,
+        tasks_before,
+        "recovery runs in the caller's task and leaves nothing running"
     );
     let rows = fixture.outbox::<ProductSnapshot>().await?;
     assert_eq!(
