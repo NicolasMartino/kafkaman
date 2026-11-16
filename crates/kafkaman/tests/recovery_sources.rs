@@ -52,7 +52,8 @@ source!(First, "first");
 source!(Second, "second");
 
 #[test]
-fn typed_sources_keep_the_declared_order() {
-    let recovery = Recovery::of((First, Second)).unwrap();
+fn typed_sources_keep_the_declared_order() -> Result<(), Box<dyn std::error::Error>> {
+    let recovery = Recovery::of((First, Second))?;
     assert_eq!(recovery.source_names(), vec!["first", "second"]);
+    Ok(())
 }
