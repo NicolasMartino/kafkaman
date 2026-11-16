@@ -573,6 +573,27 @@ impl Recovery {
         migration_context: &MigrationContext,
         request: Request,
     ) -> Result<Report, RecoveryError> {
+        self.run_with_progress(
+            pool,
+            config,
+            brokers,
+            migration_context,
+            request,
+            &mut |_| {},
+        )
+        .await
+    }
+
+    /// Report each committed source update while the run is still in progress.
+    pub async fn run_with_progress(
+        &mut self,
+        pool: &PgPool,
+        config: &Config,
+        brokers: Option<&str>,
+        migration_context: &MigrationContext,
+        request: Request,
+        progress: &mut (dyn FnMut(Outcome) + Send),
+    ) -> Result<Report, RecoveryError> {
         for name in &request.selected {
             let source = self
                 .sources
@@ -599,8 +620,11 @@ impl Recovery {
         };
         let run = Run::start(self, &request);
         match brokers {
-            Some(brokers) => run.resync(pool, config, brokers, migration_context).await,
-            None => run.redrive(pool, config).await,
+            Some(brokers) => {
+                run.resync(pool, config, brokers, migration_context, progress)
+                    .await
+            }
+            None => run.redrive(pool, config, progress).await,
         }
     }
 }
@@ -745,6 +769,7 @@ impl<'r> Run<'r> {
         config: &Config,
         brokers: &str,
         migration_context: &MigrationContext,
+        progress_sink: &mut (dyn FnMut(Outcome) + Send),
     ) -> Result<Report, RecoveryError> {
         let cfg = match ResolvedConfig::from_config(Some(config), self.catalog.clone()) {
             Ok(cfg) => cfg,
@@ -799,24 +824,34 @@ impl<'r> Run<'r> {
             let SourceKind::Resync(run) = &mut self.sources[index].kind else {
                 unreachable!("`run` refuses a received source in a resync");
             };
-            let mut record = |progress: &ResyncProgress, ends_page: bool| {
-                observed = progress.clone();
-                if ends_page {
-                    tracing::info!(
-                        target: "kafkaman",
-                        %run_id,
-                        operation = "resync",
-                        source = %name,
-                        enqueued = progress.enqueued,
-                        skipped = progress.skipped,
-                        last_key = progress.last_key.as_deref(),
-                        "recovery progress"
-                    );
-                }
+            let result = {
+                let mut record = |progress: &ResyncProgress, ends_page: bool| {
+                    observed = progress.clone();
+                    progress_sink(Outcome {
+                        source: name.clone(),
+                        progress: SourceProgress::Resync(progress.clone()),
+                    });
+                    if ends_page {
+                        tracing::info!(
+                            target: "kafkaman",
+                            %run_id,
+                            operation = "resync",
+                            source = %name,
+                            enqueued = progress.enqueued,
+                            skipped = progress.skipped,
+                            last_key = progress.last_key.as_deref(),
+                            "recovery progress"
+                        );
+                    }
+                };
+                run.run(pool, &cfg, options, run_id, &mut record).await
             };
-            let result = run.run(pool, &cfg, options, run_id, &mut record).await;
             match result {
                 Ok(done) => {
+                    progress_sink(Outcome {
+                        source: self.sources[index].name.clone(),
+                        progress: SourceProgress::Resync(done.clone()),
+                    });
                     tracing::info!(
                         target: "kafkaman",
                         %run_id,
@@ -838,7 +873,12 @@ impl<'r> Run<'r> {
         Ok(self.finish())
     }
 
-    async fn redrive(mut self, pool: &PgPool, config: &Config) -> Result<Report, RecoveryError> {
+    async fn redrive(
+        mut self,
+        pool: &PgPool,
+        config: &Config,
+        progress_sink: &mut (dyn FnMut(Outcome) + Send),
+    ) -> Result<Report, RecoveryError> {
         let cfg = match ResolvedConfig::from_config(Some(config), self.catalog.clone()) {
             Ok(cfg) => cfg,
             Err(err) => return Err(self.fail(0, 0, Failure::Resolve(err))),
@@ -875,6 +915,10 @@ impl<'r> Run<'r> {
         match redrive_received(pool, &cfg, &replay).await {
             Ok(moved) => {
                 self.progress[0] = SourceProgress::Redrive { moved };
+                progress_sink(Outcome {
+                    source: self.sources[0].name.clone(),
+                    progress: SourceProgress::Redrive { moved },
+                });
                 Ok(self.finish())
             }
             Err(err) => Err(self.fail(0, 0, Failure::Redrive(err))),

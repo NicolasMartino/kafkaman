@@ -52,6 +52,8 @@ pub mod recovery;
 pub mod axum {
     pub use kafkaman_axum::*;
 
+    #[cfg(feature = "rdkafka")]
+    pub use crate::axum_resync::{resync_router, ProgressReporter, ResyncRequest, ResyncState};
     /// Runtime composition: `serve(listener, router).with_runtime(rt).spawn()`.
     ///
     /// These names are listed explicitly rather than left to the glob above
@@ -67,6 +69,10 @@ pub mod axum {
 #[cfg(all(feature = "axum", feature = "rdkafka"))]
 #[path = "axum.rs"]
 mod axum_runtime;
+
+#[cfg(all(feature = "axum", feature = "rdkafka"))]
+#[path = "resync.rs"]
+mod axum_resync;
 
 #[cfg(feature = "rdkafka")]
 pub use runtime::{
