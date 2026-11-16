@@ -16,7 +16,9 @@ use durable_send_tests::{
     postgres, redpanda, KeylessProduct, ProductSnapshot, RegionalProduct, TestPostgres, TestResult,
 };
 use kafkaman::config::Config;
-use kafkaman::recovery::{Recovery, RecoveryError, RecoveryInputs, Report, Source, SourceProgress};
+use kafkaman::recovery::{
+    Recovery, RecoveryError, RecoveryInputs, Report, Resync, Source, SourceProgress,
+};
 use kafkaman_core::{Envelope, KafkaMessage, MessageDescriptor, TopicMode};
 use kafkaman_rdkafka::{converge_topics, TopicAdmin};
 use kafkaman_sqlx::{
@@ -405,59 +407,188 @@ async fn current(
     Ok(name.map(|name| (key.to_owned(), name)))
 }
 
+struct TestSource<M, Keys, Load, const N: u8> {
+    keys: Keys,
+    load: Load,
+    message: std::marker::PhantomData<fn() -> M>,
+}
+
+impl<M, Keys, Load, const N: u8> Resync for TestSource<M, Keys, Load, N>
+where
+    M: KafkaMessage + serde::Serialize + Send + Sync + 'static,
+    Keys: for<'a> Fn(&'a mut PgConnection, Option<&'a str>, usize) -> ResyncFuture<'a, Vec<String>>
+        + Send
+        + Sync
+        + 'static,
+    Load: for<'a> Fn(&'a mut PgConnection, &'a str, Uuid) -> ResyncFuture<'a, Option<Envelope<M>>>
+        + Send
+        + Sync
+        + 'static,
+{
+    type Message = M;
+    const NAME: &'static str = match N {
+        0 => "products",
+        1 => "regional",
+        _ => "products",
+    };
+    fn keys<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> ResyncFuture<'a, Vec<String>> {
+        (self.keys)(conn, after, limit)
+    }
+    fn load<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        key: &'a str,
+        run_id: Uuid,
+    ) -> ResyncFuture<'a, Option<Envelope<M>>> {
+        (self.load)(conn, key, run_id)
+    }
+}
+
+fn test_source<M, Keys, Load, const N: u8>(keys: Keys, load: Load) -> Source
+where
+    M: KafkaMessage + serde::Serialize + Send + Sync + 'static,
+    Keys: for<'a> Fn(&'a mut PgConnection, Option<&'a str>, usize) -> ResyncFuture<'a, Vec<String>>
+        + Send
+        + Sync
+        + 'static,
+    Load: for<'a> Fn(&'a mut PgConnection, &'a str, Uuid) -> ResyncFuture<'a, Option<Envelope<M>>>
+        + Send
+        + Sync
+        + 'static,
+{
+    Source::typed(TestSource::<M, Keys, Load, N> {
+        keys,
+        load,
+        message: std::marker::PhantomData,
+    })
+}
+
+struct ProductSource<const N: u8>;
+impl<const N: u8> Resync for ProductSource<N> {
+    type Message = ProductSnapshot;
+    const NAME: &'static str = match N {
+        0 => "products",
+        1 => "  ",
+        2 => "a",
+        3 => "snapshots",
+        _ => "products",
+    };
+    fn keys<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> ResyncFuture<'a, Vec<String>> {
+        keys_from("product_state", conn, after, limit)
+    }
+    fn load<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        key: &'a str,
+        run_id: Uuid,
+    ) -> ResyncFuture<'a, Option<Envelope<Self::Message>>> {
+        Box::pin(async move {
+            Ok(current("product_state", conn, key)
+                .await?
+                .map(|(id, name)| {
+                    ProductSnapshot::envelope(&id, &name)
+                        .with_idempotency_key(format!("product:{id}:recovery:{run_id}"))
+                }))
+        })
+    }
+}
 fn product_source(name: &str) -> Source {
-    Source::resync::<ProductSnapshot, _, _>(
-        name,
-        |conn, after, limit| keys_from("product_state", conn, after, limit),
-        |conn, key, run_id| {
-            Box::pin(async move {
-                Ok(current("product_state", conn, key)
-                    .await?
-                    .map(|(id, name)| {
-                        ProductSnapshot::envelope(&id, &name)
-                            .with_idempotency_key(format!("product:{id}:recovery:{run_id}"))
-                    }))
-            })
-        },
-    )
+    match name {
+        "products" => Source::typed(ProductSource::<0>),
+        "  " => Source::typed(ProductSource::<1>),
+        "a" => Source::typed(ProductSource::<2>),
+        "snapshots" => Source::typed(ProductSource::<3>),
+        _ => panic!("unexpected product source name: {name}"),
+    }
 }
 
+struct RegionalSource<const N: u8>;
+impl<const N: u8> Resync for RegionalSource<N> {
+    type Message = RegionalProduct;
+    const NAME: &'static str = match N {
+        0 => "regional",
+        1 => "a",
+        2 => "b",
+        _ => "regional",
+    };
+    fn keys<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> ResyncFuture<'a, Vec<String>> {
+        keys_from("regional_state", conn, after, limit)
+    }
+    fn load<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        key: &'a str,
+        run_id: Uuid,
+    ) -> ResyncFuture<'a, Option<Envelope<Self::Message>>> {
+        Box::pin(async move {
+            Ok(current("regional_state", conn, key)
+                .await?
+                .map(|(id, name)| {
+                    Envelope::new(RegionalProduct {
+                        product_id: id.clone(),
+                        region: "eu".to_owned(),
+                        name,
+                    })
+                    .with_idempotency_key(format!("regional:{id}:recovery:{run_id}"))
+                }))
+        })
+    }
+}
 fn regional_source(name: &str) -> Source {
-    Source::resync::<RegionalProduct, _, _>(
-        name,
-        |conn, after, limit| keys_from("regional_state", conn, after, limit),
-        |conn, key, run_id| {
-            Box::pin(async move {
-                Ok(current("regional_state", conn, key)
-                    .await?
-                    .map(|(id, name)| {
-                        Envelope::new(RegionalProduct {
-                            product_id: id.clone(),
-                            region: "eu".to_owned(),
-                            name,
-                        })
-                        .with_idempotency_key(format!("regional:{id}:recovery:{run_id}"))
-                    }))
-            })
-        },
-    )
+    match name {
+        "regional" => Source::typed(RegionalSource::<0>),
+        "a" => Source::typed(RegionalSource::<1>),
+        "b" => Source::typed(RegionalSource::<2>),
+        _ => panic!("unexpected regional source name: {name}"),
+    }
 }
 
+struct KeylessSource;
+impl Resync for KeylessSource {
+    type Message = KeylessProduct;
+    const NAME: &'static str = "keyless";
+    fn keys<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> ResyncFuture<'a, Vec<String>> {
+        keys_from("keyless_state", conn, after, limit)
+    }
+    fn load<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        key: &'a str,
+        run_id: Uuid,
+    ) -> ResyncFuture<'a, Option<Envelope<Self::Message>>> {
+        Box::pin(async move {
+            Ok(current("keyless_state", conn, key)
+                .await?
+                .map(|(id, name)| {
+                    KeylessProduct::envelope(&id, &name)
+                        .with_idempotency_key(format!("keyless:{id}:recovery:{run_id}"))
+                }))
+        })
+    }
+}
 fn keyless_source(name: &str) -> Source {
-    Source::resync::<KeylessProduct, _, _>(
-        name,
-        |conn, after, limit| keys_from("keyless_state", conn, after, limit),
-        |conn, key, run_id| {
-            Box::pin(async move {
-                Ok(current("keyless_state", conn, key)
-                    .await?
-                    .map(|(id, name)| {
-                        KeylessProduct::envelope(&id, &name)
-                            .with_idempotency_key(format!("keyless:{id}:recovery:{run_id}"))
-                    }))
-            })
-        },
-    )
+    assert_eq!(name, "keyless");
+    Source::typed(KeylessSource)
 }
 
 fn resync_inputs(source: Option<&str>, start_after: Option<&str>) -> RecoveryInputs {

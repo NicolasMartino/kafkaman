@@ -275,8 +275,9 @@ async fn verification_covers_every_selected_topic_before_any_storage() -> TestRe
 fn counting_keys(
     table: &'static str,
     listed: Arc<AtomicUsize>,
-) -> impl for<'a> FnMut(&'a mut PgConnection, Option<&'a str>, usize) -> ResyncFuture<'a, Vec<String>>
+) -> impl for<'a> Fn(&'a mut PgConnection, Option<&'a str>, usize) -> ResyncFuture<'a, Vec<String>>
        + Send
+       + Sync
        + 'static {
     move |conn, after, limit| {
         listed.fetch_add(1, Ordering::SeqCst);
@@ -306,8 +307,7 @@ async fn a_migration_failure_stops_the_run_before_any_key_is_listed() -> TestRes
     .await?;
     let listed = Arc::new(AtomicUsize::new(0));
     let mut recovery = Recovery::new(vec![
-        Source::resync::<ProductSnapshot, _, _>(
-            "products",
+        test_source::<ProductSnapshot, _, _, 0>(
             counting_keys("product_state", listed.clone()),
             |conn, key, run_id| {
                 Box::pin(async move {
@@ -320,8 +320,7 @@ async fn a_migration_failure_stops_the_run_before_any_key_is_listed() -> TestRes
                 })
             },
         ),
-        Source::resync::<RegionalProduct, _, _>(
-            "regional",
+        test_source::<RegionalProduct, _, _, 1>(
             counting_keys("regional_state", listed.clone()),
             |_, _, _| Box::pin(async { Ok(None) }),
         ),
@@ -614,8 +613,7 @@ async fn a_database_fault_is_returned_once_and_not_retried() -> TestResult {
     fixture.fault("p-01", "error").await?;
     let loads = Arc::new(AtomicUsize::new(0));
     let counted = loads.clone();
-    let mut recovery = Recovery::new(vec![Source::resync::<ProductSnapshot, _, _>(
-        "products",
+    let mut recovery = Recovery::new(vec![test_source::<ProductSnapshot, _, _, 0>(
         |conn, after, limit| keys_from("product_state", conn, after, limit),
         move |conn, key, run_id| {
             counted.fetch_add(1, Ordering::SeqCst);
@@ -665,8 +663,7 @@ async fn a_live_write_waits_for_the_key_being_loaded() -> TestResult {
     let loaded = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let (loaded_tx, release_rx) = (loaded.clone(), release.clone());
-    let mut recovery = Recovery::new(vec![Source::resync::<ProductSnapshot, _, _>(
-        "products",
+    let mut recovery = Recovery::new(vec![test_source::<ProductSnapshot, _, _, 0>(
         |conn, after, limit| keys_from("product_state", conn, after, limit),
         move |conn, key, run_id| {
             let (loaded, release) = (loaded_tx.clone(), release_rx.clone());
@@ -833,8 +830,7 @@ fn recorded_source(
     calls: Arc<Mutex<Vec<KeysCall>>>,
     loads: Arc<Mutex<Vec<Instant>>>,
 ) -> Source {
-    Source::resync::<ProductSnapshot, _, _>(
-        "products",
+    test_source::<ProductSnapshot, _, _, 0>(
         move |conn, after, limit| {
             let calls = calls.clone();
             let cap = caps
@@ -999,8 +995,7 @@ async fn a_resume_whose_keys_query_fails_keeps_its_cursor() -> TestResult {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let loaded = Arc::new(Mutex::new(Vec::new()));
     let (fail, seen, loads) = (broken.clone(), asked.clone(), loaded.clone());
-    let mut recovery = Recovery::new(vec![Source::resync::<ProductSnapshot, _, _>(
-        "products",
+    let mut recovery = Recovery::new(vec![test_source::<ProductSnapshot, _, _, 0>(
         move |conn, after, limit| {
             seen.lock().unwrap().push(after.map(str::to_owned));
             let fail = fail.load(Ordering::SeqCst);
@@ -1074,8 +1069,7 @@ async fn losing_the_broker_after_preparation_still_queues_every_row() -> TestRes
         .await?;
     let stop = Arc::new(tokio::sync::OnceCell::new());
     let (container, stopped) = (broker.clone(), stop.clone());
-    let mut recovery = Recovery::new(vec![Source::resync::<ProductSnapshot, _, _>(
-        "products",
+    let mut recovery = Recovery::new(vec![test_source::<ProductSnapshot, _, _, 0>(
         |conn, after, limit| keys_from("product_state", conn, after, limit),
         move |conn, key, run_id| {
             let (container, stopped) = (container.clone(), stopped.clone());

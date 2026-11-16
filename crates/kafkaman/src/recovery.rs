@@ -1,8 +1,8 @@
 //! Rebuilding outgoing snapshots and returning dead-lettered rows to dispatch,
 //! for a service that declares its sources once.
 //!
-//! A [`Source`] is either a resync (keys plus a loader of current state) or a
-//! received table to redrive. [`Recovery::request_from`] checks a run's inputs
+//! A [`Resync`] implementation rebuilds one published source; a [`Source`] can
+//! also name a received table to redrive. [`Recovery::request_from`] checks a run's inputs
 //! against the declared list and the `[recovery]` section before any I/O;
 //! [`Recovery::run`] prepares storage, runs the selected sources in order and
 //! stops at the first failure. No background task is started.
@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! # use kafkaman::{Envelope, KafkaMessage};
-//! # use kafkaman::recovery::{Recovery, RecoveryInputs, Source};
+//! # use kafkaman::recovery::{Recovery, RecoveryInputs, Resync};
 //! # #[derive(serde::Serialize)]
 //! # struct Snapshot;
 //! # impl KafkaMessage for Snapshot {
@@ -27,23 +27,18 @@
 //! # const TOPIC: &'static str = "orders";
 //! # fn entity_key(&self) -> String { "order".into() }
 //! # }
-//! # async fn load(_: &mut sqlx::PgConnection, _: &str, _: uuid::Uuid)
-//! # -> kafkaman::sqlx::Result<Option<Envelope<Snapshot>>> { Ok(None) }
+//! # struct Snapshots;
+//! # impl Resync for Snapshots {
+//! # type Message = Snapshot;
+//! # const NAME: &'static str = "snapshots";
+//! # fn keys<'a>(&'a self, _: &'a mut sqlx::PgConnection, _: Option<&'a str>, _: usize)
+//! # -> kafkaman::sqlx::ResyncFuture<'a, Vec<String>> { Box::pin(async { Ok(vec![]) }) }
+//! # fn load<'a>(&'a self, _: &'a mut sqlx::PgConnection, _: &'a str, _: uuid::Uuid)
+//! # -> kafkaman::sqlx::ResyncFuture<'a, Option<Envelope<Snapshot>>> { Box::pin(async { Ok(None) }) }
+//! # }
 //! # async fn example(pool: &sqlx::PgPool, file: &str, brokers: Option<&str>)
 //! # -> Result<(), Box<dyn std::error::Error>> {
-//! let mut recovery = Recovery::new(vec![
-//!     Source::resync::<Snapshot, _, _>(
-//!         "snapshots",
-//!         |conn, after, limit| Box::pin(async move {
-//!             Ok(sqlx::query_scalar(
-//!                 "SELECT id FROM entities WHERE ($1::text IS NULL OR id COLLATE \"C\" > $1) \
-//!                  ORDER BY id COLLATE \"C\" LIMIT $2"
-//!             ).bind(after).bind(limit as i64).fetch_all(conn).await?)
-//!         }),
-//!         |conn, key, run_id| Box::pin(load(conn, key, run_id)),
-//!     ),
-//!     Source::received::<Order>("orders"),
-//! ])?;
+//! let mut recovery = Recovery::of((Snapshots,))?;
 //! let config = kafkaman::config::Config::parse(file)?;
 //! let inputs = RecoveryInputs {
 //!     source: Some("snapshots".into()),
@@ -60,7 +55,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +77,50 @@ pub struct Source {
     descriptor: kafkaman_core::Result<MessageDescriptor>,
     kind: SourceKind,
 }
+
+/// One typed snapshot source. The loader runs under kafkaman's per-entity lock.
+pub trait Resync: Send + Sync + 'static {
+    type Message: KafkaMessage + Serialize + Send + Sync + 'static;
+    const NAME: &'static str;
+
+    fn keys<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        after: Option<&'a str>,
+        limit: usize,
+    ) -> ResyncFuture<'a, Vec<String>>;
+
+    fn load<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        key: &'a str,
+        run_id: Uuid,
+    ) -> ResyncFuture<'a, Option<Envelope<Self::Message>>>;
+}
+
+/// A tuple of typed snapshot sources accepted by [`Recovery::of`].
+pub trait ResyncSources {
+    fn into_sources(self) -> Vec<Source>;
+}
+
+macro_rules! resync_sources {
+    ($( $kind:ident : $value:ident ),+) => {
+        impl<$( $kind: Resync ),+> ResyncSources for ($( $kind, )+) {
+            fn into_sources(self) -> Vec<Source> {
+                let ($( $value, )+) = self;
+                vec![$( Source::typed($value), )+]
+            }
+        }
+    };
+}
+
+resync_sources!(A: a);
+resync_sources!(A: a, B: b);
+resync_sources!(A: a, B: b, C: c);
+resync_sources!(A: a, B: b, C: c, D: d);
+resync_sources!(A: a, B: b, C: c, D: d, E: e);
+resync_sources!(A: a, B: b, C: c, D: d, E: e, F: f);
+resync_sources!(A: a, B: b, C: c, D: d, E: e, F: f, G: g);
 
 enum SourceKind {
     Resync(Box<dyn ResyncRun>),
@@ -123,36 +161,11 @@ impl Declared {
 }
 
 impl Source {
-    /// Rebuild `M`'s outbox from current rows. `keys` pages through entity
-    /// keys after a cursor; `load` reads one entity's current state while
-    /// kafkaman holds its entity lock, and receives the run id for the
-    /// envelope's identity.
-    pub fn resync<M, Keys, Load>(name: impl Into<String>, keys: Keys, load: Load) -> Self
-    where
-        M: KafkaMessage + Serialize + Send + Sync + 'static,
-        Keys: for<'a> FnMut(
-                &'a mut PgConnection,
-                Option<&'a str>,
-                usize,
-            ) -> ResyncFuture<'a, Vec<String>>
-            + Send
-            + 'static,
-        Load: for<'a> FnMut(
-                &'a mut PgConnection,
-                &'a str,
-                Uuid,
-            ) -> ResyncFuture<'a, Option<Envelope<M>>>
-            + Send
-            + 'static,
-    {
+    pub fn typed<R: Resync>(source: R) -> Self {
         Self {
-            name: name.into(),
-            descriptor: M::descriptor(),
-            kind: SourceKind::Resync(Box::new(TypedResync::<M, Keys, Load> {
-                keys,
-                load,
-                message: PhantomData,
-            })),
+            name: R::NAME.to_owned(),
+            descriptor: R::Message::descriptor(),
+            kind: SourceKind::Resync(Box::new(TypedResync(Arc::new(source)))),
         }
     }
 
@@ -181,22 +194,9 @@ trait ResyncRun: Send {
     ) -> ResyncFuture<'a, ResyncProgress>;
 }
 
-struct TypedResync<M, Keys, Load> {
-    keys: Keys,
-    load: Load,
-    message: PhantomData<fn() -> M>,
-}
+struct TypedResync<R>(Arc<R>);
 
-impl<M, Keys, Load> ResyncRun for TypedResync<M, Keys, Load>
-where
-    M: KafkaMessage + Serialize + Send + Sync + 'static,
-    Keys: for<'a> FnMut(&'a mut PgConnection, Option<&'a str>, usize) -> ResyncFuture<'a, Vec<String>>
-        + Send
-        + 'static,
-    Load: for<'a> FnMut(&'a mut PgConnection, &'a str, Uuid) -> ResyncFuture<'a, Option<Envelope<M>>>
-        + Send
-        + 'static,
-{
+impl<R: Resync> ResyncRun for TypedResync<R> {
     fn run<'a>(
         &'a mut self,
         pool: &'a PgPool,
@@ -205,25 +205,28 @@ where
         run_id: Uuid,
         progress: &'a mut (dyn FnMut(&ResyncProgress, bool) + Send),
     ) -> ResyncFuture<'a, ResyncProgress> {
-        let keys = &mut self.keys;
-        let load = &mut self.load;
         // Keys left in the current page, so the commit that ends it is known.
         let left = Arc::new(AtomicUsize::new(0));
         let page = left.clone();
-        Box::pin(resync::<M, _, _, _>(
+        let keys_source = Arc::clone(&self.0);
+        let load_source = Arc::clone(&self.0);
+        Box::pin(resync::<R::Message, _, _, _>(
             pool,
             cfg,
             options,
             move |conn: &mut PgConnection, after: Option<&str>, limit| {
-                let listed = keys(conn, after, limit);
+                let source = Arc::clone(&keys_source);
                 let page = page.clone();
                 Box::pin(async move {
-                    let keys = listed.await?;
+                    let keys = source.keys(conn, after, limit).await?;
                     page.store(keys.len(), Ordering::SeqCst);
                     Ok(keys)
                 }) as ResyncFuture<'_, Vec<String>>
             },
-            move |conn, key| load(conn, key, run_id),
+            move |conn, key| {
+                let source = Arc::clone(&load_source);
+                Box::pin(async move { source.load(conn, key, run_id).await })
+            },
             move |done: &ResyncProgress| {
                 let ends_page = left.fetch_sub(1, Ordering::SeqCst) == 1;
                 progress(done, ends_page);
@@ -416,6 +419,11 @@ pub struct Recovery {
 }
 
 impl Recovery {
+    /// Declare typed resync sources in their execution order.
+    pub fn of(sources: impl ResyncSources) -> Result<Self, RecoveryError> {
+        Self::new(sources.into_sources())
+    }
+
     /// Refuse an empty list, blank or repeated names, invalid descriptors and
     /// conflicting declarations, before any I/O.
     pub fn new(sources: Vec<Source>) -> Result<Self, RecoveryError> {
@@ -573,6 +581,27 @@ impl Recovery {
         migration_context: &MigrationContext,
         request: Request,
     ) -> Result<Report, RecoveryError> {
+        self.run_with_progress(
+            pool,
+            config,
+            brokers,
+            migration_context,
+            request,
+            &mut |_| {},
+        )
+        .await
+    }
+
+    /// Report each committed source update while the run is still in progress.
+    pub async fn run_with_progress(
+        &mut self,
+        pool: &PgPool,
+        config: &Config,
+        brokers: Option<&str>,
+        migration_context: &MigrationContext,
+        request: Request,
+        progress: &mut (dyn FnMut(Outcome) + Send),
+    ) -> Result<Report, RecoveryError> {
         for name in &request.selected {
             let source = self
                 .sources
@@ -599,8 +628,11 @@ impl Recovery {
         };
         let run = Run::start(self, &request);
         match brokers {
-            Some(brokers) => run.resync(pool, config, brokers, migration_context).await,
-            None => run.redrive(pool, config).await,
+            Some(brokers) => {
+                run.resync(pool, config, brokers, migration_context, progress)
+                    .await
+            }
+            None => run.redrive(pool, config, progress).await,
         }
     }
 }
@@ -745,6 +777,7 @@ impl<'r> Run<'r> {
         config: &Config,
         brokers: &str,
         migration_context: &MigrationContext,
+        progress_sink: &mut (dyn FnMut(Outcome) + Send),
     ) -> Result<Report, RecoveryError> {
         let cfg = match ResolvedConfig::from_config(Some(config), self.catalog.clone()) {
             Ok(cfg) => cfg,
@@ -799,24 +832,34 @@ impl<'r> Run<'r> {
             let SourceKind::Resync(run) = &mut self.sources[index].kind else {
                 unreachable!("`run` refuses a received source in a resync");
             };
-            let mut record = |progress: &ResyncProgress, ends_page: bool| {
-                observed = progress.clone();
-                if ends_page {
-                    tracing::info!(
-                        target: "kafkaman",
-                        %run_id,
-                        operation = "resync",
-                        source = %name,
-                        enqueued = progress.enqueued,
-                        skipped = progress.skipped,
-                        last_key = progress.last_key.as_deref(),
-                        "recovery progress"
-                    );
-                }
+            let result = {
+                let mut record = |progress: &ResyncProgress, ends_page: bool| {
+                    observed = progress.clone();
+                    progress_sink(Outcome {
+                        source: name.clone(),
+                        progress: SourceProgress::Resync(progress.clone()),
+                    });
+                    if ends_page {
+                        tracing::info!(
+                            target: "kafkaman",
+                            %run_id,
+                            operation = "resync",
+                            source = %name,
+                            enqueued = progress.enqueued,
+                            skipped = progress.skipped,
+                            last_key = progress.last_key.as_deref(),
+                            "recovery progress"
+                        );
+                    }
+                };
+                run.run(pool, &cfg, options, run_id, &mut record).await
             };
-            let result = run.run(pool, &cfg, options, run_id, &mut record).await;
             match result {
                 Ok(done) => {
+                    progress_sink(Outcome {
+                        source: self.sources[index].name.clone(),
+                        progress: SourceProgress::Resync(done.clone()),
+                    });
                     tracing::info!(
                         target: "kafkaman",
                         %run_id,
@@ -838,7 +881,12 @@ impl<'r> Run<'r> {
         Ok(self.finish())
     }
 
-    async fn redrive(mut self, pool: &PgPool, config: &Config) -> Result<Report, RecoveryError> {
+    async fn redrive(
+        mut self,
+        pool: &PgPool,
+        config: &Config,
+        progress_sink: &mut (dyn FnMut(Outcome) + Send),
+    ) -> Result<Report, RecoveryError> {
         let cfg = match ResolvedConfig::from_config(Some(config), self.catalog.clone()) {
             Ok(cfg) => cfg,
             Err(err) => return Err(self.fail(0, 0, Failure::Resolve(err))),
@@ -875,6 +923,10 @@ impl<'r> Run<'r> {
         match redrive_received(pool, &cfg, &replay).await {
             Ok(moved) => {
                 self.progress[0] = SourceProgress::Redrive { moved };
+                progress_sink(Outcome {
+                    source: self.sources[0].name.clone(),
+                    progress: SourceProgress::Redrive { moved },
+                });
                 Ok(self.finish())
             }
             Err(err) => Err(self.fail(0, 0, Failure::Redrive(err))),
