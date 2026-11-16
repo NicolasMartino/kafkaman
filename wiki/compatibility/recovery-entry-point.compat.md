@@ -20,10 +20,10 @@
 
 ## Public surface and compatibility
 
-Additive, minor release. Nothing existing changes signature.
+The resync declaration now uses a typed source and a tuple in `Recovery::of`.
 
-- `kafkaman::recovery` (feature `rdkafka`): `Source::resync::<M, _, _>(name,
-  keys, load)` and `Source::received::<M>(name)` declare sources;
+- `kafkaman::recovery` (feature `rdkafka`): `Resync` declares one typed snapshot source; `Recovery::of((SourceA, SourceB))`
+  keeps their order. `Source::received::<M>(name)` declares a redrive source;
   `Recovery::new` refuses an empty list, blank or repeated names, invalid
   descriptors and conflicting roles. `Recovery::request_from(&Config,
   RecoveryInputs)` checks operation, source, cursor and row count before any

@@ -1,4 +1,4 @@
-//! An internal HTTP route for rebuilding a service's declared snapshots.
+//! HTTP routes for rebuilding a service's declared snapshots.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -184,7 +184,7 @@ impl ResyncState {
     }
 }
 
-/// Mount only on an internal listener: these routes are unauthenticated and write to the outbox.
+/// These routes carry no authentication; the host must guard them before exposing them.
 pub fn resync_router(state: ResyncState) -> Router {
     Router::new()
         .route("/resync", post(start))
