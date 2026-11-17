@@ -94,11 +94,11 @@ tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-utoipa = { version = "5", features = ["uuid"] }
+utoipa = { version = "6", features = ["uuid"] }
 # `vendored` keeps the Swagger UI assets inside the crate, so the container build
 # stays offline — the default behaviour otherwise fetches the bundle at build
 # time, which would fail in a sandboxed or air-gapped image build.
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 
 # Enforced by `just check` and CI. These are the lints that catch the classes of
