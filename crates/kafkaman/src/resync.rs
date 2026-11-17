@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::recovery::{Outcome, Recovery, RecoveryInputs, SourceProgress};
+use crate::recovery::{Outcome, Recovery, RecoveryError, RecoveryInputs, SourceProgress};
 
 type RunFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 type Runner = dyn Fn(ResyncRequest, ProgressReporter) -> RunFuture + Send + Sync;
@@ -37,6 +37,13 @@ struct SourceStatus {
     last_key: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ResumeStatus {
+    source: String,
+    last_key: Option<String>,
+    not_run: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
@@ -51,6 +58,7 @@ struct RunStatus {
     run_id: Uuid,
     state: Phase,
     progress: Vec<SourceStatus>,
+    resume: Option<ResumeStatus>,
     error: Option<String>,
 }
 
@@ -77,6 +85,50 @@ impl std::fmt::Debug for ProgressReporter {
 }
 
 impl ProgressReporter {
+    pub fn begin(&self, selected: Vec<String>, start_after: Option<String>) {
+        let Some((source, not_run)) = selected.split_first() else {
+            return;
+        };
+        let mut runs = lock(&self.runs);
+        if let Some(status) = runs.status.get_mut(&self.run_id) {
+            if status.state == Phase::Running {
+                status.resume = Some(ResumeStatus {
+                    source: source.clone(),
+                    last_key: start_after,
+                    not_run: not_run.to_vec(),
+                });
+            }
+        }
+    }
+
+    fn failed(&self, error: &RecoveryError) {
+        let RecoveryError::Failed {
+            source_name,
+            report,
+            ..
+        } = error
+        else {
+            return;
+        };
+        let last_key = report
+            .failed
+            .as_ref()
+            .and_then(|failed| match &failed.progress {
+                SourceProgress::Resync(progress) => progress.last_key.clone(),
+                SourceProgress::Redrive { .. } => None,
+            });
+        let mut runs = lock(&self.runs);
+        if let Some(status) = runs.status.get_mut(&self.run_id) {
+            if status.state == Phase::Running {
+                status.resume = Some(ResumeStatus {
+                    source: source_name.clone(),
+                    last_key,
+                    not_run: report.not_run.clone(),
+                });
+            }
+        }
+    }
+
     pub fn record(&self, outcome: Outcome) {
         let SourceProgress::Resync(progress) = outcome.progress else {
             return;
@@ -91,6 +143,17 @@ impl ProgressReporter {
         };
         if status.state != Phase::Running {
             return;
+        }
+        if let Some(resume) = status.resume.as_mut() {
+            if resume.source != source {
+                if let Some(index) = resume.not_run.iter().position(|name| name == &source) {
+                    resume.not_run.drain(..=index);
+                    resume.source.clone_from(&source);
+                }
+            }
+            if resume.source == source {
+                resume.last_key.clone_from(&progress.last_key);
+            }
         }
         let update = SourceStatus {
             source: source.clone(),
@@ -159,6 +222,11 @@ impl ResyncState {
             let brokers = brokers.clone();
             async move {
                 let mut recovery = recovery.lock().await;
+                let selected = request
+                    .source
+                    .clone()
+                    .map_or_else(|| recovery.source_names(), |source| vec![source]);
+                let start_after = request.start_after.clone();
                 let inputs = RecoveryInputs {
                     source: request.source,
                     start_after: request.start_after,
@@ -167,7 +235,8 @@ impl ResyncState {
                 let run = recovery
                     .request_from(&config, inputs)
                     .map_err(|err| err.to_string())?;
-                recovery
+                reporter.begin(selected, start_after);
+                let result = recovery
                     .run_with_progress(
                         &pool,
                         &config,
@@ -176,11 +245,22 @@ impl ResyncState {
                         run,
                         &mut |outcome| reporter.record(outcome),
                     )
-                    .await
-                    .map_err(|err| err.to_string())?;
+                    .await;
+                if let Err(error) = &result {
+                    reporter.failed(error);
+                }
+                result.map_err(|err| err.to_string())?;
                 Ok(())
             }
         })
+    }
+
+    /// Stop a run before its service session closes the pool it uses.
+    pub fn abort_active(&self) {
+        let mut runs = lock(&self.runs);
+        if let Some(run_id) = runs.active {
+            let _ = cancel_run(&mut runs, run_id);
+        }
     }
 }
 
@@ -220,6 +300,7 @@ async fn start(
         run_id,
         state: Phase::Running,
         progress: Vec::new(),
+        resume: None,
         error: None,
     };
     runs.status.insert(run_id, status.clone());
@@ -268,6 +349,10 @@ async fn cancel(
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<RunStatus>, StatusCode> {
     let mut runs = lock(&state.runs);
+    cancel_run(&mut runs, run_id).map(Json)
+}
+
+fn cancel_run(runs: &mut Runs, run_id: Uuid) -> Result<RunStatus, StatusCode> {
     let status = runs.status.get_mut(&run_id).ok_or(StatusCode::NOT_FOUND)?;
     if status.state != Phase::Running {
         return Err(StatusCode::CONFLICT);
@@ -278,5 +363,5 @@ async fn cancel(
     if let Some(handle) = runs.handles.remove(&run_id) {
         handle.abort();
     }
-    Ok(Json(result))
+    Ok(result)
 }
