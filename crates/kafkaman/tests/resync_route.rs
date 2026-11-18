@@ -93,9 +93,10 @@ async fn passes_the_resume_cursor_and_reports_failure() {
     let seen = Arc::new(Mutex::new(None));
     let app = resync_router(ResyncState::new({
         let seen = Arc::clone(&seen);
-        move |request, _| {
+        move |request, reporter| {
             let seen = Arc::clone(&seen);
             async move {
+                reporter.begin(vec!["profiles".to_owned()], request.start_after.clone());
                 *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = request.start_after;
                 Err("source failed".to_owned())
             }
@@ -122,6 +123,8 @@ async fn passes_the_resume_cursor_and_reports_failure() {
     .await
     .unwrap_or(Value::Null);
     assert_eq!(finished["error"], "source failed");
+    assert_eq!(finished["resume"]["source"], "profiles");
+    assert_eq!(finished["resume"]["last_key"], "profile-42");
     assert_eq!(
         seen.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -158,4 +161,65 @@ async fn reports_a_finished_run() {
     .await
     .unwrap_or(Value::Null);
     assert_eq!(finished["progress"][0]["last_key"], "profile-1");
+}
+
+#[tokio::test]
+async fn running_and_cancelled_runs_report_the_remaining_sources() {
+    let state = ResyncState::new(|_, reporter| async move {
+        reporter.begin(
+            [
+                "sessions",
+                "exercises",
+                "followed_programs",
+                "exercise_groups",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            None,
+        );
+        reporter.record(Outcome {
+            source: "sessions".to_owned(),
+            progress: SourceProgress::Resync(ResyncProgress {
+                enqueued: 1,
+                skipped: 0,
+                last_key: Some("session-1".to_owned()),
+            }),
+        });
+        reporter.record(Outcome {
+            source: "exercises".to_owned(),
+            progress: SourceProgress::Resync(ResyncProgress {
+                enqueued: 2,
+                skipped: 0,
+                last_key: Some("exercise-2".to_owned()),
+            }),
+        });
+        std::future::pending::<()>().await;
+        Ok(())
+    });
+    let app = resync_router(state.clone());
+    let (_, started) = call(app.clone(), Method::POST, "/resync", json!({})).await;
+    let path = format!("/resync/{}", started["run_id"].as_str().unwrap_or_default());
+    let running = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let (_, status) = call(app.clone(), Method::GET, &path, Value::Null).await;
+            if status["resume"]["source"] == "exercises" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or(Value::Null);
+    assert_eq!(running["resume"]["last_key"], "exercise-2");
+    assert_eq!(
+        running["resume"]["not_run"],
+        json!(["followed_programs", "exercise_groups"])
+    );
+
+    state.abort_active();
+    let (_, stopped) = call(app.clone(), Method::GET, &path, Value::Null).await;
+    assert_eq!(stopped["state"], "cancelled");
+    assert_eq!(stopped["resume"], running["resume"]);
+    let (status, _) = call(app, Method::POST, "/resync", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
 }
